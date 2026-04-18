@@ -1,0 +1,1283 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"testing"
+	"unsafe"
+)
+
+func newItem(scope, id string, payload map[string]interface{}) Item {
+	if payload == nil {
+		payload = map[string]interface{}{"v": 1}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return Item{Scope: scope, ID: id, Payload: raw}
+}
+
+// --- ScopeBuffer.appendItem ---------------------------------------------------
+
+func TestAppendItem_AssignsSeqMonotonically(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	for i := 1; i <= 5; i++ {
+		it, err := buf.appendItem(newItem("s", "", nil))
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		if it.Seq != uint64(i) {
+			t.Fatalf("append %d: seq=%d want %d", i, it.Seq, i)
+		}
+	}
+}
+
+func TestAppendItem_RejectsDuplicateID(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err == nil {
+		t.Fatal("expected duplicate id rejection")
+	}
+}
+
+func TestAppendItem_AllowsMultipleEmptyIDs(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	for i := 0; i < 3; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	if len(buf.items) != 3 {
+		t.Fatalf("len=%d want 3", len(buf.items))
+	}
+}
+
+// Capacity is a hard cap: a write that would push the buffer past maxItems
+// is rejected with ScopeFullError. No eviction happens — state, seq cursor
+// and byID index stay exactly as they were before the failed append.
+func TestAppendItem_RejectsAtCapacity(t *testing.T) {
+	buf := NewScopeBuffer(3)
+
+	for i := 0; i < 3; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("pre-fill %d: %v", i, err)
+		}
+	}
+
+	_, err := buf.appendItem(newItem("s", "overflow", nil))
+	if err == nil {
+		t.Fatal("expected ScopeFullError when appending past cap")
+	}
+	var sfe *ScopeFullError
+	if !errors.As(err, &sfe) {
+		t.Fatalf("expected *ScopeFullError, got %T: %v", err, err)
+	}
+	if sfe.Count != 3 || sfe.Cap != 3 {
+		t.Fatalf("ScopeFullError{Count:%d Cap:%d}, want {3,3}", sfe.Count, sfe.Cap)
+	}
+
+	if len(buf.items) != 3 {
+		t.Fatalf("rejected write mutated buffer: len=%d want 3", len(buf.items))
+	}
+	if buf.lastSeq != 3 {
+		t.Fatalf("rejected write advanced lastSeq: got %d want 3", buf.lastSeq)
+	}
+	if _, ok := buf.byID["overflow"]; ok {
+		t.Fatal("rejected id 'overflow' leaked into byID index")
+	}
+}
+
+// --- ScopeBuffer.replaceAll ---------------------------------------------------
+
+func TestReplaceAll_AssignsFreshSeqFromOne(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "", nil))
+	_, _ = buf.appendItem(newItem("s", "", nil))
+
+	items := []Item{
+		newItem("s", "a", nil),
+		newItem("s", "b", nil),
+	}
+	_, err := buf.replaceAll(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if buf.items[0].Seq != 1 || buf.items[1].Seq != 2 {
+		t.Fatalf("seq not reset: %+v", buf.items)
+	}
+	if buf.lastSeq != 2 {
+		t.Fatalf("lastSeq=%d want 2", buf.lastSeq)
+	}
+}
+
+// replaceAll rejects the whole batch when it exceeds the per-scope cap —
+// no silent truncation. Pre-existing state must stay untouched since the
+// buffer is the mutation target and the caller expects all-or-nothing.
+func TestReplaceAll_RejectsOverCap(t *testing.T) {
+	buf := NewScopeBuffer(3)
+	_, _ = buf.appendItem(newItem("s", "keep", nil))
+	priorLen := len(buf.items)
+
+	items := []Item{
+		newItem("s", "a", nil),
+		newItem("s", "b", nil),
+		newItem("s", "c", nil),
+		newItem("s", "d", nil),
+	}
+	_, err := buf.replaceAll(items)
+	if err == nil {
+		t.Fatal("expected ScopeFullError when replacement exceeds cap")
+	}
+	var sfe *ScopeFullError
+	if !errors.As(err, &sfe) {
+		t.Fatalf("expected *ScopeFullError, got %T: %v", err, err)
+	}
+	if sfe.Count != 4 || sfe.Cap != 3 {
+		t.Fatalf("ScopeFullError{Count:%d Cap:%d}, want {4,3}", sfe.Count, sfe.Cap)
+	}
+	if len(buf.items) != priorLen {
+		t.Fatalf("rejected replaceAll mutated buffer: len=%d want %d", len(buf.items), priorLen)
+	}
+}
+
+func TestReplaceAll_RejectsDuplicateIDs(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	items := []Item{
+		newItem("s", "a", nil),
+		newItem("s", "a", nil),
+	}
+	if _, err := buf.replaceAll(items); err == nil {
+		t.Fatal("expected duplicate id error")
+	}
+}
+
+func TestReplaceAll_EmptyItemsClearsScope(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "", nil))
+
+	if _, err := buf.replaceAll([]Item{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(buf.items) != 0 {
+		t.Fatalf("expected empty buffer, got %d items", len(buf.items))
+	}
+}
+
+// --- ScopeBuffer.updateByID ---------------------------------------------------
+
+func TestUpdateByID_HitPreservesSeq(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	original, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
+
+	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
+	n, err := buf.updateByID("a", newPayload)
+	if err != nil {
+		t.Fatalf("updateByID: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("updated=%d want 1", n)
+	}
+
+	got, _ := buf.getByID("a")
+	if got.Seq != original.Seq {
+		t.Fatalf("seq changed: %d -> %d", original.Seq, got.Seq)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(got.Payload, &decoded); err != nil {
+		t.Fatalf("payload decode: %v", err)
+	}
+	if v, ok := decoded["v"].(float64); !ok || v != 2 {
+		t.Fatalf("payload not updated: %s", string(got.Payload))
+	}
+}
+
+func TestUpdateByID_Miss(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
+	n, err := buf.updateByID("missing", raw)
+	if err != nil {
+		t.Fatalf("updateByID: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("updated=%d want 0", n)
+	}
+}
+
+// --- ScopeBuffer.updateBySeq --------------------------------------------------
+
+func TestUpdateBySeq_Hit(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	it, _ := buf.appendItem(newItem("s", "", map[string]interface{}{"v": 1}))
+
+	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
+	n, err := buf.updateBySeq(it.Seq, newPayload)
+	if err != nil {
+		t.Fatalf("updateBySeq: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("updated=%d want 1", n)
+	}
+
+	got, _ := buf.getBySeq(it.Seq)
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(got.Payload, &decoded); err != nil {
+		t.Fatalf("payload decode: %v", err)
+	}
+	if v, ok := decoded["v"].(float64); !ok || v != 2 {
+		t.Fatalf("payload not updated: %s", string(got.Payload))
+	}
+}
+
+func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	it, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
+
+	newPayload, _ := json.Marshal(map[string]interface{}{"v": 42})
+	if _, err := buf.updateBySeq(it.Seq, newPayload); err != nil {
+		t.Fatalf("updateBySeq: %v", err)
+	}
+
+	// byID index must reflect the new payload too, otherwise a /get by id
+	// would return the pre-update payload.
+	got, ok := buf.getByID("a")
+	if !ok {
+		t.Fatal("getByID missed after updateBySeq")
+	}
+	var decoded map[string]interface{}
+	_ = json.Unmarshal(got.Payload, &decoded)
+	if decoded["v"].(float64) != 42 {
+		t.Fatalf("byID stale payload: %s", string(got.Payload))
+	}
+}
+
+func TestUpdateBySeq_Miss(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
+	n, err := buf.updateBySeq(999, raw)
+	if err != nil {
+		t.Fatalf("updateBySeq: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("updated=%d want 0", n)
+	}
+}
+
+// --- ScopeBuffer.deleteByID ---------------------------------------------------
+
+func TestDeleteByID_Hit(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+	_, _ = buf.appendItem(newItem("s", "b", nil))
+
+	n := buf.deleteByID("a")
+	if n != 1 {
+		t.Fatalf("deleted=%d want 1", n)
+	}
+	if _, ok := buf.byID["a"]; ok {
+		t.Fatal("id 'a' still in index")
+	}
+	if len(buf.items) != 1 {
+		t.Fatalf("len=%d want 1", len(buf.items))
+	}
+}
+
+func TestDeleteByID_Miss(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	n := buf.deleteByID("missing")
+	if n != 0 {
+		t.Fatalf("deleted=%d want 0", n)
+	}
+}
+
+func TestDeleteByID_DoesNotRollbackLastSeq(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+	_, _ = buf.appendItem(newItem("s", "b", nil))
+
+	_ = buf.deleteByID("b")
+	next, _ := buf.appendItem(newItem("s", "c", nil))
+	if next.Seq != 3 {
+		t.Fatalf("seq=%d want 3 (no rollback)", next.Seq)
+	}
+}
+
+// --- ScopeBuffer.deleteBySeq --------------------------------------------------
+
+func TestDeleteBySeq_Hit(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+	it2, _ := buf.appendItem(newItem("s", "b", nil))
+	_, _ = buf.appendItem(newItem("s", "c", nil))
+
+	n := buf.deleteBySeq(it2.Seq)
+	if n != 1 {
+		t.Fatalf("deleted=%d want 1", n)
+	}
+	if _, ok := buf.bySeq[it2.Seq]; ok {
+		t.Fatal("seq still in bySeq index")
+	}
+	if _, ok := buf.byID["b"]; ok {
+		t.Fatal("id 'b' still in byID index")
+	}
+	if len(buf.items) != 2 {
+		t.Fatalf("len=%d want 2", len(buf.items))
+	}
+}
+
+func TestDeleteBySeq_Miss(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+
+	if n := buf.deleteBySeq(999); n != 0 {
+		t.Fatalf("deleted=%d want 0", n)
+	}
+	if len(buf.items) != 1 {
+		t.Fatalf("len=%d want 1", len(buf.items))
+	}
+}
+
+func TestDeleteBySeq_NoIDItem(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	it, _ := buf.appendItem(newItem("s", "", nil))
+
+	if n := buf.deleteBySeq(it.Seq); n != 1 {
+		t.Fatalf("deleted=%d want 1", n)
+	}
+	if len(buf.items) != 0 {
+		t.Fatalf("len=%d want 0", len(buf.items))
+	}
+}
+
+func TestDeleteBySeq_DoesNotRollbackLastSeq(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+	it2, _ := buf.appendItem(newItem("s", "b", nil))
+
+	_ = buf.deleteBySeq(it2.Seq)
+	next, _ := buf.appendItem(newItem("s", "c", nil))
+	if next.Seq != 3 {
+		t.Fatalf("seq=%d want 3 (no rollback)", next.Seq)
+	}
+}
+
+// --- ScopeBuffer.deleteUpToSeq ---------------------------------------------
+
+func TestDeleteUpToSeq_RemovesPrefix(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	for i := 1; i <= 5; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	n := buf.deleteUpToSeq(3)
+	if n != 3 {
+		t.Fatalf("deleted=%d want 3", n)
+	}
+	if len(buf.items) != 2 {
+		t.Fatalf("len=%d want 2", len(buf.items))
+	}
+	if buf.items[0].Seq != 4 || buf.items[1].Seq != 5 {
+		t.Fatalf("unexpected survivors: %+v", buf.items)
+	}
+	for seq := uint64(1); seq <= 3; seq++ {
+		if _, ok := buf.bySeq[seq]; ok {
+			t.Fatalf("seq %d should be gone from bySeq", seq)
+		}
+	}
+}
+
+func TestDeleteUpToSeq_RemovesIDsToo(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+	_, _ = buf.appendItem(newItem("s", "b", nil))
+	_, _ = buf.appendItem(newItem("s", "c", nil))
+
+	_ = buf.deleteUpToSeq(2)
+
+	if _, ok := buf.byID["a"]; ok {
+		t.Fatal("id 'a' should have been removed from byID")
+	}
+	if _, ok := buf.byID["b"]; ok {
+		t.Fatal("id 'b' should have been removed from byID")
+	}
+	if _, ok := buf.byID["c"]; !ok {
+		t.Fatal("id 'c' should still exist")
+	}
+}
+
+func TestDeleteUpToSeq_NoOpBelowRange(t *testing.T) {
+	buf := NewScopeBuffer(5)
+	// Append 3 items, then delete through the prefix before seq 3's start.
+	// Nothing matches because no item has seq <= 0.
+	for i := 1; i <= 3; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+	// Drop seqs 1..2 first to simulate a post-drain state, then ask to drop
+	// anything <= 2 again. The cut point is already past — expect no-op.
+	_ = buf.deleteUpToSeq(2)
+
+	n := buf.deleteUpToSeq(2)
+	if n != 0 {
+		t.Fatalf("deleted=%d want 0 (no items at or below seq 2 remain)", n)
+	}
+	if len(buf.items) != 1 {
+		t.Fatalf("len=%d want 1", len(buf.items))
+	}
+}
+
+func TestDeleteUpToSeq_RemovesAllWhenMaxAtOrAboveLast(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	for i := 1; i <= 3; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	n := buf.deleteUpToSeq(99)
+	if n != 3 {
+		t.Fatalf("deleted=%d want 3", n)
+	}
+	if len(buf.items) != 0 {
+		t.Fatalf("expected empty scope, got %d", len(buf.items))
+	}
+}
+
+func TestDeleteUpToSeq_DoesNotRollbackLastSeq(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	for i := 1; i <= 3; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	_ = buf.deleteUpToSeq(3)
+	next, _ := buf.appendItem(newItem("s", "", nil))
+	if next.Seq != 4 {
+		t.Fatalf("seq=%d want 4 (no rollback after draining)", next.Seq)
+	}
+}
+
+func TestDeleteUpToSeq_ClearsBackingSlots(t *testing.T) {
+	buf := NewScopeBuffer(8)
+	_, _ = buf.appendItem(newItem("s", "a", map[string]interface{}{"marker": "A"}))
+	_, _ = buf.appendItem(newItem("s", "b", map[string]interface{}{"marker": "B"}))
+	_, _ = buf.appendItem(newItem("s", "c", map[string]interface{}{"marker": "C"}))
+
+	if n := buf.deleteUpToSeq(2); n != 2 {
+		t.Fatalf("deleted=%d want 2", n)
+	}
+	if len(buf.items) != 1 {
+		t.Fatalf("len=%d want 1", len(buf.items))
+	}
+
+	// After the reslice, &buf.items[0] points at the original slot 2 in the
+	// backing array. The two dropped slots (original indices 0 and 1) now
+	// sit one and two Item-widths before the new start. Both must be zeroed
+	// so their payloads are eligible for GC.
+	itemSize := unsafe.Sizeof(Item{})
+	base := unsafe.Pointer(&buf.items[0])
+	for back := uintptr(1); back <= 2; back++ {
+		slot := (*Item)(unsafe.Pointer(uintptr(base) - back*itemSize))
+		if slot.ID != "" || slot.Seq != 0 || slot.Payload != nil {
+			t.Fatalf("dropped slot %d back not cleared: %+v", back, *slot)
+		}
+	}
+}
+
+// --- ScopeBuffer.tailOffset ---------------------------------------------------
+
+func TestTailOffset_BasicAndEdges(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	for i := 1; i <= 5; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	tests := []struct {
+		limit, offset int
+		wantSeq       []uint64
+	}{
+		{2, 0, []uint64{4, 5}},
+		{2, 2, []uint64{2, 3}},
+		{10, 0, []uint64{1, 2, 3, 4, 5}},
+		{2, 10, nil},
+	}
+
+	for _, tc := range tests {
+		got := buf.tailOffset(tc.limit, tc.offset)
+		if len(got) != len(tc.wantSeq) {
+			t.Errorf("tail(limit=%d offset=%d): len=%d want %d", tc.limit, tc.offset, len(got), len(tc.wantSeq))
+			continue
+		}
+		for i, seq := range tc.wantSeq {
+			if got[i].Seq != seq {
+				t.Errorf("tail(limit=%d offset=%d)[%d].seq=%d want %d", tc.limit, tc.offset, i, got[i].Seq, seq)
+			}
+		}
+	}
+}
+
+// --- ScopeBuffer.sinceSeq -----------------------------------------------------
+
+func TestSinceSeq_ReturnsItemsAfterCursor(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	for i := 1; i <= 5; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	got := buf.sinceSeq(2, 0)
+	if len(got) != 3 {
+		t.Fatalf("len=%d want 3", len(got))
+	}
+	if got[0].Seq != 3 {
+		t.Fatalf("first.seq=%d want 3", got[0].Seq)
+	}
+}
+
+func TestSinceSeq_RespectsLimit(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	for i := 1; i <= 5; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	got := buf.sinceSeq(0, 2)
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2", len(got))
+	}
+}
+
+func TestSinceSeq_EmptyWhenPastEnd(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "", nil))
+
+	got := buf.sinceSeq(100, 0)
+	if len(got) != 0 {
+		t.Fatalf("len=%d want 0", len(got))
+	}
+}
+
+// --- ScopeBuffer.getByID / getBySeq -------------------------------------------
+
+func TestGetByIDAndSeq(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	it, _ := buf.appendItem(newItem("s", "a", nil))
+
+	if got, ok := buf.getByID("a"); !ok || got.Seq != it.Seq {
+		t.Fatalf("getByID: ok=%v seq=%d want %d", ok, got.Seq, it.Seq)
+	}
+	if got, ok := buf.getBySeq(it.Seq); !ok || got.ID != "a" {
+		t.Fatalf("getBySeq: ok=%v id=%q", ok, got.ID)
+	}
+	if _, ok := buf.getByID("missing"); ok {
+		t.Fatal("getByID('missing') should miss")
+	}
+	if _, ok := buf.getBySeq(999); ok {
+		t.Fatal("getBySeq(999) should miss")
+	}
+}
+
+// --- Store --------------------------------------------------------------------
+
+func TestStore_GetOrCreateScope_RequiresScope(t *testing.T) {
+	s := NewStore(10, 100<<20)
+	if _, err := s.getOrCreateScope(""); err == nil {
+		t.Fatal("expected error for empty scope")
+	}
+}
+
+func TestStore_GetOrCreateScope_ReturnsSameBuffer(t *testing.T) {
+	s := NewStore(10, 100<<20)
+	b1, _ := s.getOrCreateScope("x")
+	b2, _ := s.getOrCreateScope("x")
+	if b1 != b2 {
+		t.Fatal("scope buffers should be identical")
+	}
+}
+
+func TestStore_GetScope_Miss(t *testing.T) {
+	s := NewStore(10, 100<<20)
+	if _, ok := s.getScope("nope"); ok {
+		t.Fatal("expected miss")
+	}
+}
+
+func TestStore_DeleteScope(t *testing.T) {
+	s := NewStore(10, 100<<20)
+	buf, _ := s.getOrCreateScope("x")
+	_, _ = buf.appendItem(newItem("x", "a", nil))
+	_, _ = buf.appendItem(newItem("x", "b", nil))
+
+	n, ok := s.deleteScope("x")
+	if !ok || n != 2 {
+		t.Fatalf("deleteScope: ok=%v n=%d", ok, n)
+	}
+	if _, found := s.getScope("x"); found {
+		t.Fatal("scope should be gone")
+	}
+
+	n, ok = s.deleteScope("missing")
+	if ok || n != 0 {
+		t.Fatalf("deleteScope(missing): ok=%v n=%d", ok, n)
+	}
+}
+
+func TestStore_ReplaceScopes_LeavesOtherScopesUntouched(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	keep, _ := s.getOrCreateScope("keep")
+	_, _ = keep.appendItem(newItem("keep", "k1", nil))
+	keepLen := len(keep.items)
+
+	grouped := map[string][]Item{
+		"replace": {newItem("replace", "r1", nil)},
+	}
+	n, err := s.replaceScopes(grouped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("replaced=%d want 1", n)
+	}
+	if len(keep.items) != keepLen {
+		t.Fatal("untouched scope was mutated")
+	}
+}
+
+func TestStore_RebuildAll_WipesEverything(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	old, _ := s.getOrCreateScope("old")
+	_, _ = old.appendItem(newItem("old", "", nil))
+
+	grouped := map[string][]Item{
+		"new": {newItem("new", "n1", nil)},
+	}
+	nScopes, nItems, err := s.rebuildAll(grouped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nScopes != 1 || nItems != 1 {
+		t.Fatalf("rebuildAll: scopes=%d items=%d", nScopes, nItems)
+	}
+	if _, ok := s.getScope("old"); ok {
+		t.Fatal("old scope should be wiped")
+	}
+	if _, ok := s.getScope("new"); !ok {
+		t.Fatal("new scope should exist")
+	}
+}
+
+// /warm must reject the whole batch (not partial-apply) when any scope in
+// the request exceeds the cap. The error carries every offending scope so a
+// client can fix all at once rather than discovering them one-by-one.
+func TestStore_ReplaceScopes_RejectsOverCapWithAllOffenders(t *testing.T) {
+	s := NewStore(3, 100<<20)
+
+	keep, _ := s.getOrCreateScope("untouched")
+	_, _ = keep.appendItem(newItem("untouched", "k", nil))
+	preLen := len(keep.items)
+
+	grouped := map[string][]Item{
+		"fits": {newItem("fits", "a", nil), newItem("fits", "b", nil)},
+		"too_big_1": {
+			newItem("too_big_1", "a", nil),
+			newItem("too_big_1", "b", nil),
+			newItem("too_big_1", "c", nil),
+			newItem("too_big_1", "d", nil),
+		},
+		"too_big_2": {
+			newItem("too_big_2", "a", nil),
+			newItem("too_big_2", "b", nil),
+			newItem("too_big_2", "c", nil),
+			newItem("too_big_2", "d", nil),
+			newItem("too_big_2", "e", nil),
+		},
+	}
+
+	_, err := s.replaceScopes(grouped)
+	if err == nil {
+		t.Fatal("expected ScopeCapacityError when batch exceeds cap")
+	}
+	var sce *ScopeCapacityError
+	if !errors.As(err, &sce) {
+		t.Fatalf("expected *ScopeCapacityError, got %T: %v", err, err)
+	}
+	if len(sce.Offenders) != 2 {
+		t.Fatalf("expected 2 offenders, got %d: %+v", len(sce.Offenders), sce.Offenders)
+	}
+	// Validate each offender carries scope/count/cap; map ordering means the
+	// offender list order is not deterministic.
+	seen := map[string]ScopeCapacityOffender{}
+	for _, o := range sce.Offenders {
+		seen[o.Scope] = o
+	}
+	if o, ok := seen["too_big_1"]; !ok || o.Count != 4 || o.Cap != 3 {
+		t.Fatalf("offender for too_big_1 missing or wrong: %+v", o)
+	}
+	if o, ok := seen["too_big_2"]; !ok || o.Count != 5 || o.Cap != 3 {
+		t.Fatalf("offender for too_big_2 missing or wrong: %+v", o)
+	}
+
+	// Atomic: the well-sized "fits" scope must NOT have been applied, and
+	// the pre-existing "untouched" scope must still have its original item.
+	if _, ok := s.getScope("fits"); ok {
+		t.Fatal("fits scope was applied despite batch error")
+	}
+	if len(keep.items) != preLen {
+		t.Fatal("existing scope was mutated by a failed batch")
+	}
+}
+
+func TestStore_RebuildAll_RejectsOverCapWithAllOffenders(t *testing.T) {
+	s := NewStore(2, 100<<20)
+
+	priorScope, _ := s.getOrCreateScope("prior")
+	_, _ = priorScope.appendItem(newItem("prior", "p", nil))
+
+	grouped := map[string][]Item{
+		"too_big_1": {
+			newItem("too_big_1", "a", nil),
+			newItem("too_big_1", "b", nil),
+			newItem("too_big_1", "c", nil),
+		},
+		"too_big_2": {
+			newItem("too_big_2", "a", nil),
+			newItem("too_big_2", "b", nil),
+			newItem("too_big_2", "c", nil),
+		},
+	}
+
+	_, _, err := s.rebuildAll(grouped)
+	if err == nil {
+		t.Fatal("expected ScopeCapacityError")
+	}
+	var sce *ScopeCapacityError
+	if !errors.As(err, &sce) {
+		t.Fatalf("expected *ScopeCapacityError, got %T: %v", err, err)
+	}
+	if len(sce.Offenders) != 2 {
+		t.Fatalf("expected 2 offenders, got %d", len(sce.Offenders))
+	}
+	// rebuildAll replaces the entire store on success. On failure the old
+	// store must remain intact — verify the prior scope is still there.
+	if _, ok := s.getScope("prior"); !ok {
+		t.Fatal("prior scope was wiped by a failed rebuild")
+	}
+}
+
+func TestStore_RebuildAll_RejectsDuplicateIDs(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	s2, _ := s.getOrCreateScope("keep")
+	_, _ = s2.appendItem(newItem("keep", "k1", nil))
+
+	grouped := map[string][]Item{
+		"bad": {
+			newItem("bad", "x", nil),
+			newItem("bad", "x", nil),
+		},
+	}
+	if _, _, err := s.rebuildAll(grouped); err == nil {
+		t.Fatal("expected duplicate id error")
+	}
+	// Validation happens before wiping, so existing scopes must be intact.
+	if _, ok := s.getScope("keep"); !ok {
+		t.Fatal("rebuildAll must not wipe on validation failure")
+	}
+}
+
+// --- recordRead (7-day heat tracking) -----------------------------------------
+
+// microsOnDay returns a microsecond Unix timestamp that falls on the given day index.
+func microsOnDay(day int64) int64 {
+	return day * 86400000000
+}
+
+func TestRecordRead_KeepsReadsWithinWindow(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	// Read on day 1000 and day 1001 (both within the 7-day window).
+	buf.recordRead(microsOnDay(1000))
+	buf.recordRead(microsOnDay(1001))
+
+	if buf.last7DReadCount != 2 {
+		t.Fatalf("last7DReadCount=%d want 2 (buggy code would reset on day change)", buf.last7DReadCount)
+	}
+}
+
+func TestRecordRead_ExpiresBucketsOutsideWindow(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	buf.recordRead(microsOnDay(1000))
+	buf.recordRead(microsOnDay(1001))
+	buf.recordRead(microsOnDay(1002))
+
+	if buf.last7DReadCount != 3 {
+		t.Fatalf("pre-window last7DReadCount=%d want 3", buf.last7DReadCount)
+	}
+
+	// Jump to day 1010 — all prior reads are > 6 days old.
+	buf.recordRead(microsOnDay(1010))
+
+	if buf.last7DReadCount != 1 {
+		t.Fatalf("after expiry last7DReadCount=%d want 1", buf.last7DReadCount)
+	}
+}
+
+func TestRecordRead_ReusesBucketSlotAcross7DayCycle(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	// Day 1000 lands in slot 1000%7 = 6.
+	buf.recordRead(microsOnDay(1000))
+	// Day 1007 also lands in slot 6 — same physical slot, 7 days later.
+	buf.recordRead(microsOnDay(1007))
+
+	// Day 1000's read is now outside the rolling window (>= 7 days old).
+	if buf.last7DReadCount != 1 {
+		t.Fatalf("last7DReadCount=%d want 1 (old slot should have been expired)", buf.last7DReadCount)
+	}
+}
+
+func TestRecordRead_RollingWindowSum(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	// 2 reads on day 1000, 1 on day 1003, 3 on day 1006.
+	buf.recordRead(microsOnDay(1000))
+	buf.recordRead(microsOnDay(1000))
+	buf.recordRead(microsOnDay(1003))
+	buf.recordRead(microsOnDay(1006))
+	buf.recordRead(microsOnDay(1006))
+	buf.recordRead(microsOnDay(1006))
+
+	if buf.last7DReadCount != 6 {
+		t.Fatalf("last7DReadCount=%d want 6", buf.last7DReadCount)
+	}
+
+	// Read on day 1007 — day 1000 falls out of window (1007-6=1001, 1000 < 1001).
+	buf.recordRead(microsOnDay(1007))
+
+	// Expected: 0 from day 1000, 1 from day 1003, 3 from day 1006, 1 from day 1007 = 5.
+	if buf.last7DReadCount != 5 {
+		t.Fatalf("last7DReadCount=%d want 5 (day 1000's 2 reads should expire)", buf.last7DReadCount)
+	}
+}
+
+// --- approxSizeBytes ----------------------------------------------------------
+
+func TestApproxSizeBytes_IgnoresReservedCapacity(t *testing.T) {
+	buf := NewScopeBuffer(10000)
+	size := buf.approxSizeBytes()
+
+	// Buggy code counted cap(items)*32 = 320KB for an empty scope.
+	if size > 2048 {
+		t.Fatalf("empty scope approx_scope_bytes=%d want < 2KB (should not count reserved capacity)", size)
+	}
+}
+
+func TestApproxSizeBytes_GrowsWithItems(t *testing.T) {
+	buf := NewScopeBuffer(10000)
+	before := buf.approxSizeBytes()
+
+	_, _ = buf.appendItem(newItem("s", "a", map[string]interface{}{"text": "hello world"}))
+
+	after := buf.approxSizeBytes()
+	if after <= before {
+		t.Fatalf("size did not grow after append: before=%d after=%d", before, after)
+	}
+}
+
+// TestDeleteByID_ClearsBackingSlot verifies the GC invariant for deleteByID:
+// after the slice shift-and-shrink, the tail slot must be zeroed so the Item's
+// payload map is eligible for GC. The backing array still exists at full
+// capacity, so we reslice past the current length to peek at the vacated slot.
+func TestDeleteByID_ClearsBackingSlot(t *testing.T) {
+	buf := NewScopeBuffer(8)
+
+	_, _ = buf.appendItem(newItem("s", "a", map[string]interface{}{"marker": "A"}))
+	_, _ = buf.appendItem(newItem("s", "b", map[string]interface{}{"marker": "B"}))
+	_, _ = buf.appendItem(newItem("s", "c", map[string]interface{}{"marker": "C"}))
+
+	if n := buf.deleteByID("b"); n != 1 {
+		t.Fatalf("delete: n=%d want 1", n)
+	}
+	if len(buf.items) != 2 {
+		t.Fatalf("len=%d want 2 after delete", len(buf.items))
+	}
+
+	full := buf.items[:3]
+	tail := full[2]
+	if tail.ID != "" || tail.Seq != 0 || tail.Payload != nil {
+		t.Fatalf("tail slot not cleared in backing array: %+v", tail)
+	}
+}
+
+// --- buildReplacementState ----------------------------------------------------
+
+func TestBuildReplacementState_SeqFromOne(t *testing.T) {
+	items := []Item{
+		newItem("s", "a", nil),
+		newItem("s", "b", nil),
+		newItem("s", "c", nil),
+	}
+	r, err := buildReplacementState(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.items) != 3 {
+		t.Fatalf("len=%d want 3 (no trim)", len(r.items))
+	}
+	if r.items[0].ID != "a" || r.items[2].ID != "c" {
+		t.Fatalf("input order not preserved: %+v", r.items)
+	}
+	if r.items[0].Seq != 1 || r.items[2].Seq != 3 {
+		t.Fatalf("seq not fresh: %+v", r.items)
+	}
+	if r.lastSeq != 3 {
+		t.Fatalf("lastSeq=%d want 3", r.lastSeq)
+	}
+	if _, ok := r.byID["a"]; !ok {
+		t.Fatal("byID missing 'a'")
+	}
+	if _, ok := r.bySeq[1]; !ok {
+		t.Fatal("bySeq missing seq 1")
+	}
+}
+
+// --- store-level byte budget --------------------------------------------------
+
+// Byte-cap is the aggregate approxItemSize across all scopes; writes that
+// would push the running total past maxStoreBytes are rejected with
+// StoreFullError. State must stay untouched on rejection — same contract as
+// the per-scope ScopeFullError.
+func TestStore_Append_RejectsAtByteCap(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "", nil))
+	capBytes := itemSize * 3
+
+	s := NewStore(100, capBytes)
+	buf, _ := s.getOrCreateScope("s")
+
+	for i := 0; i < 3; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("append %d within cap: %v", i, err)
+		}
+	}
+
+	_, err := buf.appendItem(newItem("s", "", nil))
+	if err == nil {
+		t.Fatal("expected StoreFullError when append would exceed byte cap")
+	}
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected *StoreFullError, got %T: %v", err, err)
+	}
+	if stfe.Cap != capBytes {
+		t.Fatalf("Cap=%d want %d", stfe.Cap, capBytes)
+	}
+	if stfe.AddedBytes != itemSize {
+		t.Fatalf("AddedBytes=%d want %d", stfe.AddedBytes, itemSize)
+	}
+
+	if len(buf.items) != 3 {
+		t.Fatalf("rejected write mutated buffer: len=%d want 3", len(buf.items))
+	}
+	if got := s.totalBytes.Load(); got != itemSize*3 {
+		t.Fatalf("totalBytes=%d want %d after rejected append", got, itemSize*3)
+	}
+}
+
+// Freeing capacity via /delete must let subsequent appends succeed: the
+// byte counter has to drop by the removed item's size or the store drifts
+// into a permanently "full" state.
+func TestStore_Delete_FreesBytes(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "a", nil))
+	capBytes := itemSize * 2
+
+	s := NewStore(100, capBytes)
+	buf, _ := s.getOrCreateScope("s")
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("append a: %v", err)
+	}
+	if _, err := buf.appendItem(newItem("s", "b", nil)); err != nil {
+		t.Fatalf("append b: %v", err)
+	}
+
+	// At cap now — a third append must fail.
+	if _, err := buf.appendItem(newItem("s", "c", nil)); err == nil {
+		t.Fatal("expected StoreFullError at cap")
+	}
+
+	if n := buf.deleteByID("a"); n != 1 {
+		t.Fatalf("deleteByID a: n=%d want 1", n)
+	}
+
+	// After freeing one item's worth, a new append must succeed.
+	if _, err := buf.appendItem(newItem("s", "c", nil)); err != nil {
+		t.Fatalf("append c after delete: %v", err)
+	}
+	if got := s.totalBytes.Load(); got != itemSize*2 {
+		t.Fatalf("totalBytes=%d want %d after delete+append", got, itemSize*2)
+	}
+}
+
+func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "", nil))
+	capBytes := itemSize * 3
+
+	s := NewStore(100, capBytes)
+	buf, _ := s.getOrCreateScope("s")
+	for i := 0; i < 3; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	if n := buf.deleteUpToSeq(2); n != 2 {
+		t.Fatalf("deleteUpToSeq: n=%d want 2", n)
+	}
+
+	// Two items freed, so room for two more.
+	for i := 0; i < 2; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("append after drain %d: %v", i, err)
+		}
+	}
+	if got := s.totalBytes.Load(); got != itemSize*3 {
+		t.Fatalf("totalBytes=%d want %d", got, itemSize*3)
+	}
+}
+
+func TestStore_DeleteScope_FreesBytes(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "", nil))
+	capBytes := itemSize * 4
+
+	s := NewStore(100, capBytes)
+	buf, _ := s.getOrCreateScope("s")
+	for i := 0; i < 4; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	n, ok := s.deleteScope("s")
+	if !ok || n != 4 {
+		t.Fatalf("deleteScope: ok=%v n=%d", ok, n)
+	}
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Fatalf("totalBytes=%d want 0 after deleteScope", got)
+	}
+}
+
+// /update that grows the payload must reserve the delta — a grow past the
+// byte cap returns StoreFullError without mutating the stored item.
+func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
+	small := newItem("s", "a", map[string]interface{}{"v": 1})
+	capBytes := approxItemSize(small) + 8 // room for the small item, not a large replacement
+
+	s := NewStore(100, capBytes)
+	buf, _ := s.getOrCreateScope("s")
+	if _, err := buf.appendItem(small); err != nil {
+		t.Fatalf("append small: %v", err)
+	}
+
+	// A payload with 100 extra bytes overflows the tiny headroom.
+	bigPayload, _ := json.Marshal(map[string]interface{}{
+		"v":    1,
+		"blob": "x_________________________________________________________________________________________________",
+	})
+	n, err := buf.updateByID("a", bigPayload)
+	if err == nil {
+		t.Fatal("expected StoreFullError on grow past cap")
+	}
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected *StoreFullError, got %T: %v", err, err)
+	}
+	if n != 0 {
+		t.Fatalf("updated=%d want 0 on reject", n)
+	}
+	// Payload must still be the small original.
+	got, _ := buf.getByID("a")
+	if string(got.Payload) != string(small.Payload) {
+		t.Fatalf("payload changed despite reject: %s", string(got.Payload))
+	}
+}
+
+// /warm's byte-cap check runs across all scopes in the batch. A request
+// whose net byte delta would push the store over the cap is rejected as a
+// whole with StoreFullError, and no scope is applied.
+func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "", nil))
+	capBytes := itemSize * 3
+
+	s := NewStore(100, capBytes)
+
+	// Pre-seed an unrelated scope so we can assert it survives the reject.
+	pre, _ := s.getOrCreateScope("untouched")
+	if _, err := pre.appendItem(newItem("untouched", "u", nil)); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+	preLen := len(pre.items)
+
+	// Batch adds 4 items worth — store already holds 1, so delta pushes total
+	// to 5×itemSize which exceeds the cap of 3×itemSize.
+	grouped := map[string][]Item{
+		"a": {newItem("a", "", nil), newItem("a", "", nil)},
+		"b": {newItem("b", "", nil), newItem("b", "", nil)},
+	}
+	_, err := s.replaceScopes(grouped)
+	if err == nil {
+		t.Fatal("expected StoreFullError for over-cap batch")
+	}
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected *StoreFullError, got %T: %v", err, err)
+	}
+
+	// No scope in the batch may have been applied, and the pre-seeded scope
+	// must be untouched.
+	if _, ok := s.getScope("a"); ok {
+		t.Fatal("scope 'a' applied despite reject")
+	}
+	if _, ok := s.getScope("b"); ok {
+		t.Fatal("scope 'b' applied despite reject")
+	}
+	if len(pre.items) != preLen {
+		t.Fatalf("untouched scope mutated: len=%d want %d", len(pre.items), preLen)
+	}
+	preSize := approxItemSize(newItem("untouched", "u", nil))
+	if got := s.totalBytes.Load(); got != preSize {
+		t.Fatalf("totalBytes=%d want %d (only pre-seed should count)", got, preSize)
+	}
+}
+
+// /rebuild is all-or-nothing: if the new total bytes exceed the cap the
+// rebuild aborts and the prior store is left intact.
+func TestStore_RebuildAll_RejectsAtByteCap(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "", nil))
+	capBytes := itemSize * 2
+
+	s := NewStore(100, capBytes)
+	pre, _ := s.getOrCreateScope("prior")
+	if _, err := pre.appendItem(newItem("prior", "p", nil)); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	grouped := map[string][]Item{
+		"big": {newItem("big", "", nil), newItem("big", "", nil), newItem("big", "", nil)},
+	}
+	_, _, err := s.rebuildAll(grouped)
+	if err == nil {
+		t.Fatal("expected StoreFullError for over-cap rebuild")
+	}
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected *StoreFullError, got %T: %v", err, err)
+	}
+
+	// Prior state must still be intact — no partial swap.
+	if _, ok := s.getScope("prior"); !ok {
+		t.Fatal("prior scope wiped despite rebuild reject")
+	}
+	if _, ok := s.getScope("big"); ok {
+		t.Fatal("rebuild was partially applied")
+	}
+}
+
+// A successful /rebuild replaces the store entirely: totalBytes must match
+// the sum of the newly installed items, not be additive to the prior state.
+func TestStore_RebuildAll_ResetsByteCounter(t *testing.T) {
+	s := NewStore(100, 100<<20)
+
+	pre, _ := s.getOrCreateScope("old")
+	for i := 0; i < 5; i++ {
+		if _, err := pre.appendItem(newItem("old", "", nil)); err != nil {
+			t.Fatalf("pre-seed %d: %v", i, err)
+		}
+	}
+
+	grouped := map[string][]Item{
+		"new": {newItem("new", "n1", nil), newItem("new", "n2", nil)},
+	}
+	if _, _, err := s.rebuildAll(grouped); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := approxItemSize(newItem("new", "n1", nil)) + approxItemSize(newItem("new", "n2", nil))
+	if got := s.totalBytes.Load(); got != expected {
+		t.Fatalf("totalBytes=%d want %d (counter must be reset to new total)", got, expected)
+	}
+}
+
+// reserveBytes is the atomic admission primitive. Positive deltas honor the
+// cap; negative deltas always succeed. A CAS loop isn't directly observable,
+// so this test just validates the return-value contract.
+func TestStore_ReserveBytes_RejectsPositiveOverCap(t *testing.T) {
+	s := NewStore(100, 100)
+	if ok, _, _ := s.reserveBytes(80); !ok {
+		t.Fatal("reserve 80/100 should succeed")
+	}
+	ok, current, cap := s.reserveBytes(30)
+	if ok {
+		t.Fatal("reserve 30 on top of 80 should fail (cap 100)")
+	}
+	if current != 80 {
+		t.Fatalf("current=%d want 80 (unchanged on failed reserve)", current)
+	}
+	if cap != 100 {
+		t.Fatalf("cap=%d want 100", cap)
+	}
+	if ok, _, _ := s.reserveBytes(-50); !ok {
+		t.Fatal("negative reserve (release) must always succeed")
+	}
+	if got := s.totalBytes.Load(); got != 30 {
+		t.Fatalf("totalBytes=%d want 30 after 80 + (-50)", got)
+	}
+}
+
+// deleteScope must not race with an /append that obtained the buf pointer
+// before the scope was removed from the map. Under the old RLock-snapshot
+// pattern, the appended item's bytes leaked into s.totalBytes after the
+// subtract happened on a stale value. This test drives many rounds of
+// parallel append/delete on the same scope and asserts the final counter
+// matches the items that survived in s.scopes.
+func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
+	s := NewStore(1000, 100<<20)
+
+	const rounds = 200
+	for i := 0; i < rounds; i++ {
+		scope := "race"
+		buf, _ := s.getOrCreateScope(scope)
+		// Prime with one item so deleteScope has real bytes to subtract.
+		if _, err := buf.appendItem(newItem(scope, "", nil)); err != nil {
+			t.Fatalf("prime append: %v", err)
+		}
+
+		done := make(chan struct{}, 2)
+		go func() {
+			buf, _ := s.getOrCreateScope(scope)
+			_, _ = buf.appendItem(newItem(scope, "", nil))
+			done <- struct{}{}
+		}()
+		go func() {
+			_, _ = s.deleteScope(scope)
+			done <- struct{}{}
+		}()
+		<-done
+		<-done
+	}
+
+	// Final invariant: s.totalBytes == sum(buf.bytes for every live scope).
+	// Any ghost bytes from the race would inflate totalBytes above the sum.
+	var liveBytes int64
+	for _, buf := range s.listScopes() {
+		buf.mu.RLock()
+		liveBytes += buf.bytes
+		buf.mu.RUnlock()
+	}
+	if got := s.totalBytes.Load(); got != liveBytes {
+		t.Fatalf("totalBytes=%d but live scopes hold %d bytes — ghost bytes from race", got, liveBytes)
+	}
+}

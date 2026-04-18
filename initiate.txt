@@ -1,0 +1,83 @@
+#POWERSHELL
+
+$ cd E:\dockerprojecten\caddy_module
+$ docker compose up --build -d inmem-cache
+
+[p.s. -d = detached (op de achtergrond). Weglaten als je de logs live wil zien.]
+
+
+[Dev-container erbij voor tests + curl
+De Unix-socket zit op een named volume, dus je kunt er vanaf Windows niet rechtstreeks bij. Alles gaat via de dev-container (die deelt /run).]
+
+$ docker compose up -d dev
+$ docker compose exec dev sh
+
+[Nu zit je in de container (Alpine shell). Daarbinnen:]
+
+# Smoke test
+$ curl --unix-socket /run/inmem.sock http://localhost/help
+$ curl --unix-socket /run/inmem.sock http://localhost/stats
+
+
+
+
+
+
+===================================
+
+curl --unix-socket /run/inmem.sock http://localhost/help
+
+curl --unix-socket /run/inmem.sock http://localhost/stats
+
+curl -s --unix-socket /run/inmem.sock http://localhost/stats | jq
+# jq = pretty print
+# installeer via
+# apk add --no-cache jq        
+
+
+curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"thread:1","payload": "hallo"}'
+
+
+curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+  -H "Content-Type: application/json" \
+  -d '{"scope":"thread:2","id":"m1","payload":{"text":"hello"}}'
+
+curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+  -H "Content-Type: application/json" \
+  -d '{"scope":"thread:2","id":"m2","payload":{"text":"hello"}}'
+
+
+curl -s --unix-socket /run/inmem.sock -X POST http://localhost/warm \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items":[
+      {"scope":"thread:1","id":"m1","payload":{"text":"hallo"}},
+      {"scope":"thread:1","id":"m2","payload":{"text":"wereld"}},
+      {"scope":"thread:2","id":"a1","payload":{"text":"alpha"}},
+      {"scope":"thread:2","id":"a2","payload":{"text":"beta"}},
+      {"scope":"user:42","payload":{"name":"Piet"}}
+    ]
+  }'
+
+curl -s --unix-socket /run/inmem.sock "http://localhost/tail?scope=thread:1&limit=5"
+
+curl -s --unix-socket /run/inmem.sock "http://localhost/tail?scope=thread:1&limit=5"
+
+
+
+# 1000 appends (langzaam want 1000 curl calls)
+for i in $(seq 1 1000); do
+  curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+    -H "Content-Type: application/json" \
+    -d "{\"scope\":\"thread:3\",\"id\":\"m$i\",\"payload\":{\"n\":$i,\"text\":\"msg $i\"}}" \
+    -o /dev/null
+done
+echo "done"
+
+
+
+
+
+
