@@ -271,6 +271,288 @@ func TestUpdateBySeq_Miss(t *testing.T) {
 	}
 }
 
+// --- ScopeBuffer.upsertByID ---------------------------------------------------
+
+func TestUpsertByID_CreatesNewItem(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	result, created, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 1}))
+	if err != nil {
+		t.Fatalf("upsertByID: %v", err)
+	}
+	if !created {
+		t.Fatal("created=false on first upsert")
+	}
+	if result.Seq != 1 {
+		t.Fatalf("seq=%d want 1", result.Seq)
+	}
+	if _, ok := buf.byID["a"]; !ok {
+		t.Fatal("byID index missing new item")
+	}
+	if len(buf.items) != 1 {
+		t.Fatalf("items len=%d want 1", len(buf.items))
+	}
+}
+
+func TestUpsertByID_ReplacesPayloadAndPreservesSeq(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	first, _, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 1}))
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	second, created, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 2}))
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if created {
+		t.Fatal("created=true on replace")
+	}
+	if second.Seq != first.Seq {
+		t.Fatalf("seq changed: %d -> %d", first.Seq, second.Seq)
+	}
+	if len(buf.items) != 1 {
+		t.Fatalf("items len=%d want 1 (no duplicate inserted)", len(buf.items))
+	}
+
+	got, _ := buf.getByID("a")
+	var decoded map[string]interface{}
+	_ = json.Unmarshal(got.Payload, &decoded)
+	if decoded["v"].(float64) != 2 {
+		t.Fatalf("payload not replaced: %s", string(got.Payload))
+	}
+}
+
+func TestUpsertByID_CoexistsWithAppend(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+
+	result, created, err := buf.upsertByID(newItem("s", "b", map[string]interface{}{"v": 9}))
+	if err != nil {
+		t.Fatalf("upsertByID: %v", err)
+	}
+	if !created {
+		t.Fatal("created=false for a fresh id")
+	}
+	if result.Seq != 2 {
+		t.Fatalf("seq=%d want 2 (continuous with prior append)", result.Seq)
+	}
+}
+
+func TestUpsertByID_RejectsAtCapacity(t *testing.T) {
+	buf := NewScopeBuffer(2)
+	_, _ = buf.appendItem(newItem("s", "a", nil))
+	_, _ = buf.appendItem(newItem("s", "b", nil))
+
+	_, _, err := buf.upsertByID(newItem("s", "c", nil))
+	if err == nil {
+		t.Fatal("expected ScopeFullError when upserting past cap")
+	}
+	var sfe *ScopeFullError
+	if !errors.As(err, &sfe) {
+		t.Fatalf("expected *ScopeFullError, got %T: %v", err, err)
+	}
+
+	// A replace must still succeed at capacity — only create hits the cap.
+	if _, _, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 99})); err != nil {
+		t.Fatalf("replace at cap should succeed: %v", err)
+	}
+}
+
+// --- ScopeBuffer.counterAdd ---------------------------------------------------
+
+func TestCounterAdd_CreatesWithStartingValue(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	value, created, err := buf.counterAdd("views", "article_1", 1)
+	if err != nil {
+		t.Fatalf("counterAdd: %v", err)
+	}
+	if !created {
+		t.Fatal("created=false on first call")
+	}
+	if value != 1 {
+		t.Fatalf("value=%d want 1", value)
+	}
+	got, ok := buf.getByID("article_1")
+	if !ok {
+		t.Fatal("item not in byID index")
+	}
+	if string(got.Payload) != "1" {
+		t.Fatalf("payload=%q want %q", string(got.Payload), "1")
+	}
+	if got.Seq != 1 {
+		t.Fatalf("seq=%d want 1", got.Seq)
+	}
+}
+
+func TestCounterAdd_IncrementsExistingCounter(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _, _ = buf.counterAdd("views", "article_1", 10)
+
+	value, created, err := buf.counterAdd("views", "article_1", 5)
+	if err != nil {
+		t.Fatalf("counterAdd: %v", err)
+	}
+	if created {
+		t.Fatal("created=true on existing counter")
+	}
+	if value != 15 {
+		t.Fatalf("value=%d want 15", value)
+	}
+	got, _ := buf.getByID("article_1")
+	if string(got.Payload) != "15" {
+		t.Fatalf("payload=%q want %q", string(got.Payload), "15")
+	}
+	if got.Seq != 1 {
+		t.Fatalf("seq changed: got %d want 1", got.Seq)
+	}
+}
+
+func TestCounterAdd_NegativeByDecrements(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _, _ = buf.counterAdd("c", "k", 100)
+
+	value, _, err := buf.counterAdd("c", "k", -40)
+	if err != nil {
+		t.Fatalf("counterAdd: %v", err)
+	}
+	if value != 60 {
+		t.Fatalf("value=%d want 60", value)
+	}
+}
+
+func TestCounterAdd_AllowsNegativeCreate(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	value, created, err := buf.counterAdd("c", "k", -5)
+	if err != nil {
+		t.Fatalf("counterAdd: %v", err)
+	}
+	if !created {
+		t.Fatal("created=false on fresh counter")
+	}
+	if value != -5 {
+		t.Fatalf("value=%d want -5", value)
+	}
+}
+
+// A payload that isn't a JSON number (e.g. an earlier /append of an HTML
+// string or object) must not be silently overwritten — /counter_add returns
+// a CounterPayloadError so the handler can map it to 409 Conflict.
+func TestCounterAdd_RejectsNonNumericExisting(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`"hello"`)})
+
+	_, _, err := buf.counterAdd("c", "k", 1)
+	if err == nil {
+		t.Fatal("expected CounterPayloadError for string payload")
+	}
+	var cpe *CounterPayloadError
+	if !errors.As(err, &cpe) {
+		t.Fatalf("expected *CounterPayloadError, got %T: %v", err, err)
+	}
+}
+
+func TestCounterAdd_RejectsFloatExisting(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`3.14`)})
+
+	_, _, err := buf.counterAdd("c", "k", 1)
+	if err == nil {
+		t.Fatal("expected CounterPayloadError for float payload")
+	}
+	var cpe *CounterPayloadError
+	if !errors.As(err, &cpe) {
+		t.Fatalf("expected *CounterPayloadError, got %T: %v", err, err)
+	}
+}
+
+func TestCounterAdd_RejectsObjectExisting(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`{"v":1}`)})
+
+	_, _, err := buf.counterAdd("c", "k", 1)
+	var cpe *CounterPayloadError
+	if !errors.As(err, &cpe) {
+		t.Fatalf("expected *CounterPayloadError, got %T: %v", err, err)
+	}
+}
+
+func TestCounterAdd_RejectsOutOfRangeExisting(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	// 2^53 — one above the allowed ±(2^53-1) range.
+	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`9007199254740992`)})
+
+	_, _, err := buf.counterAdd("c", "k", 1)
+	var cpe *CounterPayloadError
+	if !errors.As(err, &cpe) {
+		t.Fatalf("expected *CounterPayloadError, got %T: %v", err, err)
+	}
+}
+
+func TestCounterAdd_RejectsOverflow(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	// Seed at max.
+	_, _, _ = buf.counterAdd("c", "k", MaxCounterValue)
+
+	_, _, err := buf.counterAdd("c", "k", 1)
+	if err == nil {
+		t.Fatal("expected CounterOverflowError when going past MaxCounterValue")
+	}
+	var coe *CounterOverflowError
+	if !errors.As(err, &coe) {
+		t.Fatalf("expected *CounterOverflowError, got %T: %v", err, err)
+	}
+
+	// Existing counter unchanged after rejected overflow.
+	got, _ := buf.getByID("k")
+	if string(got.Payload) != strconvFormatInt(MaxCounterValue) {
+		t.Fatalf("counter mutated on overflow reject: %q", string(got.Payload))
+	}
+}
+
+func TestCounterAdd_RejectsUnderflow(t *testing.T) {
+	buf := NewScopeBuffer(10)
+	_, _, _ = buf.counterAdd("c", "k", -MaxCounterValue)
+
+	_, _, err := buf.counterAdd("c", "k", -1)
+	var coe *CounterOverflowError
+	if !errors.As(err, &coe) {
+		t.Fatalf("expected *CounterOverflowError, got %T: %v", err, err)
+	}
+}
+
+func TestCounterAdd_RejectsAtScopeCapacity(t *testing.T) {
+	buf := NewScopeBuffer(1)
+	_, _, _ = buf.counterAdd("c", "existing", 1)
+
+	_, _, err := buf.counterAdd("c", "another", 1)
+	if err == nil {
+		t.Fatal("expected ScopeFullError when creating past cap")
+	}
+	var sfe *ScopeFullError
+	if !errors.As(err, &sfe) {
+		t.Fatalf("expected *ScopeFullError, got %T: %v", err, err)
+	}
+
+	// Increment of existing must still succeed at capacity — only create hits the cap.
+	value, _, err := buf.counterAdd("c", "existing", 5)
+	if err != nil {
+		t.Fatalf("increment at cap should succeed: %v", err)
+	}
+	if value != 6 {
+		t.Fatalf("value=%d want 6", value)
+	}
+}
+
+// Helper: keep the test readable without importing strconv.
+func strconvFormatInt(n int64) string {
+	// json.Marshal on int64 gives the same decimal representation.
+	b, _ := json.Marshal(n)
+	return string(b)
+}
+
 // --- ScopeBuffer.deleteByID ---------------------------------------------------
 
 func TestDeleteByID_Hit(t *testing.T) {

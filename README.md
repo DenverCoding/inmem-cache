@@ -28,7 +28,7 @@ Payloads can also be served directly via `/render`, allowing Caddy, nginx, or Ap
 
 Three layers with clear boundaries:
 
-- **Core** — `package scopecache`. The cache engine itself. Stdlib-only, framework-agnostic, caller-anonymous: it registers HTTP routes on a standard `*http.ServeMux` and knows nothing about auth, identity, or who is calling. This is what the [spec](scopecache-compact-rfc.md) describes.
+- **Core** — `package scopecache`. The cache engine itself. Stdlib-only, framework-agnostic, caller-anonymous: it registers HTTP routes on a standard `*http.ServeMux` and knows nothing about auth, identity, or who is calling. This is what the [spec](scopecache-rfc.md) describes.
 - **Standalone adapter** — `cmd/scopecache/`. Thin binary that reads env vars, opens a Unix socket, and serves the core. What you use if you're running behind nginx/apache, or with no reverse proxy at all.
 - **Caddy-module adapter** — `caddymodule/` (Phase 3, planned). Wraps the core as a Caddy module. Also the home for cross-cutting concerns that require request context: auth enforcement, identity-to-scope mapping, per-tenant logging and metrics.
 
@@ -142,7 +142,11 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 ### Other endpoints
 
-`/head`, `/tail`, `/warm`, `/rebuild`, `/update`, `/delete`, `/delete-up-to`, `/delete-scope`, `/delete-scope-candidates`, `/stats`, `/help` — see section 12 of the [spec](scopecache-compact-rfc.md) for full examples.
+`/head`, `/tail`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/delete-scope-candidates`, `/stats`, `/help` — see section 12 of the [spec](scopecache-rfc.md) for full examples.
+
+`/upsert` creates a new item or replaces an existing one by `scope` + `id`. It is the idempotent, retry-safe write path: unlike `/append` (which rejects duplicate ids) or `/update` (which soft-misses on absent items), `/upsert` always writes. `seq` is preserved on replace and freshly assigned on create. The response includes `"created": true` for a fresh item and `false` for a replace.
+
+`/counter_add` atomically adds a signed int64 `by` to the integer counter at `scope` + `id`, auto-creating the counter with starting value `by` if it does not exist. Both paths run under a single scope write-lock — no client-side read-modify-write, so concurrent increments do not lose updates. The stored payload is a bare JSON integer (e.g. `42`), so `/get`, `/render`, `/upsert` and `/update` all see the same value. `by` is required and non-zero; both `by` and the result must lie within ±(2^53−1) (the JavaScript safe-integer range, so values round-trip through every client without precision loss). Reads and absolute sets go through the normal `/get`, `/upsert` and `/update` endpoints — only `/counter_add` parses the payload as an integer. Responses carry `{"ok", "created", "value"}`. If the existing item at `scope` + `id` is *not* a JSON integer within the allowed range, the request is rejected with `409 Conflict` — counters do not silently overwrite other payload types.
 
 ## Configuration
 
@@ -217,7 +221,7 @@ Module path: `github.com/DenverCoding/scopecache`. Stdlib only.
 
 ## Spec
 
-The full design and endpoint contract lives in [scopecache-compact-rfc.md](scopecache-compact-rfc.md).
+The full design and endpoint contract lives in [scopecache-rfc.md](scopecache-rfc.md).
 
 ## License
 

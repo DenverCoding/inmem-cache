@@ -25,6 +25,13 @@ const (
 	BulkRequestBytesOverhead = 16 << 20 // 16 MiB
 
 	ReadHeatWindowDays = 7
+
+	// MaxCounterValue is the largest absolute value a /counter_add operation
+	// may observe or produce. Matches the JavaScript safe-integer range
+	// (2^53 - 1), so counter values marshalled into JSON round-trip through
+	// every client without loss of precision. Applies to `by`, the existing
+	// counter value, and the result of the addition.
+	MaxCounterValue int64 = (1 << 53) - 1 // 9,007,199,254,740,991
 )
 
 // MB is an int64 byte count that serializes to JSON as a number in MiB with
@@ -61,6 +68,15 @@ type DeleteScopeRequest struct {
 type DeleteUpToRequest struct {
 	Scope  string `json:"scope"`
 	MaxSeq uint64 `json:"max_seq"`
+}
+
+// CounterAddRequest is the body of the `/counter_add` endpoint. `By` is a
+// pointer so the handler can distinguish a missing field from an explicit
+// zero — the latter is a client bug and is rejected with 400.
+type CounterAddRequest struct {
+	Scope string `json:"scope"`
+	ID    string `json:"id"`
+	By    *int64 `json:"by"`
 }
 
 type ItemsRequest struct {
@@ -128,6 +144,31 @@ type StoreFullError struct {
 
 func (e *StoreFullError) Error() string {
 	return "store is at byte capacity"
+}
+
+// CounterPayloadError is returned by ScopeBuffer.counterAdd when the existing
+// item at scope+id cannot participate in a counter operation: its payload is
+// not a JSON number, not an integer, or outside the allowed ±MaxCounterValue
+// range. The handler converts it to 409 Conflict.
+type CounterPayloadError struct {
+	Reason string
+}
+
+func (e *CounterPayloadError) Error() string {
+	return e.Reason
+}
+
+// CounterOverflowError is returned by ScopeBuffer.counterAdd when the
+// resulting value would exceed ±MaxCounterValue. The handler converts it to
+// 400 Bad Request — the caller supplied a `by` that combined with the current
+// value would push the counter outside the JS-safe integer range.
+type CounterOverflowError struct {
+	Current int64
+	By      int64
+}
+
+func (e *CounterOverflowError) Error() string {
+	return "the counter operation would exceed the allowed range of ±(2^53-1)"
 }
 
 func nowUnixMicro() int64 {

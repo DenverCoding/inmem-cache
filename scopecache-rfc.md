@@ -90,7 +90,8 @@ Note: items do not carry a server-level `ts`. Scope-level timing data
 - per-item cap: `1 MiB` (enforced on `approxItemSize` = overhead + scope + id + payload, not on raw payload alone)
 - per-scope item cap: `100000` items by default, overridable via the `SCOPECACHE_SCOPE_MAX_ITEMS` environment variable
 - store-wide byte cap: `100 MiB` of aggregate `approxItemSize` by default, overridable via the `SCOPECACHE_MAX_STORE_MB` environment variable (integer MiB). Tuned for modest VPS deployments (~1 GB total RAM alongside DB + app).
-- per-request body cap (single-item endpoints `/append`, `/update`, `/delete`, `/delete-scope`): `2 MiB` fixed.
+- per-request body cap (single-item endpoints `/append`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-scope`): `2 MiB` fixed.
+- counter value range: `±(2^53 − 1) = ±9,007,199,254,740,991`. This matches the JavaScript safe-integer range so counter values round-trip through every JSON client without precision loss. It applies to `by`, to the existing counter value, and to the result of `/counter_add`.
 - per-request body cap (bulk endpoints `/warm`, `/rebuild`): **derived at startup from the configured store cap** — roughly `store_cap + 10% + 16 MiB`. This guarantees a fully-loaded cache can always be expressed in one bulk request, with headroom for JSON framing. Concretely: default 100 MiB store → ~126 MiB request cap; `SCOPECACHE_MAX_STORE_MB=1024` → ~1.15 GiB request cap.
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
@@ -222,6 +223,8 @@ POST /append
 POST /warm
 POST /rebuild
 POST /update
+POST /upsert
+POST /counter_add
 POST /delete
 POST /delete-up-to
 POST /delete-scope
@@ -281,6 +284,40 @@ Behavior:
 - `seq` addressing lets clients mutate id-less items' payloads
 - preserve the item's `seq`
 - return hit/miss metadata
+
+### `POST /upsert`
+Input:
+- `scope` required
+- `id` required
+- `payload` required
+- `seq` forbidden
+
+Behavior:
+- create a new item or replace an existing one addressed by `scope + id`
+- on replace, preserve the item's `seq` (stable cursor for existing consumers)
+- on create, assign a fresh cache-local `seq` as `/append` would
+- reject with `507 Insufficient Storage` if the create path would exceed the per-scope item cap or the store byte cap (replace only pays the payload byte delta)
+- unlike `/append` (which rejects duplicate ids) and `/update` (which soft-misses on absent items), `/upsert` always writes — making it the idempotent, retry-safe write path
+- no `seq` addressing: `seq` is cache-assigned and has no meaning for a not-yet-created item
+- response includes `"created": true` for a fresh item, `false` for a replace, plus the final `item`
+
+### `POST /counter_add`
+Input:
+- `scope` required
+- `id` required
+- `by` required; signed 64-bit integer, non-zero, within ±(2^53 − 1)
+- `payload` forbidden (the stored payload is owned by this endpoint)
+- `seq` forbidden
+
+Behavior:
+- atomically add `by` to the integer counter stored at `scope + id`, under a single scope write-lock so concurrent calls cannot lose updates
+- if no item exists at `scope + id`, create a fresh counter with starting value equal to `by`; create paths pay the per-scope item cap and the store byte cap like `/append` and are rejected with `507 Insufficient Storage` on overflow
+- the stored payload is a bare JSON integer (for example `42`), so `/get`, `/render`, `/upsert` and `/update` all observe the same value
+- reject with `409 Conflict` if the existing item at `scope + id` is not a JSON integer within ±(2^53 − 1) — `/counter_add` never silently overwrites a non-counter payload
+- reject with `400 Bad Request` if the resulting value would exceed ±(2^53 − 1), if `by` itself is outside that range, if `by` is zero, or if `by` is missing
+- this is the only endpoint that reads or mutates payload bytes as a typed value; every other write path treats payloads as opaque
+- reads and absolute sets go through the normal `/get`, `/upsert` and `/update` endpoints
+- response carries `{ "ok", "created", "value" }`: `created` is `true` on auto-create and `false` on increment; `value` is the final counter value after the addition
 
 ### `POST /delete`
 Input:
@@ -548,7 +585,60 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/update \
   }'
 ```
 
-### 12.11 Delete
+### 12.11 Upsert
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/upsert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope": "views",
+    "id": "article:42",
+    "payload": 1000
+  }'
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "created": true,
+  "item": {
+    "scope": "views",
+    "id": "article:42",
+    "seq": 1,
+    "payload": 1000
+  }
+}
+```
+
+A second call with the same `scope + id` replaces the payload and returns `"created": false`; the `seq` stays the same.
+
+### 12.12 Counter add
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/counter_add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope": "views",
+    "id": "article:42",
+    "by": 1
+  }'
+```
+
+Response (first call — auto-create):
+
+```json
+{
+  "ok": true,
+  "created": true,
+  "value": 1
+}
+```
+
+A second call with the same `scope + id` increments and returns `"created": false, "value": 2`. Pass a negative `by` to decrement. A subsequent `/get?scope=views&id=article:42` returns the item with `"payload": 2`.
+
+### 12.13 Delete
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete \
@@ -559,7 +649,7 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete \
   }'
 ```
 
-### 12.12 Delete-through (write-buffer drain)
+### 12.14 Delete-through (write-buffer drain)
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to \
@@ -570,13 +660,13 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to
   }'
 ```
 
-### 12.13 Candidate scopes older than 3 hours
+### 12.15 Candidate scopes older than 3 hours
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/delete-scope-candidates?limit=10&hours=3"
 ```
 
-### 12.14 Stats
+### 12.16 Stats
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/stats"

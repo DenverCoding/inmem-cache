@@ -130,6 +130,22 @@ func validateWriteItem(item Item, endpoint string) error {
 	return checkItemSize(item)
 }
 
+func validateUpsertItem(item Item) error {
+	if err := validateScope(item.Scope, "/upsert"); err != nil {
+		return err
+	}
+	if err := requireID(item.ID, "/upsert"); err != nil {
+		return err
+	}
+	if !payloadPresent(item.Payload) {
+		return errors.New("the 'payload' field is required")
+	}
+	if item.Seq != 0 {
+		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '/upsert' endpoint")
+	}
+	return checkItemSize(item)
+}
+
 func validateUpdateItem(item Item) error {
 	if err := validateScope(item.Scope, "/update"); err != nil {
 		return err
@@ -148,6 +164,29 @@ func validateUpdateItem(item Item) error {
 		return errors.New("the 'payload' field is required")
 	}
 	return checkItemSize(item)
+}
+
+// validateCounterAddRequest returns the parsed `by` on success so the handler
+// can pass it straight to the store without re-dereferencing the pointer.
+// Missing `by` is distinguished from an explicit zero by the pointer type.
+func validateCounterAddRequest(req CounterAddRequest) (int64, error) {
+	if err := validateScope(req.Scope, "/counter_add"); err != nil {
+		return 0, err
+	}
+	if err := requireID(req.ID, "/counter_add"); err != nil {
+		return 0, err
+	}
+	if req.By == nil {
+		return 0, errors.New("the 'by' field is required for the '/counter_add' endpoint")
+	}
+	by := *req.By
+	if by == 0 {
+		return 0, errors.New("the 'by' field must not be zero")
+	}
+	if by > MaxCounterValue || by < -MaxCounterValue {
+		return 0, errors.New("the 'by' field must be within ±(2^53-1)")
+	}
+	return by, nil
 }
 
 func validateDeleteRequest(req DeleteRequest) error {

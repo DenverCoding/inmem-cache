@@ -261,6 +261,128 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
+// handleUpsert creates a new item or replaces an existing one by scope + id.
+// Unlike /append (which rejects duplicate ids) or /update (which soft-misses
+// on absent items), /upsert always writes — making it the idempotent, retry-
+// safe write path. Seq is preserved on replace and freshly assigned on create.
+func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, started)
+		return
+	}
+
+	var item Item
+	if err := decodeBody(w, r, MaxSingleRequestBytes, &item); err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	if err := validateUpsertItem(item); err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	buf, err := api.store.getOrCreateScope(item.Scope)
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	origScope := item.Scope
+	result, created, err := buf.upsertByID(item)
+	if err != nil {
+		var sfe *ScopeFullError
+		if errors.As(err, &sfe) {
+			scopeFull(w, started, []ScopeCapacityOffender{
+				{Scope: origScope, Count: sfe.Count, Cap: sfe.Cap},
+			})
+			return
+		}
+		var stfe *StoreFullError
+		if errors.As(err, &stfe) {
+			storeFull(w, started, stfe)
+			return
+		}
+		conflict(w, started, err.Error())
+		return
+	}
+
+	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
+		"ok":      true,
+		"created": created,
+		"item":    result,
+	}, started)
+}
+
+// handleCounterAdd atomically increments (or creates) a numeric counter at
+// scope+id by `by`. It is the only endpoint that reads or mutates a payload
+// as a typed value — every other write path treats payloads as opaque bytes.
+// Creates pay a fresh approxItemSize reservation; replaces pay only the byte
+// delta of the new integer representation.
+func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, started)
+		return
+	}
+
+	var req CounterAddRequest
+	if err := decodeBody(w, r, MaxSingleRequestBytes, &req); err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	by, err := validateCounterAddRequest(req)
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	buf, err := api.store.getOrCreateScope(req.Scope)
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	origScope := req.Scope
+	value, created, err := buf.counterAdd(req.Scope, req.ID, by)
+	if err != nil {
+		var sfe *ScopeFullError
+		if errors.As(err, &sfe) {
+			scopeFull(w, started, []ScopeCapacityOffender{
+				{Scope: origScope, Count: sfe.Count, Cap: sfe.Cap},
+			})
+			return
+		}
+		var stfe *StoreFullError
+		if errors.As(err, &stfe) {
+			storeFull(w, started, stfe)
+			return
+		}
+		var cpe *CounterPayloadError
+		if errors.As(err, &cpe) {
+			conflict(w, started, cpe.Error())
+			return
+		}
+		var coe *CounterOverflowError
+		if errors.As(err, &coe) {
+			badRequest(w, started, coe.Error())
+			return
+		}
+		conflict(w, started, err.Error())
+		return
+	}
+
+	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
+		"ok":      true,
+		"created": created,
+		"value":   value,
+	}, started)
+}
+
 func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -839,6 +961,8 @@ POST /append - append one item to a scope
 POST /warm - warm or refresh one or more scopes
 POST /rebuild - rebuild the entire cache
 POST /update - update one item by scope + id or scope + seq (exactly one of id/seq required)
+POST /upsert - create or replace one item by scope + id; response carries "created": true for a fresh item, false for a replace
+POST /counter_add - atomically add 'by' (signed int64, non-zero, within ±(2^53-1)) to the integer counter at scope + id; creates a fresh counter with starting value 'by' on miss; 409 if the existing item is not a counter-valued integer; response carries {ok, created, value}
 POST /delete - delete one item by scope + id or scope + seq (exactly one of id/seq required)
 POST /delete-up-to - delete every item in a scope with seq <= max_seq
 POST /delete-scope - delete one entire scope from the cache
@@ -869,6 +993,8 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/warm", api.handleWarm)
 	mux.HandleFunc("/rebuild", api.handleRebuild)
 	mux.HandleFunc("/update", api.handleUpdate)
+	mux.HandleFunc("/upsert", api.handleUpsert)
+	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete-up-to", api.handleDeleteUpTo)
 	mux.HandleFunc("/delete-scope", api.handleDeleteScope)

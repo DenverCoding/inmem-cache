@@ -373,6 +373,225 @@ func TestUpdate_RejectsNeitherIDNorSeq(t *testing.T) {
 	}
 }
 
+// --- /upsert ------------------------------------------------------------------
+
+func TestUpsert_Creates(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	code, out, _ := doRequest(t, h, "POST", "/upsert", `{"scope":"s","id":"a","payload":{"v":1}}`)
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if !mustBool(t, out, "created") {
+		t.Error("created=false on first upsert")
+	}
+	item := out["item"].(map[string]interface{})
+	if item["seq"].(float64) != 1 {
+		t.Errorf("seq=%v want 1", item["seq"])
+	}
+
+	_, got, _ := doRequest(t, h, "GET", "/get?scope=s&id=a", "")
+	if !mustBool(t, got, "hit") {
+		t.Error("get after upsert missed")
+	}
+}
+
+func TestUpsert_Replaces(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/upsert", `{"scope":"s","id":"a","payload":{"v":1}}`)
+
+	code, out, _ := doRequest(t, h, "POST", "/upsert", `{"scope":"s","id":"a","payload":{"v":2}}`)
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if mustBool(t, out, "created") {
+		t.Error("created=true on replace")
+	}
+	item := out["item"].(map[string]interface{})
+	if item["seq"].(float64) != 1 {
+		t.Errorf("seq=%v want 1 (preserved)", item["seq"])
+	}
+
+	_, got, _ := doRequest(t, h, "GET", "/get?scope=s&id=a", "")
+	gotItem := got["item"].(map[string]interface{})
+	if gotItem["payload"].(map[string]interface{})["v"].(float64) != 2 {
+		t.Error("payload not replaced")
+	}
+}
+
+func TestUpsert_MissingID(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/upsert", `{"scope":"s","payload":{"v":1}}`)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestUpsert_MissingScope(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/upsert", `{"id":"a","payload":{"v":1}}`)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestUpsert_MissingPayload(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/upsert", `{"scope":"s","id":"a"}`)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestUpsert_SeqForbidden(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/upsert", `{"scope":"s","id":"a","seq":5,"payload":{"v":1}}`)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestUpsert_MethodNotAllowed(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "GET", "/upsert", "")
+	if code != http.StatusMethodNotAllowed {
+		t.Fatalf("code=%d want 405", code)
+	}
+}
+
+// --- /counter_add -------------------------------------------------------------
+
+func TestCounterAdd_CreatesOnMiss(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	code, out, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"views","id":"article_1","by":1}`)
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if !mustBool(t, out, "created") {
+		t.Error("created=false on first call")
+	}
+	if mustFloat(t, out, "value") != 1 {
+		t.Errorf("value=%v want 1", out["value"])
+	}
+
+	// Round-trip through /get — payload is a bare JSON number.
+	_, got, _ := doRequest(t, h, "GET", "/get?scope=views&id=article_1", "")
+	if !mustBool(t, got, "hit") {
+		t.Error("round-trip /get miss")
+	}
+}
+
+func TestCounterAdd_Increments(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":10}`)
+
+	code, out, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":5}`)
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if mustBool(t, out, "created") {
+		t.Error("created=true on existing counter")
+	}
+	if mustFloat(t, out, "value") != 15 {
+		t.Errorf("value=%v want 15", out["value"])
+	}
+}
+
+func TestCounterAdd_NegativeBy(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":100}`)
+
+	_, out, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":-40}`)
+	if mustFloat(t, out, "value") != 60 {
+		t.Errorf("value=%v want 60", out["value"])
+	}
+}
+
+func TestCounterAdd_ConflictOnNonNumericExisting(t *testing.T) {
+	h, _ := newTestHandler(10)
+	// Seed with an HTML-ish string payload via /append.
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"pages","id":"home","payload":"<html/>"}`)
+
+	code, out, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"pages","id":"home","by":1}`)
+	if code != http.StatusConflict {
+		t.Fatalf("code=%d want 409", code)
+	}
+	if mustBool(t, out, "ok") {
+		t.Error("ok=true on conflict")
+	}
+}
+
+func TestCounterAdd_ConflictOnFloatExisting(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/upsert", `{"scope":"c","id":"k","payload":3.14}`)
+
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":1}`)
+	if code != http.StatusConflict {
+		t.Fatalf("code=%d want 409", code)
+	}
+}
+
+func TestCounterAdd_BadRequestOnZeroBy(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":0}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestCounterAdd_BadRequestOnMissingBy(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestCounterAdd_BadRequestOnMissingID(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","by":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestCounterAdd_BadRequestOnMissingScope(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"id":"k","by":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestCounterAdd_BadRequestOnByOutOfRange(t *testing.T) {
+	h, _ := newTestHandler(10)
+	// 2^53 is one past MaxCounterValue.
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":9007199254740992}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestCounterAdd_BadRequestOnOverflow(t *testing.T) {
+	h, _ := newTestHandler(10)
+	// Seed at the maximum allowed counter value.
+	_, _, _ = doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":9007199254740991}`)
+
+	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","id":"k","by":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+func TestCounterAdd_MethodNotAllowed(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "GET", "/counter_add", "")
+	if code != http.StatusMethodNotAllowed {
+		t.Fatalf("code=%d want 405", code)
+	}
+}
+
 // --- /delete ------------------------------------------------------------------
 
 func TestDelete_Hit(t *testing.T) {
