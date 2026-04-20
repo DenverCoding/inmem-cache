@@ -50,22 +50,21 @@ The service listens on `/run/scopecache.sock` inside the container (mounted to t
 
 Stdlib-only means the build has no external dependencies — just Go and git.
 
-### 1. Install Go (skip if already present)
+### 1. Install Go from the official tarball
 
-Debian / Ubuntu:
-
-```bash
-sudo apt update && sudo apt install -y golang-go git
-```
-
-If the distro's Go is too old (anything before 1.22), install the official tarball instead:
+`go.mod` requires **Go 1.23+**. Distro packages (`apt install golang-go`) are often older and will fail on `go build` with `toolchain not available`, so install the official tarball directly:
 
 ```bash
+sudo apt update && sudo apt install -y git curl
+sudo rm -rf /usr/local/go
 curl -L https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh
-source /etc/profile.d/go.sh
-go version
+echo 'export PATH=/usr/local/go/bin:$PATH' | sudo tee /etc/profile.d/go.sh
+export PATH=/usr/local/go/bin:$PATH
+hash -r
+go version   # should print: go version go1.23.4 linux/amd64
 ```
+
+Note: `/usr/local/go/bin` is placed **first** on PATH so it wins over any prior apt-installed Go.
 
 ### 2. Clone and build
 
@@ -77,16 +76,29 @@ go build -o scopecache ./cmd/scopecache
 
 ### 3. Run it
 
-The default socket path is `/run/scopecache.sock`, which typically requires root. For a non-root run, override the path:
+As root, the default socket path `/run/scopecache.sock` works out of the box:
 
 ```bash
-SCOPECACHE_SOCKET_PATH=/tmp/scopecache.sock ./scopecache
+./scopecache &
 ```
 
-Smoke test from another shell:
+As a non-root user, override the socket path to somewhere writable:
 
 ```bash
-curl --unix-socket /tmp/scopecache.sock http://localhost/help
+SCOPECACHE_SOCKET_PATH=/tmp/scopecache.sock ./scopecache &
+```
+
+Smoke test:
+
+```bash
+curl --unix-socket /run/scopecache.sock http://localhost/help
+curl -s --unix-socket /run/scopecache.sock http://localhost/stats
+```
+
+Full end-to-end suite (75 assertions over every endpoint):
+
+```bash
+bash e2e_test.sh
 ```
 
 ### 4. Run under systemd (optional)
