@@ -50,9 +50,25 @@ The service listens on `/run/scopecache.sock` inside the container (mounted to t
 
 Stdlib-only means the build has no external dependencies — just Go and git.
 
-### 1. Install Go from the official tarball
+### 1. Install Go
 
-`go.mod` requires **Go 1.23+**. Distro packages (`apt install golang-go`) are often older and will fail on `go build` with `toolchain not available`, so install the official tarball directly:
+`go.mod` requires **Go 1.21+**, which covers most modern distros out of the box. The distro package is the easy path:
+
+```bash
+sudo apt update && sudo apt install -y golang-go git
+go version   # must be >= 1.21
+```
+
+Distro coverage:
+
+| Distro            | Default Go      |
+|-------------------|-----------------|
+| Debian 12 (bookworm) | 1.19 — too old, use tarball below |
+| Debian 13 (trixie)   | 1.24 — ok |
+| Ubuntu 22.04 LTS  | 1.18 — too old, use tarball below |
+| Ubuntu 24.04 LTS  | 1.22 — ok |
+
+If your distro's Go is older than 1.21, install the official tarball instead:
 
 ```bash
 sudo apt update && sudo apt install -y git curl
