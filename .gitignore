@@ -1,5 +1,6 @@
 /scopecache
 *.exe
+*.test
 /sock/
 /CLAUDE.md
 /init.txt
