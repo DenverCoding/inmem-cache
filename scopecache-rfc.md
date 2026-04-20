@@ -228,6 +228,7 @@ POST /counter_add
 POST /delete
 POST /delete-up-to
 POST /delete-scope
+POST /wipe
 ```
 
 ### `POST /append`
@@ -353,6 +354,17 @@ Behavior:
 - delete one entire scope
 - remove items, indexes, and scope-level metadata for that scope
 - return hit/miss metadata and deleted item count
+
+### `POST /wipe`
+Input:
+- no request body
+
+Behavior:
+- clear the entire store in one atomic call: every scope, every item, every byte reservation
+- the store-wide complement of `/delete-scope`: a client-side equivalent would be `N` `/delete-scope` calls and would not be atomic
+- the cache never wipes on its own — this is an explicit client action intended for test teardown, emergency reset, or preparing a fresh slate before a `/rebuild`
+- response carries `{ "ok", "deleted_scopes", "deleted_items", "freed_mb" }`: `freed_mb` is the store-wide byte budget released back to the cap (in MiB, 4 decimals, matching `/stats`)
+- holders of stale scope buffer pointers see a detached buffer: any write they complete after the wipe stays local to the orphan and cannot corrupt the post-wipe byte counter (same guarantee as `/delete-scope`)
 
 ---
 
@@ -666,7 +678,28 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to
 curl -s --unix-socket /run/scopecache.sock "http://localhost/delete-scope-candidates?limit=10&hours=3"
 ```
 
-### 12.16 Stats
+### 12.16 Wipe the entire store
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/wipe
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "deleted_scopes": 42,
+  "deleted_items": 1337,
+  "freed_mb": 12.4512
+}
+```
+
+Atomic: when the call returns, every scope, every item and every byte
+reservation has been released. A follow-up `/stats` reports
+`scope_count: 0`, `total_items: 0`, `tracked_store_mb: 0`.
+
+### 12.17 Stats
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/stats"

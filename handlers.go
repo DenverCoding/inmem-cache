@@ -546,6 +546,33 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
+// handleWipe clears the entire store: every scope, every item, every byte
+// reservation. It is the store-wide complement of /delete-scope — destructive
+// in one call, with no request body. The response carries the counts and
+// freed bytes so the client can verify what was released.
+//
+// This is *not* an eviction policy: the cache never wipes on its own.
+// /wipe exists because a client-side "for each scope: /delete-scope" is
+// N calls and not atomic, whereas a server-side wipe is one lock and one
+// map replacement.
+func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, started)
+		return
+	}
+
+	deletedScopes, deletedItems, freedBytes := api.store.wipe()
+
+	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
+		"ok":             true,
+		"deleted_scopes": deletedScopes,
+		"deleted_items":  deletedItems,
+		"freed_mb":       MB(freedBytes),
+	}, started)
+}
+
 func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -966,6 +993,7 @@ POST /counter_add - atomically add 'by' (signed int64, non-zero, within ±(2^53-
 POST /delete - delete one item by scope + id or scope + seq (exactly one of id/seq required)
 POST /delete-up-to - delete every item in a scope with seq <= max_seq
 POST /delete-scope - delete one entire scope from the cache
+POST /wipe - delete every scope from the cache in one atomic call (no request body); response carries {ok, deleted_scopes, deleted_items, freed_mb}
 GET  /head - get the oldest items from a scope; supports optional after_seq for cursor-based forward reads (offset is not supported, use /tail for position-based paging)
 GET  /tail - get the most recent items from a scope (supports optional offset)
 GET  /get - get one item by scope + id or scope + seq
@@ -998,6 +1026,7 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete-up-to", api.handleDeleteUpTo)
 	mux.HandleFunc("/delete-scope", api.handleDeleteScope)
+	mux.HandleFunc("/wipe", api.handleWipe)
 	mux.HandleFunc("/head", api.handleHead)
 	mux.HandleFunc("/tail", api.handleTail)
 	mux.HandleFunc("/get", api.handleGet)

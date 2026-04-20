@@ -906,6 +906,117 @@ func TestStore_DeleteScope(t *testing.T) {
 	}
 }
 
+// --- Store.wipe ---------------------------------------------------------------
+
+func TestStore_Wipe_EmptyStore(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	scopes, items, freed := s.wipe()
+	if scopes != 0 || items != 0 || freed != 0 {
+		t.Fatalf("wipe empty: scopes=%d items=%d freed=%d want 0,0,0", scopes, items, freed)
+	}
+}
+
+func TestStore_Wipe_RemovesEveryScopeAndCountsItems(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	for _, name := range []string{"a", "b", "c"} {
+		buf, _ := s.getOrCreateScope(name)
+		for i := 0; i < 4; i++ {
+			if _, err := buf.appendItem(newItem(name, "", nil)); err != nil {
+				t.Fatalf("append %s/%d: %v", name, i, err)
+			}
+		}
+	}
+
+	scopes, items, freed := s.wipe()
+	if scopes != 3 || items != 12 {
+		t.Fatalf("wipe: scopes=%d items=%d want 3,12", scopes, items)
+	}
+	if freed <= 0 {
+		t.Fatalf("wipe: freed=%d want >0", freed)
+	}
+
+	for _, name := range []string{"a", "b", "c"} {
+		if _, ok := s.getScope(name); ok {
+			t.Errorf("scope %q should be gone after wipe", name)
+		}
+	}
+}
+
+// wipe must bring s.totalBytes exactly back to zero so the next append's
+// reservation starts from a clean baseline. This is the property /wipe
+// promises to clients that are about to /rebuild into a freshly empty store.
+func TestStore_Wipe_ResetsTotalBytes(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	buf, _ := s.getOrCreateScope("s")
+	for i := 0; i < 5; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if s.totalBytes.Load() == 0 {
+		t.Fatal("totalBytes should be non-zero before wipe")
+	}
+
+	_, _, freed := s.wipe()
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Fatalf("totalBytes=%d want 0 after wipe", got)
+	}
+	if freed == 0 {
+		t.Fatal("freed bytes reported as 0 despite non-empty store")
+	}
+}
+
+// After /wipe the next /append must succeed even when the pre-wipe store
+// was at its byte cap — the cap budget has been fully released.
+func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
+	itemSize := approxItemSize(newItem("s", "", nil))
+	capBytes := itemSize * 3
+
+	s := NewStore(100, capBytes)
+	buf, _ := s.getOrCreateScope("s")
+	for i := 0; i < 3; i++ {
+		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+			t.Fatalf("fill %d: %v", i, err)
+		}
+	}
+	// At the cap: the next append must fail.
+	if _, err := buf.appendItem(newItem("s", "", nil)); err == nil {
+		t.Fatal("expected StoreFullError before wipe")
+	}
+
+	s.wipe()
+
+	buf2, _ := s.getOrCreateScope("s")
+	if _, err := buf2.appendItem(newItem("s", "", nil)); err != nil {
+		t.Fatalf("append after wipe: %v", err)
+	}
+}
+
+// A ScopeBuffer pointer held before wipe must detach cleanly: further
+// mutations on it must not corrupt the store's byte counter. This mirrors
+// the orphan-buffer guarantee of deleteScope.
+func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
+	s := NewStore(10, 100<<20)
+
+	buf, _ := s.getOrCreateScope("s")
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	s.wipe()
+
+	// The caller still has `buf`; operating on it must not touch totalBytes.
+	if _, err := buf.appendItem(newItem("s", "b", nil)); err != nil {
+		t.Fatalf("orphan append: %v", err)
+	}
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Fatalf("orphan mutation leaked into totalBytes: got %d want 0", got)
+	}
+}
+
 func TestStore_ReplaceScopes_LeavesOtherScopesUntouched(t *testing.T) {
 	s := NewStore(10, 100<<20)
 

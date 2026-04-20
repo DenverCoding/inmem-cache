@@ -689,6 +689,125 @@ func TestDeleteScope_Miss(t *testing.T) {
 	}
 }
 
+// --- /wipe --------------------------------------------------------------------
+
+func TestWipe_EmptyStore(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	code, out, _ := doRequest(t, h, "POST", "/wipe", "")
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if !mustBool(t, out, "ok") {
+		t.Error("ok=false")
+	}
+	if mustFloat(t, out, "deleted_scopes") != 0 {
+		t.Errorf("deleted_scopes=%v want 0", out["deleted_scopes"])
+	}
+	if mustFloat(t, out, "deleted_items") != 0 {
+		t.Errorf("deleted_items=%v want 0", out["deleted_items"])
+	}
+}
+
+func TestWipe_ClearsEveryScope(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","id":"1","payload":{"v":1}}`)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","id":"2","payload":{"v":2}}`)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"b","id":"1","payload":{"v":1}}`)
+
+	code, out, _ := doRequest(t, h, "POST", "/wipe", "")
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if mustFloat(t, out, "deleted_scopes") != 2 {
+		t.Errorf("deleted_scopes=%v want 2", out["deleted_scopes"])
+	}
+	if mustFloat(t, out, "deleted_items") != 3 {
+		t.Errorf("deleted_items=%v want 3", out["deleted_items"])
+	}
+	if mustFloat(t, out, "freed_mb") <= 0 {
+		t.Errorf("freed_mb=%v want >0", out["freed_mb"])
+	}
+
+	// Both scopes must now be gone.
+	for _, scope := range []string{"a", "b"} {
+		_, out, _ := doRequest(t, h, "GET", "/stats", "")
+		scopes, ok := out["scopes"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("stats has no scopes map: %+v", out)
+		}
+		if _, present := scopes[scope]; present {
+			t.Errorf("scope %q still present after /wipe", scope)
+		}
+	}
+}
+
+// After /wipe the store-wide byte counter and scope count surfaced via
+// /stats must both be zero — clients use those numbers to confirm the wipe.
+func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"x","payload":{"v":1}}`)
+
+	_, _, _ = doRequest(t, h, "POST", "/wipe", "")
+
+	_, out, _ := doRequest(t, h, "GET", "/stats", "")
+	if mustFloat(t, out, "scope_count") != 0 {
+		t.Errorf("scope_count=%v want 0", out["scope_count"])
+	}
+	if mustFloat(t, out, "total_items") != 0 {
+		t.Errorf("total_items=%v want 0", out["total_items"])
+	}
+	if mustFloat(t, out, "tracked_store_mb") != 0 {
+		t.Errorf("tracked_store_mb=%v want 0", out["tracked_store_mb"])
+	}
+}
+
+func TestWipe_GETNotAllowed(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	code, _, _ := doRequest(t, h, "GET", "/wipe", "")
+	if code != 405 {
+		t.Fatalf("code=%d want 405", code)
+	}
+}
+
+// /wipe accepts a POST with no body. A non-empty body is simply ignored;
+// it has no effect on the operation.
+func TestWipe_IgnoresBody(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"x","payload":{"v":1}}`)
+
+	code, out, _ := doRequest(t, h, "POST", "/wipe", `{"anything":"goes"}`)
+	if code != 200 {
+		t.Fatalf("code=%d want 200", code)
+	}
+	if mustFloat(t, out, "deleted_items") != 1 {
+		t.Errorf("deleted_items=%v want 1", out["deleted_items"])
+	}
+}
+
+// After /wipe fresh writes must succeed — the cap budget is fully released,
+// no stale scope state blocks a re-used id, seq counters restart from 1.
+func TestWipe_FreshWritesAfterwards(t *testing.T) {
+	h, _ := newTestHandler(10)
+	for i := 0; i < 3; i++ {
+		_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"`+fmt.Sprint(i)+`","payload":{"v":1}}`)
+	}
+
+	_, _, _ = doRequest(t, h, "POST", "/wipe", "")
+
+	// Re-use an id that existed before the wipe — must succeed.
+	code, out, _ := doRequest(t, h, "POST", "/append", `{"scope":"s","id":"0","payload":{"v":42}}`)
+	if code != 200 {
+		t.Fatalf("re-append after wipe: code=%d want 200", code)
+	}
+	item := out["item"].(map[string]interface{})
+	// seq restarts from 1 because the scope was fully removed.
+	if item["seq"].(float64) != 1 {
+		t.Errorf("post-wipe seq=%v want 1", item["seq"])
+	}
+}
+
 // --- /head / /tail ------------------------------------------------------------
 
 func TestHead_DefaultLimitAndMiss(t *testing.T) {

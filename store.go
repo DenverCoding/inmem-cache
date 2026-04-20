@@ -805,6 +805,39 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	return itemCount, true
 }
 
+// wipe removes every scope from the store and resets the byte counter to
+// zero in one atomic step. Each scope buffer is detached (buf.store = nil)
+// under its own write-lock before the store map is replaced, mirroring the
+// /delete-scope pattern: any in-flight mutator waiting on buf.mu wakes up
+// on a detached buffer and skips store-counter accounting, so orphaned work
+// cannot corrupt the post-wipe state.
+//
+// freedBytes is captured via totalBytes.Swap(0) AFTER every buf has been
+// detached, so it covers any bytes a concurrent /append committed through
+// reserveBytes while wipe was walking the map.
+//
+// The caller — the /wipe handler — surfaces (scopeCount, totalItems, freedBytes)
+// in the response so a client can verify how much state the call released.
+func (s *Store) wipe() (int, int, int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	scopeCount := len(s.scopes)
+	totalItems := 0
+
+	for _, buf := range s.scopes {
+		buf.mu.Lock()
+		totalItems += len(buf.items)
+		buf.store = nil
+		buf.mu.Unlock()
+	}
+
+	freedBytes := s.totalBytes.Swap(0)
+	s.scopes = make(map[string]*ScopeBuffer)
+
+	return scopeCount, totalItems, freedBytes
+}
+
 func (s *Store) stats() map[string]interface{} {
 	// Single-pass snapshot under one store lock: scope_count and total_items
 	// reflect the same set of scopes. A prior version released the store lock
