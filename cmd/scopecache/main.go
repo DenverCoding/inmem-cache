@@ -136,9 +136,24 @@ func main() {
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
+	// Timeouts sized for a local AF_UNIX cache. Budgets account for wire
+	// transfer AND stream JSON-decode of the bulk body (encoding/json runs
+	// ~100-500 MB/s on modern CPU; interleaved with reading so the slower
+	// of the two dominates).
+	//   ReadTimeout  — accept → body fully read. A 1 GiB store config
+	//                  (~1.14 GiB bulk body cap) takes ~15-40s on a slow
+	//                  CPU-constrained host; 60s gives comfortable margin.
+	//                  Configs beyond ~2 GiB may need tuning.
+	//   WriteTimeout — must exceed ReadTimeout; covers body-read + handler
+	//                  + response write. Handlers are sub-ms, so the 15s
+	//                  overhead is pure slack.
+	//   IdleTimeout  — keep-alive idle-kill; standard Go default shape.
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      75 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	socketPath := socketPathFromEnv()
