@@ -1032,7 +1032,14 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// against the freshly reset counter, permanently inflating totalBytes
 	// (its item lands in an unreachable orphan buffer). Mirrors wipe and
 	// /delete-scope; see ScopeBuffer.detached.
+	//
+	// The scope count is returned to the /rebuild handler, so it must
+	// reflect the state as handed over — not the state after a concurrent
+	// getOrCreateScope has already begun writing into s.scopes (which is
+	// the same map as newScopes after the swap). defer-Unlock plus a return
+	// expression keeps the read under the lock.
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, buf := range s.scopes {
 		buf.mu.Lock()
 		buf.detached = true
@@ -1041,7 +1048,6 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	}
 	s.scopes = newScopes
 	s.totalBytes.Store(totalNewBytes)
-	s.mu.Unlock()
 
 	return len(newScopes), totalItems, nil
 }
