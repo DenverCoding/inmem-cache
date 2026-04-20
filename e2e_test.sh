@@ -151,6 +151,114 @@ say '== counter conflict =='
 call 'upsert non-int'                   200 POST   /upsert   '{"scope":"c","id":"str","payload":"not a number"}'
 call 'counter_add on non-int'           409 POST   /counter_add '{"scope":"c","id":"str","by":1}'
 
+# --- arithmetic sanity --------------------------------------------------------
+# These four blocks each loop a small number of mutating calls and then assert
+# the aggregate state with a single read — they catch regressions where an
+# individual op returns 200 but the cache ends up in the wrong shape.
+say '== arithmetic sanity =='
+
+# counter: 10x(+1) + 3x(-1) must land at exactly 7
+i=0; while [ $i -lt 10 ]; do
+    req POST /counter_add '{"scope":"cmath","id":"n","by":1}'  >/dev/null
+    i=$((i+1))
+done
+i=0; while [ $i -lt 3 ]; do
+    req POST /counter_add '{"scope":"cmath","id":"n","by":-1}' >/dev/null
+    i=$((i+1))
+done
+call 'counter: read final'              200 GET    '/get?scope=cmath&id=n'
+case $LAST_BODY in
+    *'"payload":7'*) okmsg 'counter 10x(+1) + 3x(-1) == 7' ;;
+    *) bad "counter math body: $LAST_BODY" ;;
+esac
+
+# delete-up-to: 10 appends, trim up to seq 6, only t7..t10 must survive
+i=1; while [ $i -le 10 ]; do
+    req POST /append "{\"scope\":\"tmath\",\"id\":\"t$i\",\"payload\":$i}" >/dev/null
+    i=$((i+1))
+done
+call 'trim: delete-up-to seq=6'         200 POST   /delete-up-to '{"scope":"tmath","max_seq":6}'
+call 'trim: head after trim'            200 GET    '/head?scope=tmath'
+case $LAST_BODY in
+    *'"id":"t7"'*'"id":"t10"'*) okmsg 'trim: t7..t10 still present' ;;
+    *) bad "trim: expected t7..t10 in body: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":"t1"'*|*'"id":"t6"'*) bad "trim: stale ids leaked: $LAST_BODY" ;;
+    *) okmsg 'trim: t1..t6 are gone' ;;
+esac
+
+# append count: 10 appends to a fresh scope; /stats must report item_count:10
+i=1; while [ $i -le 10 ]; do
+    req POST /append "{\"scope\":\"appn\",\"id\":\"a$i\",\"payload\":$i}" >/dev/null
+    i=$((i+1))
+done
+call 'append count: stats'              200 GET    /stats
+case $LAST_BODY in
+    *'"appn"'*'"item_count":10'*) okmsg 'stats: appn has 10 items' ;;
+    *) bad "append count stats: $LAST_BODY" ;;
+esac
+
+# upsert idempotency: 5 upserts on the same id must leave exactly 1 item,
+# and the surviving payload must be the last one written (4).
+i=0; while [ $i -lt 5 ]; do
+    req POST /upsert "{\"scope\":\"uidem\",\"id\":\"only\",\"payload\":$i}" >/dev/null
+    i=$((i+1))
+done
+call 'upsert idem: stats'               200 GET    /stats
+case $LAST_BODY in
+    *'"uidem"'*'"item_count":1'*) okmsg 'stats: uidem has 1 item after 5 upserts' ;;
+    *) bad "upsert idem stats: $LAST_BODY" ;;
+esac
+call 'upsert idem: final value'         200 GET    '/get?scope=uidem&id=only'
+case $LAST_BODY in
+    *'"payload":4'*) okmsg 'upsert idem: final payload is 4' ;;
+    *) bad "upsert idem final: $LAST_BODY" ;;
+esac
+
+# tail windowing: 10 appends (seq 1..10). limit=5 is the newest slice (t6..t10);
+# limit=5&offset=5 skips that newest slice and returns the previous one (t1..t5).
+i=1; while [ $i -le 10 ]; do
+    req POST /append "{\"scope\":\"tail10\",\"id\":\"t$i\",\"payload\":$i}" >/dev/null
+    i=$((i+1))
+done
+call 'tail limit=5 (newest)'            200 GET    '/tail?scope=tail10&limit=5'
+case $LAST_BODY in
+    *'"id":"t6"'*'"id":"t10"'*) okmsg 'tail newest: t6..t10 present (ids)' ;;
+    *) bad "tail newest: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":"t1"'*|*'"id":"t5"'*) bad "tail newest leaked older ids: $LAST_BODY" ;;
+    *) okmsg 'tail newest: t1..t5 absent (ids)' ;;
+esac
+# seq check: trailing comma prevents "seq":1 from matching "seq":10 etc.
+case $LAST_BODY in
+    *'"seq":6,'*'"seq":10,'*) okmsg 'tail newest: seq 6..10 present' ;;
+    *) bad "tail newest seq: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"seq":1,'*|*'"seq":5,'*) bad "tail newest leaked older seqs: $LAST_BODY" ;;
+    *) okmsg 'tail newest: seq 1..5 absent' ;;
+esac
+
+call 'tail limit=5 offset=5 (oldest)'   200 GET    '/tail?scope=tail10&limit=5&offset=5'
+case $LAST_BODY in
+    *'"id":"t1"'*'"id":"t5"'*) okmsg 'tail offset=5: t1..t5 present (ids)' ;;
+    *) bad "tail offset=5: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":"t6"'*|*'"id":"t10"'*) bad "tail offset=5 leaked newer ids: $LAST_BODY" ;;
+    *) okmsg 'tail offset=5: t6..t10 absent (ids)' ;;
+esac
+case $LAST_BODY in
+    *'"seq":1,'*'"seq":5,'*) okmsg 'tail offset=5: seq 1..5 present' ;;
+    *) bad "tail offset=5 seq: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"seq":6,'*|*'"seq":10,'*) bad "tail offset=5 leaked newer seqs: $LAST_BODY" ;;
+    *) okmsg 'tail offset=5: seq 6..10 absent' ;;
+esac
+
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='
 call 'wipe'                             200 POST   /wipe
