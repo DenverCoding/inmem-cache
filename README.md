@@ -46,6 +46,88 @@ docker compose up --build scopecache
 
 The service listens on `/run/scopecache.sock` inside the container (mounted to the host volume defined in `docker-compose.yml`).
 
+## Quickstart (Linux VPS)
+
+Stdlib-only means the build has no external dependencies — just Go and git.
+
+### 1. Install Go (skip if already present)
+
+Debian / Ubuntu:
+
+```bash
+sudo apt update && sudo apt install -y golang-go git
+```
+
+If the distro's Go is too old (anything before 1.22), install the official tarball instead:
+
+```bash
+curl -L https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
+echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh
+source /etc/profile.d/go.sh
+go version
+```
+
+### 2. Clone and build
+
+```bash
+git clone https://github.com/DenverCoding/scopecache.git
+cd scopecache
+go build -o scopecache ./cmd/scopecache
+```
+
+### 3. Run it
+
+The default socket path is `/run/scopecache.sock`, which typically requires root. For a non-root run, override the path:
+
+```bash
+SCOPECACHE_SOCKET_PATH=/tmp/scopecache.sock ./scopecache
+```
+
+Smoke test from another shell:
+
+```bash
+curl --unix-socket /tmp/scopecache.sock http://localhost/help
+```
+
+### 4. Run under systemd (optional)
+
+Create `/etc/systemd/system/scopecache.service`:
+
+```ini
+[Unit]
+Description=scopecache
+After=network.target
+
+[Service]
+Type=simple
+User=scopecache
+Group=scopecache
+ExecStart=/usr/local/bin/scopecache
+Environment=SCOPECACHE_SOCKET_PATH=/run/scopecache/scopecache.sock
+Environment=SCOPECACHE_MAX_STORE_MB=100
+RuntimeDirectory=scopecache
+RuntimeDirectoryMode=0750
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin scopecache
+sudo cp scopecache /usr/local/bin/
+sudo systemctl daemon-reload
+sudo systemctl enable --now scopecache
+```
+
+Add the proxy user (e.g. `www-data` for nginx/apache, `caddy` for Caddy) to the `scopecache` group so it can connect to the socket:
+
+```bash
+sudo usermod -aG scopecache www-data
+```
+
 ## Usage
 
 Every request hits the Unix socket, so `curl` needs `--unix-socket` and a dummy `http://localhost` host.
