@@ -59,24 +59,61 @@ func decodeBody(w http.ResponseWriter, r *http.Request, max int64, out interface
 	return nil
 }
 
-func writeJSONWithDuration(w http.ResponseWriter, code int, payload map[string]interface{}, started time.Time) {
-	payload["duration_us"] = time.Since(started).Microseconds()
+// orderedFields is a JSON object whose keys are emitted in insertion order.
+// encoding/json sorts map keys alphabetically, which scatters ok, errors,
+// counts, and payloads through the output in whichever order the alphabet
+// dictates. orderedFields lets every response put ok first, config/caps
+// before aggregates, heavy or variable-size fields last, and duration_us
+// at the very end — a shape a human eye (and a log scanner) can read at
+// a glance.
+type orderedFields []kv
+
+type kv struct {
+	K string
+	V interface{}
+}
+
+func (o orderedFields) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, f := range o {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		key, err := json.Marshal(f.K)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(key)
+		buf.WriteByte(':')
+		val, err := json.Marshal(f.V)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(val)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
+	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func badRequest(w http.ResponseWriter, started time.Time, message string) {
-	writeJSONWithDuration(w, http.StatusBadRequest, map[string]interface{}{
-		"ok":    false,
-		"error": message,
+	writeJSONWithDuration(w, http.StatusBadRequest, orderedFields{
+		{"ok", false},
+		{"error", message},
 	}, started)
 }
 
 func conflict(w http.ResponseWriter, started time.Time, message string) {
-	writeJSONWithDuration(w, http.StatusConflict, map[string]interface{}{
-		"ok":    false,
-		"error": message,
+	writeJSONWithDuration(w, http.StatusConflict, orderedFields{
+		{"ok", false},
+		{"error", message},
 	}, started)
 }
 
@@ -89,10 +126,10 @@ func scopeFull(w http.ResponseWriter, started time.Time, offenders []ScopeCapaci
 	if len(offenders) > 1 {
 		msg = "multiple scopes are at capacity"
 	}
-	writeJSONWithDuration(w, http.StatusInsufficientStorage, map[string]interface{}{
-		"ok":     false,
-		"error":  msg,
-		"scopes": offenders,
+	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
+		{"ok", false},
+		{"error", msg},
+		{"scopes", offenders},
 	}, started)
 }
 
@@ -101,19 +138,19 @@ func scopeFull(w http.ResponseWriter, started time.Time, offenders []ScopeCapaci
 // client can judge how much headroom remains and whether draining one scope
 // will fix the next retry.
 func storeFull(w http.ResponseWriter, started time.Time, e *StoreFullError) {
-	writeJSONWithDuration(w, http.StatusInsufficientStorage, map[string]interface{}{
-		"ok":               false,
-		"error":            "store is at byte capacity",
-		"tracked_store_mb": MB(e.StoreBytes),
-		"added_mb":         MB(e.AddedBytes),
-		"max_store_mb":     MB(e.Cap),
+	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
+		{"ok", false},
+		{"error", "store is at byte capacity"},
+		{"tracked_store_mb", MB(e.StoreBytes)},
+		{"added_mb", MB(e.AddedBytes)},
+		{"max_store_mb", MB(e.Cap)},
 	}, started)
 }
 
 func methodNotAllowed(w http.ResponseWriter, started time.Time) {
-	writeJSONWithDuration(w, http.StatusMethodNotAllowed, map[string]interface{}{
-		"ok":    false,
-		"error": "the HTTP method is not allowed for this endpoint",
+	writeJSONWithDuration(w, http.StatusMethodNotAllowed, orderedFields{
+		{"ok", false},
+		{"error", "the HTTP method is not allowed for this endpoint"},
 	}, started)
 }
 
@@ -161,9 +198,9 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":   true,
-		"item": item,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"item", item},
 	}, started)
 }
 
@@ -205,10 +242,10 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":              true,
-		"count":           len(req.Items),
-		"replaced_scopes": replacedScopes,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"count", len(req.Items)},
+		{"replaced_scopes", replacedScopes},
 	}, started)
 }
 
@@ -260,11 +297,11 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":             true,
-		"count":          len(req.Items),
-		"rebuilt_scopes": rebuiltScopes,
-		"rebuilt_items":  rebuiltItems,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"count", len(req.Items)},
+		{"rebuilt_scopes", rebuiltScopes},
+		{"rebuilt_items", rebuiltItems},
 	}, started)
 }
 
@@ -316,10 +353,10 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":      true,
-		"created": created,
-		"item":    result,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"created", created},
+		{"item", result},
 	}, started)
 }
 
@@ -383,10 +420,10 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":      true,
-		"created": created,
-		"value":   value,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"created", created},
+		{"value", value},
 	}, started)
 }
 
@@ -411,10 +448,10 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(item.Scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":            true,
-			"hit":           false,
-			"updated_count": 0,
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"updated_count", 0},
 		}, started)
 		return
 	}
@@ -436,10 +473,10 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":            true,
-		"hit":           updated > 0,
-		"updated_count": updated,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", updated > 0},
+		{"updated_count", updated},
 	}, started)
 }
 
@@ -464,10 +501,10 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(req.Scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":            true,
-			"hit":           false,
-			"deleted_count": 0,
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"deleted_count", 0},
 		}, started)
 		return
 	}
@@ -479,10 +516,10 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		deleted = buf.deleteBySeq(req.Seq)
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":            true,
-		"hit":           deleted > 0,
-		"deleted_count": deleted,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", deleted > 0},
+		{"deleted_count", deleted},
 	}, started)
 }
 
@@ -507,20 +544,20 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(req.Scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":            true,
-			"hit":           false,
-			"deleted_count": 0,
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"deleted_count", 0},
 		}, started)
 		return
 	}
 
 	deleted := buf.deleteUpToSeq(req.MaxSeq)
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":            true,
-		"hit":           deleted > 0,
-		"deleted_count": deleted,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", deleted > 0},
+		{"deleted_count", deleted},
 	}, started)
 }
 
@@ -545,11 +582,11 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 
 	deletedItems, deleted := api.store.deleteScope(req.Scope)
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":            true,
-		"hit":           deleted,
-		"deleted_scope": deleted,
-		"deleted_items": deletedItems,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", deleted},
+		{"deleted_scope", deleted},
+		{"deleted_items", deletedItems},
 	}, started)
 }
 
@@ -577,11 +614,11 @@ func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
 
 	deletedScopes, deletedItems, freedBytes := api.store.wipe()
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":             true,
-		"deleted_scopes": deletedScopes,
-		"deleted_items":  deletedItems,
-		"freed_mb":       MB(freedBytes),
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"deleted_scopes", deletedScopes},
+		{"deleted_items", deletedItems},
+		{"freed_mb", MB(freedBytes)},
 	}, started)
 }
 
@@ -627,11 +664,11 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":    true,
-			"hit":   false,
-			"count": 0,
-			"items": []Item{},
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"count", 0},
+			{"items", []Item{}},
 		}, started)
 		return
 	}
@@ -643,11 +680,11 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		buf.recordRead(nowUnixMicro())
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":    true,
-		"hit":   len(items) > 0,
-		"count": len(items),
-		"items": items,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", len(items) > 0},
+		{"count", len(items)},
+		{"items", items},
 	}, started)
 }
 
@@ -678,12 +715,12 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":     true,
-			"hit":    false,
-			"count":  0,
-			"offset": offset,
-			"items":  []Item{},
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"count", 0},
+			{"offset", offset},
+			{"items", []Item{}},
 		}, started)
 		return
 	}
@@ -693,12 +730,12 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		buf.recordRead(nowUnixMicro())
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":     true,
-		"hit":    len(items) > 0,
-		"count":  len(items),
-		"offset": offset,
-		"items":  items,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", len(items) > 0},
+		{"count", len(items)},
+		{"offset", offset},
+		{"items", items},
 	}, started)
 }
 
@@ -736,10 +773,10 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(scope)
 	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":   true,
-			"hit":  false,
-			"item": nil,
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"item", nil},
 		}, started)
 		return
 	}
@@ -747,10 +784,10 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	if hasID {
 		item, found := buf.getByID(id)
 		if !found {
-			writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-				"ok":   true,
-				"hit":  false,
-				"item": nil,
+			writeJSONWithDuration(w, http.StatusOK, orderedFields{
+				{"ok", true},
+				{"hit", false},
+				{"item", nil},
 			}, started)
 			return
 		}
@@ -760,10 +797,10 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 		// on /delete-scope-candidates for client-side eviction decisions.
 		buf.recordRead(nowUnixMicro())
 
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":   true,
-			"hit":  true,
-			"item": item,
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", true},
+			{"item", item},
 		}, started)
 		return
 	}
@@ -776,20 +813,20 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	item, found := buf.getBySeq(seq)
 	if !found {
-		writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-			"ok":   true,
-			"hit":  false,
-			"item": nil,
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"item", nil},
 		}, started)
 		return
 	}
 
 	buf.recordRead(nowUnixMicro())
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":   true,
-		"hit":  true,
-		"item": item,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", true},
+		{"item", item},
 	}, started)
 }
 
@@ -922,20 +959,19 @@ func (api *API) handleDeleteScopeCandidates(w http.ResponseWriter, r *http.Reque
 	minAgeMicros := hours * int64(time.Hour/time.Microsecond)
 
 	for name, buf := range scopes {
-		stats := buf.stats()
+		st := buf.stats()
 
-		createdTS := stats["created_ts"].(int64)
-		if hours > 0 && now-createdTS < minAgeMicros {
+		if hours > 0 && now-st.CreatedTS < minAgeMicros {
 			continue
 		}
 
 		list = append(list, Candidate{
 			Scope:           name,
-			CreatedTS:       createdTS,
-			LastAccessTS:    stats["last_access_ts"].(int64),
-			Last7dReadCount: stats["last_7d_read_count"].(uint64),
-			ItemCount:       stats["item_count"].(int),
-			ApproxScopeMB:   stats["approx_scope_mb"].(MB),
+			CreatedTS:       st.CreatedTS,
+			LastAccessTS:    st.LastAccessTS,
+			Last7dReadCount: st.Last7DReadCount,
+			ItemCount:       st.ItemCount,
+			ApproxScopeMB:   st.ApproxScopeMB,
 		})
 	}
 
@@ -947,11 +983,11 @@ func (api *API) handleDeleteScopeCandidates(w http.ResponseWriter, r *http.Reque
 		list = list[:limit]
 	}
 
-	writeJSONWithDuration(w, http.StatusOK, map[string]interface{}{
-		"ok":         true,
-		"count":      len(list),
-		"hours":      hours,
-		"candidates": list,
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"count", len(list)},
+		{"hours", hours},
+		{"candidates", list},
 	}, started)
 }
 
@@ -963,8 +999,37 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stats := api.store.stats()
-	writeJSONWithDuration(w, http.StatusOK, stats, started)
+	st := api.store.stats()
+
+	// Build the scopes map with each entry as orderedFields so per-scope
+	// fields emit in a logical order (counts first, timestamps, then reads).
+	// The outer map keys are scope names and will sort alphabetically, which
+	// is appropriate for an arbitrary identifier set.
+	scopes := make(map[string]orderedFields, len(st.Scopes))
+	for name, sc := range st.Scopes {
+		scopes[name] = orderedFields{
+			{"item_count", sc.ItemCount},
+			{"last_seq", sc.LastSeq},
+			{"approx_scope_mb", sc.ApproxScopeMB},
+			{"created_ts", sc.CreatedTS},
+			{"last_access_ts", sc.LastAccessTS},
+			{"read_count_total", sc.ReadCountTotal},
+			{"last_7d_read_count", sc.Last7DReadCount},
+		}
+	}
+
+	// Top-level order: ok, then config/caps, then aggregates, then the
+	// variable-size scopes blob. duration_us is appended by the helper.
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"default_limit", st.DefaultLimit},
+		{"max_limit", st.MaxLimit},
+		{"max_store_mb", st.MaxStoreMB},
+		{"scope_count", st.ScopeCount},
+		{"total_items", st.TotalItems},
+		{"tracked_store_mb", st.TrackedStoreMB},
+		{"scopes", scopes},
+	}, started)
 }
 
 func (api *API) handleHelp(w http.ResponseWriter, r *http.Request) {

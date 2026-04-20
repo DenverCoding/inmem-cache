@@ -695,18 +695,32 @@ func (b *ScopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	return item, ok
 }
 
-func (b *ScopeBuffer) stats() map[string]interface{} {
+// ScopeStats is the typed snapshot of a single ScopeBuffer. It is what
+// buf.stats() returns so callers inside the package (e.g. the candidate-
+// selection path) can read fields directly, and what the /stats handler
+// flattens into orderedFields for the wire format.
+type ScopeStats struct {
+	ItemCount       int
+	LastSeq         uint64
+	ApproxScopeMB   MB
+	CreatedTS       int64
+	LastAccessTS    int64
+	ReadCountTotal  uint64
+	Last7DReadCount uint64
+}
+
+func (b *ScopeBuffer) stats() ScopeStats {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	return map[string]interface{}{
-		"item_count":         len(b.items),
-		"last_seq":           b.lastSeq,
-		"created_ts":         b.createdTS,
-		"last_access_ts":     b.lastAccessTS,
-		"last_7d_read_count": b.last7DReadCount,
-		"read_count_total":   b.readCountTotal,
-		"approx_scope_mb":    MB(b.approxSizeBytesLocked()),
+	return ScopeStats{
+		ItemCount:       len(b.items),
+		LastSeq:         b.lastSeq,
+		ApproxScopeMB:   MB(b.approxSizeBytesLocked()),
+		CreatedTS:       b.createdTS,
+		LastAccessTS:    b.lastAccessTS,
+		ReadCountTotal:  b.readCountTotal,
+		Last7DReadCount: b.last7DReadCount,
 	}
 }
 
@@ -871,7 +885,20 @@ func (s *Store) wipe() (int, int, int64) {
 	return scopeCount, totalItems, freedBytes
 }
 
-func (s *Store) stats() map[string]interface{} {
+// StoreStats is the typed snapshot of the store. stats() returns it so the
+// /stats handler can flatten it into orderedFields for the wire, and so any
+// in-package caller (tests, future adapters) can read fields directly.
+type StoreStats struct {
+	ScopeCount     int
+	TotalItems     int
+	DefaultLimit   int
+	MaxLimit       int
+	TrackedStoreMB MB
+	MaxStoreMB     MB
+	Scopes         map[string]ScopeStats
+}
+
+func (s *Store) stats() StoreStats {
 	// Single-pass snapshot under one store lock: scope_count and total_items
 	// reflect the same set of scopes. A prior version released the store lock
 	// between the per-scope walk and a separate pass, allowing the counts in
@@ -879,26 +906,23 @@ func (s *Store) stats() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	scopeStats := make(map[string]interface{}, len(s.scopes))
+	scopeStats := make(map[string]ScopeStats, len(s.scopes))
 	totalItems := 0
 
 	for scope, buf := range s.scopes {
 		st := buf.stats()
 		scopeStats[scope] = st
-		if n, ok := st["item_count"].(int); ok {
-			totalItems += n
-		}
+		totalItems += st.ItemCount
 	}
 
-	return map[string]interface{}{
-		"ok":               true,
-		"scope_count":      len(scopeStats),
-		"total_items":      totalItems,
-		"default_limit":    DefaultLimit,
-		"max_limit":        MaxLimit,
-		"tracked_store_mb": MB(s.totalBytes.Load()),
-		"max_store_mb":     MB(s.maxStoreBytes),
-		"scopes":           scopeStats,
+	return StoreStats{
+		ScopeCount:     len(scopeStats),
+		TotalItems:     totalItems,
+		DefaultLimit:   DefaultLimit,
+		MaxLimit:       MaxLimit,
+		TrackedStoreMB: MB(s.totalBytes.Load()),
+		MaxStoreMB:     MB(s.maxStoreBytes),
+		Scopes:         scopeStats,
 	}
 }
 
