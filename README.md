@@ -1,6 +1,9 @@
 # scopecache
 
-A small, local, in-memory cache and write-buffer written in Go — stdlib only, served over a Unix domain socket. Items live in scopes (namespaces) and stay hot in RAM so your app doesn't re-query the database on every read; the same primitives double as a write-buffer that flattens high-frequency inserts into periodic bulk commits. Because `/render` returns raw payload bytes, a fronting webserver like Caddy, nginx or apache can pipe cached HTML, JSON or XML straight to the client — no application layer in between. Deliberately limited to three addressable fields (scope, id, seq), which is what keeps it fast (~30M reads/sec/core) and easy to reason about. scopecache is deliberately limited in capability, yet flexible enough to cover a wide range of real-world use cases.
+A small, local, in-memory cache and write buffer written in Go — stdlib only, served over a Unix domain socket.
+Tuned for modest VPS footprints, it can deliver millions of reads per second per core.
+Data lives in scopes (namespaces) and is addressable only by scope, id, or seq; the entire cache is disposable and can be wiped and rebuilt from the source of truth at any time.
+Payloads can also be served directly via `/render`, allowing Caddy, nginx, or Apache to send cached HTML, JSON, or XML straight to the client without an application layer in between. This can substantially reduce per-request overhead and allow a single server to handle far more traffic on cacheable paths.
 
 ## What it is
 
