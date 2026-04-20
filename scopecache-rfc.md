@@ -187,6 +187,8 @@ Contract:
 
 **Content-Type policy.** The cache always returns `application/octet-stream` on `/render`. It does **not** sniff, guess, or derive a real MIME type from the payload. Browser-facing setups are expected to override `Content-Type` in the fronting proxy (e.g. Caddy's `header Content-Type text/html` inside a route block). Keeping the cache dumb here is deliberate — see §1.1 and the boundary rule.
 
+**The proxy also owns security headers.** For HTML payloads (especially user-influenced ones) the fronting proxy is responsible for `X-Content-Type-Options: nosniff`, CSP, and framing headers. The cache never inspects payload bytes, so it cannot apply these on your behalf.
+
 **JSON-string decoding.** `payload` must be a valid JSON value (see §2 rule 3). When the stored payload is a JSON *string* (first non-whitespace byte is `"`), `/render` peels exactly one layer of JSON string-encoding before writing the body — so `"<html>..."` in storage becomes `<html>...` on the wire. All other JSON values (object, array, number, bool) are written raw; the consumer is expected to parse them as JSON. This is the only transformation the cache performs, and it exists because HTML/XML/text cannot be stored any other way while `payload` remains JSON-typed.
 
 Hits count toward scope read-heat (`last_access_ts`, `last_7d_read_count`) exactly like `/get`; misses do not.
