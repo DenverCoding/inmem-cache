@@ -13,66 +13,66 @@ import (
 	"syscall"
 	"time"
 
-	inmemcache "github.com/DenverCoding/inmem-cache"
+	"github.com/DenverCoding/scopecache"
 )
 
 // UnixSocketPerm is applied to the listening socket file on POSIX systems
-// so the Caddy / inmem-cache group can connect without the file being
+// so the Caddy / scopecache group can connect without the file being
 // world-readable. It is a no-op on Windows (Chmod there only toggles the
 // read-only attribute), which is harmless: Windows AF_UNIX access is
 // already gated by NTFS ACLs on the containing directory.
 const UnixSocketPerm = 0660
 
 // DefaultSocketPath is the platform-specific default for the listening
-// AF_UNIX socket. Linux uses /run/inmem.sock (a tmpfs that vanishes on
+// AF_UNIX socket. Linux uses /run/scopecache.sock (a tmpfs that vanishes on
 // reboot, which matches the cache's disposable semantics); other OSes fall
 // back to os.TempDir() because /run does not exist or is not user-writable
 // there. Per-platform definitions live in socket_linux.go and socket_other.go.
-// The value can be overridden at runtime via the INMEM_SOCKET_PATH env var.
+// The value can be overridden at runtime via the SCOPECACHE_SOCKET_PATH env var.
 var DefaultSocketPath string
 
-// scopeMaxItemsFromEnv returns INMEM_SCOPE_MAX_ITEMS if set to a positive
+// scopeMaxItemsFromEnv returns SCOPECACHE_SCOPE_MAX_ITEMS if set to a positive
 // integer, otherwise the compile-time default. A malformed or non-positive
 // value is ignored with a warning — the server still starts rather than
 // failing on a fat-fingered env var.
 func scopeMaxItemsFromEnv() int {
-	raw := os.Getenv("INMEM_SCOPE_MAX_ITEMS")
+	raw := os.Getenv("SCOPECACHE_SCOPE_MAX_ITEMS")
 	if raw == "" {
-		return inmemcache.ScopeMaxItems
+		return scopecache.ScopeMaxItems
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
-		log.Printf("INMEM_SCOPE_MAX_ITEMS=%q is not a positive integer; using default %d", raw, inmemcache.ScopeMaxItems)
-		return inmemcache.ScopeMaxItems
+		log.Printf("SCOPECACHE_SCOPE_MAX_ITEMS=%q is not a positive integer; using default %d", raw, scopecache.ScopeMaxItems)
+		return scopecache.ScopeMaxItems
 	}
 	return n
 }
 
-// socketPathFromEnv returns INMEM_SOCKET_PATH if set to a non-empty value,
+// socketPathFromEnv returns SCOPECACHE_SOCKET_PATH if set to a non-empty value,
 // otherwise the platform-specific DefaultSocketPath (see socket_linux.go /
 // socket_other.go). Letting operators override the path keeps the binary
 // usable on systems where /run is not writable (macOS dev boxes) or where
 // multiple cache instances need distinct sockets.
 func socketPathFromEnv() string {
-	if p := os.Getenv("INMEM_SOCKET_PATH"); p != "" {
+	if p := os.Getenv("SCOPECACHE_SOCKET_PATH"); p != "" {
 		return p
 	}
 	return DefaultSocketPath
 }
 
-// maxStoreBytesFromEnv returns INMEM_MAX_STORE_MB (in MiB, converted to bytes)
+// maxStoreBytesFromEnv returns SCOPECACHE_MAX_STORE_MB (in MiB, converted to bytes)
 // if set to a positive integer, otherwise the compile-time default. Same
 // lenient policy as scopeMaxItemsFromEnv: malformed or non-positive values log
 // a warning and the server keeps running on the default.
 func maxStoreBytesFromEnv() int64 {
-	raw := os.Getenv("INMEM_MAX_STORE_MB")
+	raw := os.Getenv("SCOPECACHE_MAX_STORE_MB")
 	if raw == "" {
-		return int64(inmemcache.MaxStoreMiB) << 20
+		return int64(scopecache.MaxStoreMiB) << 20
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
-		log.Printf("INMEM_MAX_STORE_MB=%q is not a positive integer; using default %d MiB", raw, inmemcache.MaxStoreMiB)
-		return int64(inmemcache.MaxStoreMiB) << 20
+		log.Printf("SCOPECACHE_MAX_STORE_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxStoreMiB)
+		return int64(scopecache.MaxStoreMiB) << 20
 	}
 	return int64(n) << 20
 }
@@ -110,9 +110,9 @@ func listenUnixSocket(path string) (net.Listener, error) {
 func main() {
 	maxItems := scopeMaxItemsFromEnv()
 	maxStoreBytes := maxStoreBytesFromEnv()
-	store := inmemcache.NewStore(maxItems, maxStoreBytes)
-	api := inmemcache.NewAPI(store)
-	log.Printf("inmem cache capacity: %d items per scope, %d MiB store-wide", maxItems, maxStoreBytes>>20)
+	store := scopecache.NewStore(maxItems, maxStoreBytes)
+	api := scopecache.NewAPI(store)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide", maxItems, maxStoreBytes>>20)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
@@ -136,7 +136,7 @@ func main() {
 
 	go func() {
 		<-signalCtx.Done()
-		log.Print("inmem cache shutting down")
+		log.Print("scopecache shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
@@ -144,12 +144,12 @@ func main() {
 		}
 	}()
 
-	log.Printf("inmem cache listening on unix://%s", socketPath)
+	log.Printf("scopecache listening on unix://%s", socketPath)
 	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("serve error: %v", err)
 	}
 
 	_ = ln.Close()
 	_ = os.Remove(socketPath)
-	log.Print("inmem cache stopped")
+	log.Print("scopecache stopped")
 }

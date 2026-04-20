@@ -1,4 +1,4 @@
-package inmemcache
+package scopecache
 
 import (
 	"encoding/json"
@@ -9,8 +9,8 @@ import (
 const (
 	DefaultLimit       = 1000   // read response size when client omits ?limit
 	MaxLimit           = 10000  // hard ceiling on ?limit; higher values are clamped, not rejected
-	ScopeMaxItems      = 100000 // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via INMEM_SCOPE_MAX_ITEMS
-	MaxStoreMiB        = 100    // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via INMEM_MAX_STORE_MB
+	ScopeMaxItems      = 100000 // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
+	MaxStoreMiB        = 100    // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
 	MaxItemBytes       = 1 << 20 // 1 MiB cap on approxItemSize (overhead + scope + id + payload), not on raw payload alone
 	MaxScopeBytes      = 128
 	MaxIDBytes         = 128

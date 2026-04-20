@@ -1,4 +1,4 @@
-package inmemcache
+package scopecache
 
 import (
 	"encoding/json"
@@ -80,8 +80,8 @@ func TestHelp_GETReturnsText(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "inmem-cache") {
-		t.Fatal("help body missing 'inmem-cache'")
+	if !strings.Contains(rec.Body.String(), "scopecache") {
+		t.Fatal("help body missing 'scopecache'")
 	}
 }
 

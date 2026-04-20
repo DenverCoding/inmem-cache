@@ -1,4 +1,4 @@
-/inmem-cache
+/scopecache
 *.exe
 /sock/
 /CLAUDE.md

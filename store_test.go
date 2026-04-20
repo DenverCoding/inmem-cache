@@ -1,4 +1,4 @@
-package inmemcache
+package scopecache
 
 import (
 	"encoding/json"

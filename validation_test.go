@@ -1,4 +1,4 @@
-package inmemcache
+package scopecache
 
 import (
 	"encoding/json"
@@ -246,7 +246,7 @@ func TestValidateUpdateItem(t *testing.T) {
 
 // The bulk request cap must always exceed the store cap so a fully-loaded
 // cache can be restored in a single /warm or /rebuild call, regardless of
-// how INMEM_MAX_STORE_MB is configured.
+// how SCOPECACHE_MAX_STORE_MB is configured.
 func TestBulkRequestBytesFor_ScalesWithStoreCap(t *testing.T) {
 	cases := []int64{
 		1 << 20,    // 1 MiB — pathological small store

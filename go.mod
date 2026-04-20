@@ -1,3 +1,3 @@
-module github.com/DenverCoding/inmem-cache
+module github.com/DenverCoding/scopecache
 
 go 1.23

@@ -12,5 +12,5 @@ import (
 // supports AF_UNIX natively, so the listen path works as-is; access is
 // gated by NTFS ACLs on the parent directory rather than socket file perms.
 func init() {
-	DefaultSocketPath = filepath.Join(os.TempDir(), "inmem.sock")
+	DefaultSocketPath = filepath.Join(os.TempDir(), "scopecache.sock")
 }

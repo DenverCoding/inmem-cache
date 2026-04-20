@@ -3,9 +3,9 @@ WORKDIR /src
 COPY go.mod ./
 COPY *.go ./
 COPY cmd ./cmd
-RUN CGO_ENABLED=0 go build -o /out/inmem-cache ./cmd/inmem-cache
+RUN CGO_ENABLED=0 go build -o /out/scopecache ./cmd/scopecache
 
 FROM alpine:latest
 RUN apk add --no-cache curl
-COPY --from=builder /out/inmem-cache /usr/bin/inmem-cache
-CMD ["/usr/bin/inmem-cache"]
+COPY --from=builder /out/scopecache /usr/bin/scopecache
+CMD ["/usr/bin/scopecache"]

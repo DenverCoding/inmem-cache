@@ -1,4 +1,4 @@
-package inmemcache
+package scopecache
 
 import (
 	"bytes"
@@ -814,7 +814,7 @@ func (api *API) handleHelp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	helpText := `inmem-cache v2
+	helpText := `scopecache v2
 
 RULES:
 - payload must be a valid JSON value (object, array, string, number, bool); its contents are opaque to the cache — never inspected or searched
@@ -826,12 +826,12 @@ RULES:
 - id is optional
 - if id is present, it must be unique within its scope
 - write operations reject duplicates for the same scope + id
-- per-scope capacity is 100,000 items by default (override with INMEM_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
+- per-scope capacity is 100,000 items by default (override with SCOPECACHE_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
 - /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete-up-to or /delete-scope
-- store-wide byte cap is 100 MiB by default (override with INMEM_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries tracked_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
+- store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries tracked_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
 - per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints have a fixed 2 MiB body cap.
 - every byte-ish field in JSON responses (tracked_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
-- the listening socket path defaults to /run/inmem.sock on Linux and $TMPDIR/inmem.sock on macOS/Windows; override with INMEM_SOCKET_PATH
+- the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
 
 ENDPOINTS:
 GET  /help - show this help text

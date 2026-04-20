@@ -1,8 +1,8 @@
-# inmem-cache — Compact RFC-Style Spec
+# scopecache — Compact RFC-Style Spec
 
 ## 1. Scope
 
-`inmem-cache` is a small, local, rebuildable in-memory cache/buffer.  
+`scopecache` is a small, local, rebuildable in-memory cache/buffer.  
 The source of truth lives elsewhere — a database, a file, data generated in code, anything — and the cache is always rebuildable from it.
 
 The service supports both hot-read caching and simple write-buffer use.
@@ -18,11 +18,11 @@ This system is **not**:
 
 ### 1.1 Where this spec fits
 
-This RFC describes **the core** (`package inmemcache`): the cache engine and its HTTP contract. The core is framework-agnostic and caller-anonymous — it registers routes on an `*http.ServeMux`, validates request shape (scope/id/payload), and serves cache operations. It does not know who the caller is, and implements no auth, identity, or per-tenant policy.
+This RFC describes **the core** (`package scopecache`): the cache engine and its HTTP contract. The core is framework-agnostic and caller-anonymous — it registers routes on an `*http.ServeMux`, validates request shape (scope/id/payload), and serves cache operations. It does not know who the caller is, and implements no auth, identity, or per-tenant policy.
 
 Thin **adapters** wrap the core and are out of scope for this document:
 
-- `cmd/inmem-cache/` — standalone binary that opens a Unix socket and serves the core directly.
+- `cmd/scopecache/` — standalone binary that opens a Unix socket and serves the core directly.
 - `caddymodule/` — Caddy-module wrapper; also the home for cross-cutting concerns that require request context (authN/authZ enforcement, identity-to-scope mapping, per-tenant logging/metrics).
 
 New **cache features** belong in the core and are spec'd here. **Cross-cutting concerns** (auth, identity, per-tenant policy) belong in an adapter and are deliberately not specified in this document.
@@ -88,10 +88,10 @@ Note: items do not carry a server-level `ts`. Scope-level timing data
 - default read `limit`: `1000` (applied when the client omits `?limit`)
 - maximum read `limit`: `10000` (values above are silently clamped, not rejected)
 - per-item cap: `1 MiB` (enforced on `approxItemSize` = overhead + scope + id + payload, not on raw payload alone)
-- per-scope item cap: `100000` items by default, overridable via the `INMEM_SCOPE_MAX_ITEMS` environment variable
-- store-wide byte cap: `100 MiB` of aggregate `approxItemSize` by default, overridable via the `INMEM_MAX_STORE_MB` environment variable (integer MiB). Tuned for modest VPS deployments (~1 GB total RAM alongside DB + app).
+- per-scope item cap: `100000` items by default, overridable via the `SCOPECACHE_SCOPE_MAX_ITEMS` environment variable
+- store-wide byte cap: `100 MiB` of aggregate `approxItemSize` by default, overridable via the `SCOPECACHE_MAX_STORE_MB` environment variable (integer MiB). Tuned for modest VPS deployments (~1 GB total RAM alongside DB + app).
 - per-request body cap (single-item endpoints `/append`, `/update`, `/delete`, `/delete-scope`): `2 MiB` fixed.
-- per-request body cap (bulk endpoints `/warm`, `/rebuild`): **derived at startup from the configured store cap** — roughly `store_cap + 10% + 16 MiB`. This guarantees a fully-loaded cache can always be expressed in one bulk request, with headroom for JSON framing. Concretely: default 100 MiB store → ~126 MiB request cap; `INMEM_MAX_STORE_MB=1024` → ~1.15 GiB request cap.
+- per-request body cap (bulk endpoints `/warm`, `/rebuild`): **derived at startup from the configured store cap** — roughly `store_cap + 10% + 16 MiB`. This guarantees a fully-loaded cache can always be expressed in one bulk request, with headroom for JSON framing. Concretely: default 100 MiB store → ~126 MiB request cap; `SCOPECACHE_MAX_STORE_MB=1024` → ~1.15 GiB request cap.
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
 
@@ -321,7 +321,7 @@ Behavior:
 
 ## 7. Operational model
 
-1. The service listens on a local Unix domain socket only (default `/run/inmem.sock` on Linux, `$TMPDIR/inmem.sock` elsewhere; override with `INMEM_SOCKET_PATH`). There is no TCP listener.
+1. The service listens on a local Unix domain socket only (default `/run/scopecache.sock` on Linux, `$TMPDIR/scopecache.sock` elsewhere; override with `SCOPECACHE_SOCKET_PATH`). There is no TCP listener.
 2. Access is gated by filesystem permissions on the socket path. The service is not intended to be exposed over the network.
 3. On restart, the cache may start empty.
 4. Rebuild-from-DB is an acceptable recovery model.
@@ -348,7 +348,7 @@ Next:
 
 1. Client-side helpers (PHP first): `/head`-loop dump to JSONL file, and
    warm-/rebuild-from-file that wraps JSONL into `{"items":[...]}` on the wire.
-2. Phase 3: convert to a Caddy module (`package inmemcache`,
+2. Phase 3: convert to a Caddy module (`package scopecache`,
    `caddy.RegisterModule()`, `Provision` / `Validate` / `Cleanup`).
    No API changes; the HTTP surface is reused.
 
@@ -361,9 +361,9 @@ Out of scope (by design):
 
 ## 10. Comparison with Redis
 
-`inmem-cache` and Redis solve overlapping problems but make different trade-offs. This section is orientation, not a benchmark.
+`scopecache` and Redis solve overlapping problems but make different trade-offs. This section is orientation, not a benchmark.
 
-**Where `inmem-cache` wins**
+**Where `scopecache` wins**
 
 - **Operational simplicity.** One Go binary; Phase 3 embeds it in Caddy so there are zero extra processes. No `redis.conf`, AOF/RDB, or eviction policies. Unix socket only — no TCP, auth, ACLs, or TLS.
 - **Domain fit.** The `scope/id/seq` model maps directly to how clients use the cache, with no translation to generic primitives. `/warm` and `/rebuild` are atomic all-or-nothing in a single call where Redis needs MULTI/EXEC or Lua. Scope-level read-heat and `/delete-scope-candidates` ranking are built in.
@@ -372,20 +372,20 @@ Out of scope (by design):
 
 **Where Redis wins**
 
-- **Raw speed.** Redis over Unix socket is ~20–50 µs per op (binary RESP). `inmem-cache` is ~100–150 µs (HTTP + JSON parse). Rarely the bottleneck in DB-backed workloads, but relevant on hot per-request paths.
+- **Raw speed.** Redis over Unix socket is ~20–50 µs per op (binary RESP). `scopecache` is ~100–150 µs (HTTP + JSON parse). Rarely the bottleneck in DB-backed workloads, but relevant on hot per-request paths.
 - **Persistence, replication, HA.** We have none; a crash means rebuilding from the DB. Redis offers AOF/RDB, replication, and Cluster.
-- **Feature breadth.** Redis has pub/sub, streams, sorted sets, hyperloglog, bitmaps, TTLs, Lua scripting, and cross-key transactions. `inmem-cache` only exposes the endpoints in §6.
+- **Feature breadth.** Redis has pub/sub, streams, sorted sets, hyperloglog, bitmaps, TTLs, Lua scripting, and cross-key transactions. `scopecache` only exposes the endpoints in §6.
 - **Payload flexibility.** Redis accepts raw bytes; we require valid JSON, so binary blobs pay ~33% base64 overhead.
-- **Shared state across nodes.** A single Redis can back many application processes; `inmem-cache` lives inside one process, so multiple Caddy instances each hold independent caches.
+- **Shared state across nodes.** A single Redis can back many application processes; `scopecache` lives inside one process, so multiple Caddy instances each hold independent caches.
 - **Ecosystem.** Client libraries, dashboards, monitoring integrations, 15 years of community answers.
 
-**In short:** `inmem-cache` trades raw speed, feature breadth, and cross-node sharing for operational simplicity, domain fit, and zero-dependency deployment. For its intended use — a local, disposable, per-Caddy-instance cache in front of an authoritative DB — that trade is deliberate. Workloads that need persistence, replication, or Redis-only data structures should use Redis.
+**In short:** `scopecache` trades raw speed, feature breadth, and cross-node sharing for operational simplicity, domain fit, and zero-dependency deployment. For its intended use — a local, disposable, per-Caddy-instance cache in front of an authoritative DB — that trade is deliberate. Workloads that need persistence, replication, or Redis-only data structures should use Redis.
 
 ---
 
 ## 11. Summary
 
-`inmem-readcache` is a scope-first hot-window cache.
+`scopecache` is a scope-first hot-window cache.
 
 Its core identity is:
 
@@ -400,18 +400,18 @@ Its core identity is:
 
 ## 12. Examples
 
-The service listens on a Unix domain socket (default `/run/inmem.sock`), so every curl example passes `--unix-socket` and uses `http://localhost/...` as a dummy URL host. Set `INMEM_SOCKET_PATH` to override the path; adjust `--unix-socket` accordingly.
+The service listens on a Unix domain socket (default `/run/scopecache.sock`), so every curl example passes `--unix-socket` and uses `http://localhost/...` as a dummy URL host. Set `SCOPECACHE_SOCKET_PATH` to override the path; adjust `--unix-socket` accordingly.
 
 ### 12.1 Help
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/help"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/help"
 ```
 
 ### 12.2 Append
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/append \
   -H "Content-Type: application/json" \
   -d '{
     "scope": "thread:900",
@@ -425,35 +425,35 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
 ### 12.3 Head
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/head?scope=thread:900&limit=10"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/head?scope=thread:900&limit=10"
 ```
 
 ### 12.4 Tail
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/tail?scope=thread:900&limit=10"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/tail?scope=thread:900&limit=10"
 ```
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/tail?scope=thread:900&limit=10&offset=10"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/tail?scope=thread:900&limit=10&offset=10"
 ```
 
 ### 12.5 Head with cursor
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/head?scope=thread:900&after_seq=5&limit=10"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/head?scope=thread:900&after_seq=5&limit=10"
 ```
 
 ### 12.6 Get by id
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/get?scope=thread:900&id=post_1"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/get?scope=thread:900&id=post_1"
 ```
 
 ### 12.7 Get by seq
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/get?scope=thread:900&seq=1"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/get?scope=thread:900&seq=1"
 ```
 
 ### 12.7a Render (serve raw payload, no envelope)
@@ -461,7 +461,7 @@ curl -s --unix-socket /run/inmem.sock "http://localhost/get?scope=thread:900&seq
 Cache an HTML fragment as a JSON string, then serve it raw:
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/append \
   -H "Content-Type: application/json" \
   -d '{
     "scope": "pages",
@@ -469,7 +469,7 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
     "payload": "<html><body>Hi</body></html>"
   }'
 
-curl -s --unix-socket /run/inmem.sock \
+curl -s --unix-socket /run/scopecache.sock \
   "http://localhost/render?scope=pages&id=home"
 # → <html><body>Hi</body></html>
 ```
@@ -477,7 +477,7 @@ curl -s --unix-socket /run/inmem.sock \
 A JSON object stored under the same pattern is served with its raw JSON bytes:
 
 ```bash
-curl -s --unix-socket /run/inmem.sock \
+curl -s --unix-socket /run/scopecache.sock \
   "http://localhost/render?scope=thread:900&id=post_1"
 # → {"text":"hello"}
 ```
@@ -487,7 +487,7 @@ Response for a miss is `404 Not Found` with an empty body.
 ### 12.8 Warm
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/warm \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/warm \
   -H "Content-Type: application/json" \
   -d '{
     "items": [
@@ -512,7 +512,7 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/warm \
 ### 12.9 Rebuild
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/rebuild \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/rebuild \
   -H "Content-Type: application/json" \
   -d '{
     "items": [
@@ -537,7 +537,7 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/rebuild \
 ### 12.10 Update
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/update \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/update \
   -H "Content-Type: application/json" \
   -d '{
     "scope": "thread:900",
@@ -551,7 +551,7 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/update \
 ### 12.11 Delete
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/delete \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete \
   -H "Content-Type: application/json" \
   -d '{
     "scope": "thread:900",
@@ -562,7 +562,7 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/delete \
 ### 12.12 Delete-through (write-buffer drain)
 
 ```bash
-curl -s --unix-socket /run/inmem.sock -X POST http://localhost/delete-up-to \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to \
   -H "Content-Type: application/json" \
   -d '{
     "scope": "pending_orders",
@@ -573,11 +573,11 @@ curl -s --unix-socket /run/inmem.sock -X POST http://localhost/delete-up-to \
 ### 12.13 Candidate scopes older than 3 hours
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/delete-scope-candidates?limit=10&hours=3"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/delete-scope-candidates?limit=10&hours=3"
 ```
 
 ### 12.14 Stats
 
 ```bash
-curl -s --unix-socket /run/inmem.sock "http://localhost/stats"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/stats"
 ```

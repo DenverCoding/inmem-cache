@@ -6,5 +6,5 @@ package main
 // systemd-managed runtime tree, and is the conventional home for ephemeral
 // IPC sockets. Root or group-write access on /run is the caller's concern.
 func init() {
-	DefaultSocketPath = "/run/inmem.sock"
+	DefaultSocketPath = "/run/scopecache.sock"
 }
