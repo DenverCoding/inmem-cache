@@ -386,6 +386,29 @@ Behavior:
 - `/warm` should briefly touch the store, then operate at affected scope level
 - `/rebuild` may lock/store-replace globally
 
+### Durability contract
+
+A 2xx response from any write endpoint (`/append`, `/warm`, `/update`,
+`/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`,
+`/wipe`, `/rebuild`) confirms the write was applied to the cache at the
+moment of commit. It is **not** a persistence guarantee:
+
+- A concurrent `/rebuild` or `/wipe` replaces or clears the entire store
+  and will erase writes that committed moments earlier. This is intentional:
+  both endpoints express "the source of truth says this is the new state,"
+  and the cache is explicitly subordinate to that source.
+- `/delete-scope` and `/delete-up-to` erase earlier writes within their
+  scope by design. Concurrent appends that happened to succeed just before
+  a delete can vanish.
+- The orphan-detach mechanism (`*ScopeDetachedError`) protects the store's
+  internal accounting — the byte counter cannot be corrupted by a write
+  that commits into a buffer unlinked by a concurrent swap — but it does
+  not, and cannot, retroactively preserve the write itself.
+
+Clients MUST be idempotent against cache loss (items re-fetchable or
+re-derivable from the source of truth) and MUST NOT treat a 200 OK as
+durable acknowledgment. The cache is deliberately disposable; see §1.
+
 ---
 
 ## 9. Implementation priorities
