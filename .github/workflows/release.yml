@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build static binaries
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build \
+              -trimpath \
+              -ldflags="-s -w" \
+              -o dist/scopecache-linux-$arch \
+              ./cmd/scopecache
+          done
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum scopecache-linux-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/scopecache-linux-amd64 \
+            dist/scopecache-linux-arm64 \
+            dist/SHA256SUMS

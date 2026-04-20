@@ -48,6 +48,22 @@ The service listens on `/run/scopecache.sock` inside the container (mounted to t
 
 ## Quickstart (Linux VPS)
 
+The fastest path is to download a prebuilt binary from the [Releases page](https://github.com/DenverCoding/scopecache/releases):
+
+```bash
+# Pick the matching architecture (amd64 or arm64):
+wget https://github.com/DenverCoding/scopecache/releases/latest/download/scopecache-linux-amd64
+chmod +x scopecache-linux-amd64
+sudo mv scopecache-linux-amd64 /usr/local/bin/scopecache
+scopecache &
+```
+
+Verify the download against the published `SHA256SUMS` file on the same release page.
+
+The binary is statically linked (`CGO_ENABLED=0`), so it runs on any Linux distro — Debian, Ubuntu, Alpine, scratch containers — with no glibc or Go dependency.
+
+If you prefer to build from source, or the architecture you need isn't prebuilt, read on.
+
 Stdlib-only means the build has no external dependencies — just Go and git.
 
 ### 1. Install Go
