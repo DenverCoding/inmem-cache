@@ -10,14 +10,16 @@ A small, local, rebuildable in-memory cache over a Unix domain socket. Written i
 - Wipeable and rebuildable at any time — the source of truth lives elsewhere (a database, a JSON file, data built in code, anything).
 - Tuned for modest VPS footprints (~1 GB RAM alongside DB + app), with a 100 MiB default store cap.
 - **Extremely fast**: sub-50-nanosecond reads on a populated store (see [Performance](#performance)).
+- **It can serve cached content directly to the HTTP edge.** The `/render` endpoint returns the raw payload bytes — no JSON envelope, no wrapper — so a fronting proxy (Caddy, nginx, apache) can pipe cached HTML pages, XML documents, JSON API responses or text fragments straight to the browser or API client. No application layer in between, no deserialize-and-reserialize round-trip. With Redis/memcached-style caches an application always has to sit in the middle to translate their reply into HTTP. 
+- inmem-cache is intentionally simple. Filtering and addressing are deliberately limited to three fields — `scope`, `id`, `seq` — and that limitation is the whole point: it is what keeps the cache fast and easy to reason about. There is no rich query language, but because `scope` and `id` are free-form strings the client fully controls, a surprisingly wide set of access patterns can be modeled on top of them.
+- inmem-cache is small enough to stay fully comprehensible, yet rich enough to carry a wide range of useful patterns. Its strength lies in the combination of simplicity, practical usefulness, and ease of deployment: a small, local, in-memory scope-first cache and write-buffer that is intentionally limited in surface area, yet flexible enough to support hot-read caching, lightweight write-buffer workflows, and direct response serving — all built from the same small set of core primitives. Cached HTML, XML, or JSON can be rendered straight to the wire, allowing a fronting webserver to present content directly from the cache without any intermediate application layer.
+- inmem-cache is deliberately limited in capability, yet flexible enough to cover a wide range of real-world use cases. Proposals to expand the query surface or make the cache "smarter" — automatic TTL, eviction, background policies — are scrutinised hard: anything added here competes directly with the simplicity and predictability that make the cache fast and easy to reason about.
 
 ## What it is not
 
 - A database, search engine, analytics store, or generic query engine.
 - A business-logic layer.
 - Payloads are opaque JSON — the cache never inspects, parses, or searches inside them.
-
-inmem-cache is intentionally simple. Filtering and addressing are deliberately limited to three fields — `scope`, `id`, `seq` — and that limitation is the whole point: it is what keeps the cache fast and easy to reason about. There is no rich query language, but because `scope` and `id` are free-form strings the client fully controls, a surprisingly wide set of access patterns can be modeled on top of them.
 
 ## Architecture
 
@@ -109,6 +111,31 @@ Miss response:
 ```json
 { "ok": true, "hit": false, "item": null }
 ```
+
+### Render one item (raw payload, no envelope)
+
+`/render` serves a single item's payload as raw bytes — no JSON wrapper around it. Use it to serve cached HTML, XML, JSON or text fragments directly from the cache (typically fronted by Caddy, nginx or apache, which sets the real `Content-Type`).
+
+Store an HTML fragment as a JSON string:
+
+```bash
+curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope": "pages",
+    "id": "home",
+    "payload": "<html><body>Hi</body></html>"
+  }'
+```
+
+Serve it raw:
+
+```bash
+curl -s --unix-socket /run/inmem.sock "http://localhost/render?scope=pages&id=home"
+# → <html><body>Hi</body></html>
+```
+
+Contract: hit returns `200` with the raw payload bytes; miss returns `404` with an empty body. Both use `Content-Type: application/octet-stream` — the fronting proxy is expected to override it for browser-facing deployments. When the payload is a JSON string (HTML/XML/text), one layer of JSON encoding is peeled; other JSON values (object, array, number, bool) are written raw.
 
 ### Other endpoints
 

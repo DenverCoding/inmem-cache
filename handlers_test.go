@@ -601,6 +601,183 @@ func TestGet_ByIDAndBySeq(t *testing.T) {
 	}
 }
 
+// --- /render ------------------------------------------------------------------
+
+// doRawRequest is a slimmed-down variant of doRequest that returns the full
+// ResponseRecorder. /render tests need header access (Content-Type) and raw
+// body access (no JSON unmarshaling) — doRequest hides both.
+func doRawRequest(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestRender_MethodNotAllowed(t *testing.T) {
+	h, _ := newTestHandler(10)
+	rec := doRawRequest(t, h, "POST", "/render?scope=s&id=a")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("code=%d want 405", rec.Code)
+	}
+}
+
+func TestRender_RejectsMissingScope(t *testing.T) {
+	h, _ := newTestHandler(10)
+	rec := doRawRequest(t, h, "GET", "/render?id=a")
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400", rec.Code)
+	}
+}
+
+func TestRender_RequiresExactlyOneOfIDOrSeq(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	rec := doRawRequest(t, h, "GET", "/render?scope=s")
+	if rec.Code != 400 {
+		t.Fatalf("neither: code=%d want 400", rec.Code)
+	}
+
+	rec = doRawRequest(t, h, "GET", "/render?scope=s&id=a&seq=1")
+	if rec.Code != 400 {
+		t.Fatalf("both: code=%d want 400", rec.Code)
+	}
+}
+
+func TestRender_RejectsMalformedSeq(t *testing.T) {
+	h, _ := newTestHandler(10)
+	rec := doRawRequest(t, h, "GET", "/render?scope=s&seq=notanumber")
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400", rec.Code)
+	}
+}
+
+// Miss (scope doesn't exist, or scope exists but item doesn't) must return
+// 404 with an empty body and a neutral Content-Type — the envelope-free
+// contract that distinguishes /render from /get.
+func TestRender_MissReturns404EmptyBody(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	rec := doRawRequest(t, h, "GET", "/render?scope=nope&id=a")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing scope: code=%d want 404", rec.Code)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("missing scope: body=%q want empty", body)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("missing scope: Content-Type=%q want application/octet-stream", ct)
+	}
+
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
+
+	rec = doRawRequest(t, h, "GET", "/render?scope=s&id=nonexistent")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing id: code=%d want 404", rec.Code)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("missing id: body=%q want empty", body)
+	}
+
+	rec = doRawRequest(t, h, "GET", "/render?scope=s&seq=42")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing seq: code=%d want 404", rec.Code)
+	}
+}
+
+// JSON object payloads are written raw — no envelope, no transformation.
+// The consumer gets exactly the bytes that were stored.
+func TestRender_JSONObjectPayload(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":{"text":"hello"}}`)
+
+	rec := doRawRequest(t, h, "GET", "/render?scope=s&id=a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("Content-Type=%q want application/octet-stream", ct)
+	}
+	if body := rec.Body.String(); body != `{"text":"hello"}` {
+		t.Errorf("body=%q want %q (raw JSON object, no envelope)", body, `{"text":"hello"}`)
+	}
+}
+
+func TestRender_JSONArrayPayload(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":[1,2,3]}`)
+
+	rec := doRawRequest(t, h, "GET", "/render?scope=s&id=a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200", rec.Code)
+	}
+	if body := rec.Body.String(); body != `[1,2,3]` {
+		t.Errorf("body=%q want raw JSON array", body)
+	}
+}
+
+// The core use case: HTML/XML/text stored as a JSON string. /render must
+// strip exactly one layer of JSON string-encoding so the consumer receives
+// real HTML bytes, not the quoted/escaped form. Without this, a browser
+// served by Caddy would receive a literal `"<html>..."` and render it as
+// text instead of as a webpage.
+func TestRender_JSONStringPayload_DecodesOneLayer(t *testing.T) {
+	h, _ := newTestHandler(10)
+	htmlBody := "<html><body>Hi \"quoted\" and\nnewline and \\ backslash</body></html>"
+	encodedPayload, err := json.Marshal(htmlBody)
+	if err != nil {
+		t.Fatalf("marshal htmlBody: %v", err)
+	}
+	appendBody := fmt.Sprintf(`{"scope":"pages","id":"home","payload":%s}`, encodedPayload)
+	if code, _, raw := doRequest(t, h, "POST", "/append", appendBody); code != 200 {
+		t.Fatalf("append: code=%d body=%s", code, raw)
+	}
+
+	rec := doRawRequest(t, h, "GET", "/render?scope=pages&id=home")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != htmlBody {
+		t.Errorf("body=%q want %q (JSON string must be decoded one layer)", got, htmlBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("Content-Type=%q want application/octet-stream (cache does not sniff MIME)", ct)
+	}
+}
+
+func TestRender_BySeq(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","payload":{"v":7}}`)
+
+	rec := doRawRequest(t, h, "GET", "/render?scope=s&seq=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200", rec.Code)
+	}
+	if body := rec.Body.String(); body != `{"v":7}` {
+		t.Errorf("body=%q want raw JSON object", body)
+	}
+}
+
+// /render hits feed scope read-heat the same way /get hits do, so
+// /delete-scope-candidates reflects render-driven traffic. Misses must not
+// count (same rule as /get) — otherwise a hot 404 would skew eviction.
+func TestRender_HitBumpsReadHeat_MissDoesNot(t *testing.T) {
+	h, api := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
+
+	_ = doRawRequest(t, h, "GET", "/render?scope=s&id=a")
+	_ = doRawRequest(t, h, "GET", "/render?scope=s&id=a")
+	_ = doRawRequest(t, h, "GET", "/render?scope=s&id=nonexistent") // miss — must not count
+
+	buf, _ := api.store.getScope("s")
+	buf.mu.RLock()
+	got := buf.last7DReadCount
+	buf.mu.RUnlock()
+	if got != 2 {
+		t.Errorf("last_7d_read_count=%d want 2 (two hits, miss must not count)", got)
+	}
+}
+
 // --- /stats -------------------------------------------------------------------
 
 func TestStats_Structure(t *testing.T) {

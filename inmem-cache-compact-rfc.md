@@ -134,6 +134,7 @@ Ordering rules:
 GET /head
 GET /tail
 GET /get
+GET /render
 GET /stats
 GET /help
 GET /delete-scope-candidates
@@ -169,6 +170,25 @@ Query:
 - exactly one of `id` or `seq`
 
 Returns exactly one item or a miss.
+
+### `GET /render`
+Query:
+- `scope` required
+- exactly one of `id` or `seq`
+
+Serves exactly one item's payload as raw bytes, with no JSON envelope around it. The use case is serving cached HTML, XML, JSON or text fragments directly to a consumer (typically a browser, fronted by Caddy, nginx or apache).
+
+Contract:
+
+- **Hit** — `200 OK`, body is the raw payload bytes, `Content-Type: application/octet-stream`.
+- **Miss** (scope unknown, or `id`/`seq` not present) — `404 Not Found`, empty body, `Content-Type: application/octet-stream`.
+- **Validation error** (missing `scope`, malformed `seq`, etc.) — `400 Bad Request` with the standard JSON error envelope. Developer-facing errors keep the envelope; the envelope-free contract only applies to hit/miss.
+
+**Content-Type policy.** The cache always returns `application/octet-stream` on `/render`. It does **not** sniff, guess, or derive a real MIME type from the payload. Browser-facing setups are expected to override `Content-Type` in the fronting proxy (e.g. Caddy's `header Content-Type text/html` inside a route block). Keeping the cache dumb here is deliberate — see §1.1 and the boundary rule.
+
+**JSON-string decoding.** `payload` must be a valid JSON value (see §2 rule 3). When the stored payload is a JSON *string* (first non-whitespace byte is `"`), `/render` peels exactly one layer of JSON string-encoding before writing the body — so `"<html>..."` in storage becomes `<html>...` on the wire. All other JSON values (object, array, number, bool) are written raw; the consumer is expected to parse them as JSON. This is the only transformation the cache performs, and it exists because HTML/XML/text cannot be stored any other way while `payload` remains JSON-typed.
+
+Hits count toward scope read-heat (`last_access_ts`, `last_7d_read_count`) exactly like `/get`; misses do not.
 
 ### `GET /stats`
 Returns store-level and scope-level operational metadata.
@@ -435,6 +455,34 @@ curl -s --unix-socket /run/inmem.sock "http://localhost/get?scope=thread:900&id=
 ```bash
 curl -s --unix-socket /run/inmem.sock "http://localhost/get?scope=thread:900&seq=1"
 ```
+
+### 12.7a Render (serve raw payload, no envelope)
+
+Cache an HTML fragment as a JSON string, then serve it raw:
+
+```bash
+curl -s --unix-socket /run/inmem.sock -X POST http://localhost/append \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope": "pages",
+    "id": "home",
+    "payload": "<html><body>Hi</body></html>"
+  }'
+
+curl -s --unix-socket /run/inmem.sock \
+  "http://localhost/render?scope=pages&id=home"
+# → <html><body>Hi</body></html>
+```
+
+A JSON object stored under the same pattern is served with its raw JSON bytes:
+
+```bash
+curl -s --unix-socket /run/inmem.sock \
+  "http://localhost/render?scope=thread:900&id=post_1"
+# → {"text":"hello"}
+```
+
+Response for a miss is `404 Not Found` with an empty body.
 
 ### 12.8 Warm
 

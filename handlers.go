@@ -1,6 +1,7 @@
 package inmemcache
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -631,6 +632,106 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
+// handleRender serves a single item as raw payload bytes with no JSON
+// envelope. The use case is serving cached HTML/XML/JSON/text fragments
+// directly from the cache (typically fronted by Caddy, nginx, or apache).
+//
+// Design rules — deliberately minimal:
+//   - Hit and miss paths are envelope-free: 200 carries raw payload bytes,
+//     404 carries an empty body. Both use Content-Type application/octet-stream
+//     — a neutral default the fronting proxy is expected to override via its
+//     own route config (e.g. `header Content-Type text/html`). The cache does
+//     NOT sniff content or guess the real MIME type.
+//   - Validation errors (missing scope, malformed seq, etc.) still use the
+//     standard JSON error envelope. Those are developer-facing, not content-facing.
+//   - If the stored payload is a JSON string (first non-whitespace byte is `"`),
+//     one layer of JSON string-encoding is peeled so `"<html>..."` is served
+//     as `<html>...` on the wire. All other JSON values (object, array, number,
+//     bool) are written raw; the consumer is expected to parse them as JSON.
+func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, started)
+		return
+	}
+
+	scope := r.URL.Query().Get("scope")
+	id := r.URL.Query().Get("id")
+	seqStr := r.URL.Query().Get("seq")
+
+	if scopeErr := validateScope(scope, "/render"); scopeErr != nil {
+		badRequest(w, started, scopeErr.Error())
+		return
+	}
+
+	hasID := id != ""
+	hasSeq := seqStr != ""
+	if hasID == hasSeq {
+		badRequest(w, started, "exactly one of 'id' or 'seq' must be provided")
+		return
+	}
+
+	if hasID {
+		if idErr := validateID(id); idErr != nil {
+			badRequest(w, started, idErr.Error())
+			return
+		}
+	}
+
+	var seq uint64
+	if hasSeq {
+		parsed, err := strconv.ParseUint(seqStr, 10, 64)
+		if err != nil {
+			badRequest(w, started, "the 'seq' parameter must be a valid unsigned integer")
+			return
+		}
+		seq = parsed
+	}
+
+	writeMiss := func() {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusNotFound)
+	}
+
+	buf, ok := api.store.getScope(scope)
+	if !ok {
+		writeMiss()
+		return
+	}
+
+	var item Item
+	var found bool
+	if hasID {
+		item, found = buf.getByID(id)
+	} else {
+		item, found = buf.getBySeq(seq)
+	}
+	if !found {
+		writeMiss()
+		return
+	}
+
+	// A hit counts toward scope read-heat, same as /get.
+	buf.recordRead(nowUnixMicro())
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+
+	trimmed := bytes.TrimLeft(item.Payload, " \t\r\n")
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(item.Payload, &s); err == nil {
+			_, _ = w.Write([]byte(s))
+			return
+		}
+		// Fall through to raw bytes on unmarshal failure. Stored payloads
+		// are validated on write, so this is a defensive safety net rather
+		// than an expected path.
+	}
+	_, _ = w.Write(item.Payload)
+}
+
 // Per-scope stats are read under each buffer's own lock, not store-wide:
 // the response is per-scope consistent but not a global atomic snapshot,
 // which is acceptable because this endpoint is advisory.
@@ -744,6 +845,7 @@ POST /delete-scope - delete one entire scope from the cache
 GET  /head - get the oldest items from a scope; supports optional after_seq for cursor-based forward reads (offset is not supported, use /tail for position-based paging)
 GET  /tail - get the most recent items from a scope (supports optional offset)
 GET  /get - get one item by scope + id or scope + seq
+GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss returns 404; JSON-string payloads are decoded one layer so cached HTML/XML/text is served as-is; Content-Type is application/octet-stream — fronting proxy is expected to set the real type if browser-facing
 GET  /stats - show store stats and approximate store size
 GET  /delete-scope-candidates - list scope eviction candidates, sorted by oldest last_access_ts (response includes last_7d_read_count for client-side filtering/sorting)
 
@@ -754,6 +856,7 @@ NOTES:
 - /delete-scope removes all items, indexes and scope-level metadata for one scope
 - /delete-scope-candidates is advisory only: returns candidates, never deletes; the client decides
 - /delete-scope-candidates supports optional ?hours=N to exclude recently created scopes
+- /render has a deliberately envelope-free hit/miss contract: 200 carries raw payload bytes, 404 carries an empty body; both use Content-Type application/octet-stream. Validation errors (400) still use the JSON error envelope. The cache does not sniff or guess MIME types — browser-facing setups must set Content-Type in the fronting proxy.
 `
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -772,6 +875,7 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/head", api.handleHead)
 	mux.HandleFunc("/tail", api.handleTail)
 	mux.HandleFunc("/get", api.handleGet)
+	mux.HandleFunc("/render", api.handleRender)
 	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/help", api.handleHelp)
 	mux.HandleFunc("/delete-scope-candidates", api.handleDeleteScopeCandidates)
