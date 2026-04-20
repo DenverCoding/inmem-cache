@@ -411,6 +411,18 @@ Clients MUST be idempotent against cache loss (items re-fetchable or
 re-derivable from the source of truth) and MUST NOT treat a 200 OK as
 durable acknowledgment. The cache is deliberately disposable; see §1.
 
+### Read consistency
+
+`/stats` and `/delete-scope-candidates` are advisory snapshots, not transactional:
+
+- Each scope is read under its own lock so per-scope values are internally
+  consistent, but the response as a whole is not a global snapshot — writes
+  committing in other scopes between reads are visible in the same response.
+- Store-wide totals (`approx_store_mb`, aggregate counts) come from the
+  atomic counter and may briefly skew against the sum of per-scope values
+  under concurrent writes. The `Σ buf.bytes == totalBytes` invariant holds
+  at quiesce, not at every observation.
+
 ---
 
 ## 9. Implementation priorities
