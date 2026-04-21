@@ -339,6 +339,12 @@ Reproduce with:
 go test -bench=. -benchmem -benchtime=3s -run=^$ ./...
 ```
 
+### Memory footprint
+
+The standalone binary uses ~4.5 MB resident RAM at startup with an empty cache, and stabilises around ~9 MB after serving load (Go runtime + goroutine stacks). Cache data adds `approxItemSize` per item on top. At the default 100 MiB store cap the total RSS ceiling is roughly ~110 MB.
+
+Measured with `/proc/<pid>/status` on linux/amd64, Go 1.21, static binary (`CGO_ENABLED=0`).
+
 ## Building from source
 
 ```bash
