@@ -154,6 +154,74 @@ func methodNotAllowed(w http.ResponseWriter, started time.Time) {
 	}, started)
 }
 
+// lookupTarget is the parsed form of /get's and /render's URL query:
+// a scope plus exactly one of id or seq. Built by parseLookupTarget.
+type lookupTarget struct {
+	Scope string
+	ByID  bool
+	ID    string
+	Seq   uint64
+}
+
+// parseLookupTarget pulls scope + exactly one of id/seq from the query
+// string and validates each. Scope errors are labelled with the endpoint;
+// the id/seq shape errors are endpoint-agnostic since the rule is the same
+// on every single-item read.
+func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
+	query := r.URL.Query()
+	scope := query.Get("scope")
+	id := query.Get("id")
+	seqStr := query.Get("seq")
+
+	if err := validateScope(scope, endpoint); err != nil {
+		return lookupTarget{}, err
+	}
+
+	hasID := id != ""
+	hasSeq := seqStr != ""
+	if hasID == hasSeq {
+		return lookupTarget{}, errors.New("exactly one of 'id' or 'seq' must be provided")
+	}
+
+	if hasID {
+		if err := validateID(id); err != nil {
+			return lookupTarget{}, err
+		}
+		return lookupTarget{Scope: scope, ByID: true, ID: id}, nil
+	}
+
+	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	if err != nil {
+		return lookupTarget{}, errors.New("the 'seq' parameter must be a valid unsigned integer")
+	}
+	return lookupTarget{Scope: scope, Seq: seq}, nil
+}
+
+// scopeLimit is the parsed form of the scope+limit query pair used by every
+// multi-item read (/head, /tail, /ts_range). Endpoint-specific params
+// (offset, after_seq, since_ts, …) are parsed by the handler itself — this
+// helper deliberately stops at the common pair.
+type scopeLimit struct {
+	Scope string
+	Limit int
+}
+
+// parseScopeLimit validates scope and normalizes limit in the order every
+// caller expects (scope first, then limit), so the returned error matches
+// the handlers' historical behaviour.
+func parseScopeLimit(r *http.Request, endpoint string) (scopeLimit, error) {
+	query := r.URL.Query()
+	scope := query.Get("scope")
+	if err := validateScope(scope, endpoint); err != nil {
+		return scopeLimit{}, err
+	}
+	limit, err := normalizeLimit(query.Get("limit"))
+	if err != nil {
+		return scopeLimit{}, err
+	}
+	return scopeLimit{Scope: scope, Limit: limit}, nil
+}
+
 func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -630,18 +698,12 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := r.URL.Query()
-	scope := query.Get("scope")
-	limit, err := normalizeLimit(query.Get("limit"))
-
-	if scopeErr := validateScope(scope, "/head"); scopeErr != nil {
-		badRequest(w, started, scopeErr.Error())
-		return
-	}
+	q, err := parseScopeLimit(r, "/head")
 	if err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
+	query := r.URL.Query()
 	// /head reads forward by cursor only. Positional 'offset' addressing
 	// lives on /tail exclusively because seq-based forward reads are stable
 	// under /delete-up-to while position-based forward reads are not.
@@ -662,7 +724,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	buf, ok := api.store.getScope(scope)
+	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
 		writeJSONWithDuration(w, http.StatusOK, orderedFields{
 			{"ok", true},
@@ -674,7 +736,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, truncated := buf.sinceSeq(afterSeq, limit)
+	items, truncated := buf.sinceSeq(afterSeq, q.Limit)
 	// Only a non-empty result counts toward read-heat. An empty window is
 	// effectively a miss and should not skew eviction.
 	if len(items) > 0 {
@@ -698,24 +760,18 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scope := r.URL.Query().Get("scope")
-	limit, err := normalizeLimit(r.URL.Query().Get("limit"))
-	offset, offsetErr := normalizeOffset(r.URL.Query().Get("offset"))
-
-	if scopeErr := validateScope(scope, "/tail"); scopeErr != nil {
-		badRequest(w, started, scopeErr.Error())
-		return
-	}
+	q, err := parseScopeLimit(r, "/tail")
 	if err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
-	if offsetErr != nil {
-		badRequest(w, started, offsetErr.Error())
+	offset, err := normalizeOffset(r.URL.Query().Get("offset"))
+	if err != nil {
+		badRequest(w, started, err.Error())
 		return
 	}
 
-	buf, ok := api.store.getScope(scope)
+	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
 		writeJSONWithDuration(w, http.StatusOK, orderedFields{
 			{"ok", true},
@@ -728,7 +784,7 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, truncated := buf.tailOffset(limit, offset)
+	items, truncated := buf.tailOffset(q.Limit, offset)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}
@@ -758,17 +814,12 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := r.URL.Query()
-	scope := query.Get("scope")
-	limit, err := normalizeLimit(query.Get("limit"))
-	if scopeErr := validateScope(scope, "/ts_range"); scopeErr != nil {
-		badRequest(w, started, scopeErr.Error())
-		return
-	}
+	q, err := parseScopeLimit(r, "/ts_range")
 	if err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
+	query := r.URL.Query()
 
 	sinceTs, err := parseTsParam("since_ts", query.Get("since_ts"))
 	if err != nil {
@@ -785,7 +836,7 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, ok := api.store.getScope(scope)
+	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
 		writeJSONWithDuration(w, http.StatusOK, orderedFields{
 			{"ok", true},
@@ -797,7 +848,7 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, truncated := buf.tsRange(sinceTs, untilTs, limit)
+	items, truncated := buf.tsRange(sinceTs, untilTs, q.Limit)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}
@@ -819,80 +870,41 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scope := r.URL.Query().Get("scope")
-	id := r.URL.Query().Get("id")
-	seqStr := r.URL.Query().Get("seq")
-
-	if scopeErr := validateScope(scope, "/get"); scopeErr != nil {
-		badRequest(w, started, scopeErr.Error())
-		return
-	}
-
-	hasID := id != ""
-	hasSeq := seqStr != ""
-
-	if hasID == hasSeq {
-		badRequest(w, started, "exactly one of 'id' or 'seq' must be provided")
-		return
-	}
-
-	if hasID {
-		if idErr := validateID(id); idErr != nil {
-			badRequest(w, started, idErr.Error())
-			return
-		}
-	}
-
-	buf, ok := api.store.getScope(scope)
-	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"item", nil},
-		}, started)
-		return
-	}
-
-	if hasID {
-		item, found := buf.getByID(id)
-		if !found {
-			writeJSONWithDuration(w, http.StatusOK, orderedFields{
-				{"ok", true},
-				{"hit", false},
-				{"item", nil},
-			}, started)
-			return
-		}
-
-		// Only a hit counts toward scope read-heat. A miss by explicit id/seq
-		// should not inflate last_7d_read_count, since the signal is surfaced
-		// on /delete-scope-candidates for client-side eviction decisions.
-		buf.recordRead(nowUnixMicro())
-
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", true},
-			{"item", item},
-		}, started)
-		return
-	}
-
-	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	target, err := parseLookupTarget(r, "/get")
 	if err != nil {
-		badRequest(w, started, "the 'seq' parameter must be a valid unsigned integer")
+		badRequest(w, started, err.Error())
 		return
 	}
 
-	item, found := buf.getBySeq(seq)
-	if !found {
+	miss := func() {
 		writeJSONWithDuration(w, http.StatusOK, orderedFields{
 			{"ok", true},
 			{"hit", false},
 			{"item", nil},
 		}, started)
+	}
+
+	buf, ok := api.store.getScope(target.Scope)
+	if !ok {
+		miss()
 		return
 	}
 
+	var item Item
+	var found bool
+	if target.ByID {
+		item, found = buf.getByID(target.ID)
+	} else {
+		item, found = buf.getBySeq(target.Seq)
+	}
+	if !found {
+		miss()
+		return
+	}
+
+	// Only a hit counts toward scope read-heat. A miss by explicit id/seq
+	// should not inflate last_7d_read_count, since the signal is surfaced
+	// on /delete-scope-candidates for client-side eviction decisions.
 	buf.recordRead(nowUnixMicro())
 
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
@@ -926,37 +938,10 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scope := r.URL.Query().Get("scope")
-	id := r.URL.Query().Get("id")
-	seqStr := r.URL.Query().Get("seq")
-
-	if scopeErr := validateScope(scope, "/render"); scopeErr != nil {
-		badRequest(w, started, scopeErr.Error())
+	target, err := parseLookupTarget(r, "/render")
+	if err != nil {
+		badRequest(w, started, err.Error())
 		return
-	}
-
-	hasID := id != ""
-	hasSeq := seqStr != ""
-	if hasID == hasSeq {
-		badRequest(w, started, "exactly one of 'id' or 'seq' must be provided")
-		return
-	}
-
-	if hasID {
-		if idErr := validateID(id); idErr != nil {
-			badRequest(w, started, idErr.Error())
-			return
-		}
-	}
-
-	var seq uint64
-	if hasSeq {
-		parsed, err := strconv.ParseUint(seqStr, 10, 64)
-		if err != nil {
-			badRequest(w, started, "the 'seq' parameter must be a valid unsigned integer")
-			return
-		}
-		seq = parsed
 	}
 
 	writeMiss := func() {
@@ -964,7 +949,7 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}
 
-	buf, ok := api.store.getScope(scope)
+	buf, ok := api.store.getScope(target.Scope)
 	if !ok {
 		writeMiss()
 		return
@@ -972,10 +957,10 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 
 	var item Item
 	var found bool
-	if hasID {
-		item, found = buf.getByID(id)
+	if target.ByID {
+		item, found = buf.getByID(target.ID)
 	} else {
-		item, found = buf.getBySeq(seq)
+		item, found = buf.getBySeq(target.Seq)
 	}
 	if !found {
 		writeMiss()
