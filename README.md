@@ -14,7 +14,7 @@ Payloads can also be served directly via `/render`, allowing Caddy, nginx, or Ap
 - Tuned for modest VPS footprints (~1 GB RAM alongside DB + app), with a 100 MiB default store cap.
 - **Extremely fast**: around 10,000 HTTP requests per second per core over the Unix socket and over 100,000 per second aggregate under concurrent load, backed by a cache core that answers in-process lookups in sub-50 nanoseconds (see [Performance](#performance)).
 - **It can serve cached content directly to the HTTP edge.** The `/render` endpoint returns the raw payload bytes — no JSON envelope, no wrapper — so a fronting proxy (Caddy, nginx, apache) can pipe cached HTML pages, XML documents, JSON API responses or text fragments straight to the browser or API client. No application layer in between, no deserialize-and-reserialize round-trip. With Redis/memcached-style caches an application always has to sit in the middle to translate their reply into HTTP. 
-- scopecache is intentionally simple. Filtering and addressing are deliberately limited to three fields — `scope`, `id`, `seq` — and that limitation is the whole point: it is what keeps the cache fast and easy to reason about. There is no rich query language, but because `scope` and `id` are free-form strings the client fully controls, a surprisingly wide set of access patterns can be modeled on top of them.
+- scopecache is intentionally simple. Addressing is limited to `scope`, `id`, and `seq`; filtering adds one more axis, an optional client-supplied `ts` (int64) that `/ts_range` treats as a time-window filter. That deliberate shortness is the whole point: it is what keeps the cache fast and easy to reason about. There is no rich query language, but because `scope` and `id` are free-form strings the client fully controls — and `ts` opens server-side time windows without dragging payloads into the query surface — a surprisingly wide set of access patterns can be modeled on top of them.
 - scopecache is small enough to stay fully comprehensible, yet rich enough to carry a wide range of useful patterns. Its strength lies in the combination of simplicity, practical usefulness, and ease of deployment: a small, local, in-memory scope-first cache and write-buffer that is intentionally limited in surface area, yet flexible enough to support hot-read caching, lightweight write-buffer workflows, and direct response serving — all built from the same small set of core primitives. Cached HTML, XML, or JSON can be rendered straight to the wire, allowing a fronting webserver to present content directly from the cache without any intermediate application layer.
 - scopecache is deliberately limited in capability, yet flexible enough to cover a wide range of real-world use cases. Proposals to expand the query surface or make the cache "smarter" — automatic TTL, eviction, background policies — are scrutinised hard: anything added here competes directly with the simplicity and predictability that make the cache fast and easy to reason about.
 
@@ -268,7 +268,9 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 
 ### Other endpoints
 
-`/head`, `/tail`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/wipe`, `/delete-scope-candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples.
+`/head`, `/tail`, `/ts_range`, `/warm`, `/rebuild`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`, `/wipe`, `/delete-scope-candidates`, `/stats`, `/help` — see section 13 of the [spec](scopecache-rfc.md) for full examples.
+
+`/ts_range` filters a scope by a client-supplied top-level `ts` (signed int64, milliseconds since unix epoch by convention — the cache is opaque to the unit). At least one of `since_ts` / `until_ts` must be provided; both together form an inclusive `[since_ts, until_ts]` window. Items without a `ts` are excluded. Results are returned in ascending `seq` order — `ts` is a filter, not an ordering key. Responses on `/head`, `/tail`, and `/ts_range` carry `{ "ok", "items", "truncated" }`; `truncated: true` means more matching items exist beyond the returned `limit`. `/ts_range` has **no pagination cursor** because `ts` is mutable (via `/update` / `/upsert`) and non-unique — narrow the window or raise `limit` to fetch more. `ts` is optional on `/append`, `/warm`, `/rebuild`, `/update` (absent = preserve) and `/upsert` (absent = clear, matching its whole-item replace semantics).
 
 `/upsert` creates a new item or replaces an existing one by `scope` + `id`. It is the idempotent, retry-safe write path: unlike `/append` (which rejects duplicate ids) or `/update` (which soft-misses on absent items), `/upsert` always writes. `seq` is preserved on replace and freshly assigned on create. The response includes `"created": true` for a fresh item and `false` for a replace.
 
@@ -310,6 +312,19 @@ Single-item read, direct function call against the store — no HTTP layer:
 | `GetByID` (parallel, 32 cores)   | ~29 ns  | 0         |
 
 That is roughly **30 million reads per second per core**. The scope-level `RWMutex` does not serialize readers, so throughput scales with cores. These numbers describe the ceiling of the cache core itself, not the rate a client sees over the socket.
+
+### Time-window filtering (`/ts_range`)
+
+`/ts_range` performs an unindexed linear scan over the scope's items — no secondary index on `ts` is maintained. Two shapes worth measuring: a realistic scope where the scan early-exits on `limit`, and a worst-case scope where the filter window forces the scan to traverse every item.
+
+| Benchmark                     | Items in scope | Scan work                       | Time/op  | Allocs/op |
+|-------------------------------|----------------|----------------------------------|----------|-----------|
+| `TsRange_Realistic`           | 2,000 (all match) | ~1,001 iterations (early-exit) | ~7.3 µs  | 1         |
+| `TsRange_FullScope_Worst`     | 100,000 (matches clustered at tail) | full 100,000 iterations | ~119 µs  | 1         |
+
+**Why no `ts` index.** A secondary index would trade sub-millisecond read cost for non-trivial write-path overhead — index maintenance on every `/append`, `/update`, `/upsert`, `/warm`, and `/rebuild`, plus the extra memory to hold it. The scan is already fast enough that this trade is not warranted: even the pathological case on a maxed-out 100,000-item scope completes in ~120 µs, well below the ~100 µs HTTP framing floor (see the end-to-end table below). A client on the Unix socket therefore cannot observe the scan cost on top of the request round-trip. Keeping the read path unindexed keeps the write path cheap and the store small — which is the whole point of the design (§4 of the [spec](scopecache-rfc.md)).
+
+The single allocation per call is the output slice, sized to `limit` (~72 KiB at the default `limit=1000`). The scan loop itself allocates nothing.
 
 ### HTTP over Unix socket (end-to-end)
 

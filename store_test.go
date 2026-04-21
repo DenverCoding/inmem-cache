@@ -179,7 +179,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 	original, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
-	n, err := buf.updateByID("a", newPayload)
+	n, err := buf.updateByID("a", newPayload, nil)
 	if err != nil {
 		t.Fatalf("updateByID: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 func TestUpdateByID_Miss(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
-	n, err := buf.updateByID("missing", raw)
+	n, err := buf.updateByID("missing", raw, nil)
 	if err != nil {
 		t.Fatalf("updateByID: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestUpdateBySeq_Hit(t *testing.T) {
 	it, _ := buf.appendItem(newItem("s", "", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
-	n, err := buf.updateBySeq(it.Seq, newPayload)
+	n, err := buf.updateBySeq(it.Seq, newPayload, nil)
 	if err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 	it, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 42})
-	if _, err := buf.updateBySeq(it.Seq, newPayload); err != nil {
+	if _, err := buf.updateBySeq(it.Seq, newPayload, nil); err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
 
@@ -262,7 +262,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 func TestUpdateBySeq_Miss(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
-	n, err := buf.updateBySeq(999, raw)
+	n, err := buf.updateBySeq(999, raw, nil)
 	if err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
@@ -791,7 +791,7 @@ func TestTailOffset_BasicAndEdges(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got := buf.tailOffset(tc.limit, tc.offset)
+		got, _ := buf.tailOffset(tc.limit, tc.offset)
 		if len(got) != len(tc.wantSeq) {
 			t.Errorf("tail(limit=%d offset=%d): len=%d want %d", tc.limit, tc.offset, len(got), len(tc.wantSeq))
 			continue
@@ -812,7 +812,7 @@ func TestSinceSeq_ReturnsItemsAfterCursor(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	got := buf.sinceSeq(2, 0)
+	got, _ := buf.sinceSeq(2, 0)
 	if len(got) != 3 {
 		t.Fatalf("len=%d want 3", len(got))
 	}
@@ -827,7 +827,7 @@ func TestSinceSeq_RespectsLimit(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	got := buf.sinceSeq(0, 2)
+	got, _ := buf.sinceSeq(0, 2)
 	if len(got) != 2 {
 		t.Fatalf("len=%d want 2", len(got))
 	}
@@ -837,7 +837,7 @@ func TestSinceSeq_EmptyWhenPastEnd(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "", nil))
 
-	got := buf.sinceSeq(100, 0)
+	got, _ := buf.sinceSeq(100, 0)
 	if len(got) != 0 {
 		t.Fatalf("len=%d want 0", len(got))
 	}
@@ -1537,7 +1537,7 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 		"v":    1,
 		"blob": "x_________________________________________________________________________________________________",
 	})
-	n, err := buf.updateByID("a", bigPayload)
+	n, err := buf.updateByID("a", bigPayload, nil)
 	if err == nil {
 		t.Fatal("expected StoreFullError on grow past cap")
 	}

@@ -342,6 +342,10 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 				continue
 			}
 			b.items[i].Payload = item.Payload
+			// /upsert has replace-the-whole-item semantics, so ts follows the
+			// client's input exactly: send ts → stored, omit → cleared. That
+			// differs from /update (which treats absent ts as "preserve").
+			b.items[i].Ts = item.Ts
 
 			updated := b.items[i]
 			b.bySeq[updated.Seq] = updated
@@ -481,7 +485,12 @@ func parseCounterValue(payload json.RawMessage) (int64, error) {
 	return v, nil
 }
 
-func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error) {
+// updateByID mutates the item at (scope, id). Payload is always overwritten.
+// Ts follows "absent → preserve, present → overwrite" semantics: a nil ts
+// leaves the stored ts alone, a non-nil ts replaces it. This asymmetry with
+// /upsert (which blind-overwrites ts) is deliberate — /update is a partial
+// modify, /upsert is a full replace.
+func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -494,9 +503,9 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 		return 0, nil
 	}
 
-	// Only the payload changes on /update; scope/id are unchanged, so the
-	// byte delta reduces to len(new_payload) - len(old_payload). A shrink
-	// can't fail the cap check, but a grow must reserve first.
+	// Only the payload changes on /update; scope/id/ts are unchanged in size,
+	// so the byte delta reduces to len(new_payload) - len(old_payload). A
+	// shrink can't fail the cap check, but a grow must reserve first.
 	delta := int64(len(payload)) - int64(len(existing.Payload))
 	if b.store != nil && delta != 0 {
 		ok, current, max := b.store.reserveBytes(delta)
@@ -511,6 +520,9 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 		}
 
 		b.items[i].Payload = payload
+		if ts != nil {
+			b.items[i].Ts = ts
+		}
 
 		updated := b.items[i]
 		b.bySeq[updated.Seq] = updated
@@ -523,7 +535,7 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 	return 0, nil
 }
 
-func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, error) {
+func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -553,6 +565,9 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 	}
 
 	b.items[i].Payload = payload
+	if ts != nil {
+		b.items[i].Ts = ts
+	}
 
 	updated := b.items[i]
 	b.bySeq[seq] = updated
@@ -675,35 +690,45 @@ func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) int {
 	return idx
 }
 
-func (b *ScopeBuffer) tailOffset(limit int, offset int) []Item {
+// tailOffset returns the newest-first window `[start, end)` of b.items and a
+// hasMore flag. hasMore is true when older items exist before the window (i.e.
+// start > 0), signalling to the caller that the response is clipped at the
+// oldest end. It does NOT signal truncation at the newest end (that is what
+// offset already describes to the client).
+func (b *ScopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if limit <= 0 || offset < 0 {
-		return []Item{}
+		return []Item{}, false
 	}
 	if offset >= len(b.items) {
-		return []Item{}
+		return []Item{}, false
 	}
 
 	end := len(b.items) - offset
 	start := end - limit
+	hasMore := start > 0
 	if start < 0 {
 		start = 0
 	}
 	if start >= end {
-		return []Item{}
+		return []Item{}, false
 	}
 
-	return append([]Item(nil), b.items[start:end]...)
+	return append([]Item(nil), b.items[start:end]...), hasMore
 }
 
-func (b *ScopeBuffer) sinceSeq(afterSeq uint64, limit int) []Item {
+// sinceSeq returns items with seq > afterSeq, oldest-first, up to limit. The
+// bool is true when more matching items exist beyond the returned slice, which
+// lets the handler surface truncated=true without the client having to guess
+// from count == limit.
+func (b *ScopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if len(b.items) == 0 {
-		return []Item{}
+		return []Item{}, false
 	}
 
 	idx := sort.Search(len(b.items), func(i int) bool {
@@ -711,14 +736,50 @@ func (b *ScopeBuffer) sinceSeq(afterSeq uint64, limit int) []Item {
 	})
 
 	if idx >= len(b.items) {
-		return []Item{}
+		return []Item{}, false
 	}
 
-	out := append([]Item(nil), b.items[idx:]...)
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	available := len(b.items) - idx
+	take := available
+	hasMore := false
+	if limit > 0 && available > limit {
+		take = limit
+		hasMore = true
 	}
-	return out
+	out := make([]Item, take)
+	copy(out, b.items[idx:idx+take])
+	return out, hasMore
+}
+
+// tsRange scans the scope in seq order, returning items whose Ts falls inside
+// the inclusive window defined by sinceTs and untilTs (either may be nil to
+// leave that side unbounded). Items without a Ts are always skipped. The bool
+// is true when at least one further matching item exists beyond the limit,
+// so the handler can set truncated=true. This is an O(n) scan — unindexed
+// because the per-scope cap (100k items) makes a linear pass sub-millisecond
+// and the code stays trivially correct under concurrent ts mutations.
+func (b *ScopeBuffer) tsRange(sinceTs, untilTs *int64, limit int) ([]Item, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	out := make([]Item, 0, limit)
+	for _, it := range b.items {
+		if it.Ts == nil {
+			continue
+		}
+		if sinceTs != nil && *it.Ts < *sinceTs {
+			continue
+		}
+		if untilTs != nil && *it.Ts > *untilTs {
+			continue
+		}
+		if limit > 0 && len(out) == limit {
+			// Found one more match beyond the cap — signal truncation and stop.
+			return out, true
+		}
+		out = append(out, it)
+	}
+	return out, false
 }
 
 func (b *ScopeBuffer) getByID(id string) (Item, bool) {

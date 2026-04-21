@@ -110,6 +110,35 @@ func normalizeOffset(raw string) (int, error) {
 	return n, nil
 }
 
+// parseTsParam decodes a since_ts/until_ts query string as a signed int64
+// (milliseconds since unix epoch, by convention; the cache is opaque to the
+// unit). An empty raw value returns (nil, nil) so callers can distinguish
+// "absent" from "present but zero". Any value that does not round-trip as an
+// int64 fails validation rather than silently clamping.
+func parseTsParam(name, raw string) (*int64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, errors.New("the '" + name + "' parameter must be a valid int64 (milliseconds since unix epoch)")
+	}
+	return &v, nil
+}
+
+// validateTsRangeParams enforces the shape rules for /ts_range's time window:
+// at least one bound must be present, and the window must be non-inverted.
+// Bounds are inclusive on both ends (SQL BETWEEN convention).
+func validateTsRangeParams(sinceTs, untilTs *int64) error {
+	if sinceTs == nil && untilTs == nil {
+		return errors.New("at least one of 'since_ts' or 'until_ts' must be provided for the '/ts_range' endpoint")
+	}
+	if sinceTs != nil && untilTs != nil && *sinceTs > *untilTs {
+		return errors.New("the 'since_ts' must not be greater than 'until_ts'")
+	}
+	return nil
+}
+
 func normalizeHours(raw string) (int64, error) {
 	if raw == "" {
 		return 0, nil

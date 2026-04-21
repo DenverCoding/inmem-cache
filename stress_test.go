@@ -93,9 +93,9 @@ func TestStress_MixedOps(t *testing.T) {
 				case 0:
 					_, _ = buf.getByID("seed_" + strconv.Itoa(rng.Intn(20)))
 				case 1:
-					_ = buf.tailOffset(10, 0)
+					_, _ = buf.tailOffset(10, 0)
 				case 2:
-					_ = buf.sinceSeq(0, 10)
+					_, _ = buf.sinceSeq(0, 10)
 				}
 				reads.Add(1)
 
@@ -140,6 +140,7 @@ func TestStress_MixedOps(t *testing.T) {
 				_, _ = buf.updateByID(
 					"upsert_"+strconv.Itoa(rng.Intn(30)),
 					json.RawMessage(`{"updated":true}`),
+					nil,
 				)
 				updates.Add(1)
 

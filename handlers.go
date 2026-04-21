@@ -459,9 +459,9 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	var updated int
 	var err error
 	if item.ID != "" {
-		updated, err = buf.updateByID(item.ID, item.Payload)
+		updated, err = buf.updateByID(item.ID, item.Payload, item.Ts)
 	} else {
-		updated, err = buf.updateBySeq(item.Seq, item.Payload)
+		updated, err = buf.updateBySeq(item.Seq, item.Payload, item.Ts)
 	}
 	if err != nil {
 		var stfe *StoreFullError
@@ -668,12 +668,13 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 			{"ok", true},
 			{"hit", false},
 			{"count", 0},
+			{"truncated", false},
 			{"items", []Item{}},
 		}, started)
 		return
 	}
 
-	items := buf.sinceSeq(afterSeq, limit)
+	items, truncated := buf.sinceSeq(afterSeq, limit)
 	// Only a non-empty result counts toward read-heat. An empty window is
 	// effectively a miss and should not skew eviction.
 	if len(items) > 0 {
@@ -684,6 +685,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		{"ok", true},
 		{"hit", len(items) > 0},
 		{"count", len(items)},
+		{"truncated", truncated},
 		{"items", items},
 	}, started)
 }
@@ -720,12 +722,13 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 			{"hit", false},
 			{"count", 0},
 			{"offset", offset},
+			{"truncated", false},
 			{"items", []Item{}},
 		}, started)
 		return
 	}
 
-	items := buf.tailOffset(limit, offset)
+	items, truncated := buf.tailOffset(limit, offset)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}
@@ -735,6 +738,75 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 		{"hit", len(items) > 0},
 		{"count", len(items)},
 		{"offset", offset},
+		{"truncated", truncated},
+		{"items", items},
+	}, started)
+}
+
+// handleTsRange answers time-window queries: return every item in a scope
+// whose client-supplied Ts falls inside [since_ts, until_ts]. At least one
+// bound must be provided; both bounds are inclusive (SQL BETWEEN convention);
+// items without a Ts are always excluded. No pagination cursor — if the
+// response is capped by ?limit, the truncated flag tells the client to narrow
+// the window and retry rather than chase a seq cursor (seq has no meaningful
+// relationship to a ts-filtered view, especially because ts is user-mutable).
+func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, started)
+		return
+	}
+
+	query := r.URL.Query()
+	scope := query.Get("scope")
+	limit, err := normalizeLimit(query.Get("limit"))
+	if scopeErr := validateScope(scope, "/ts_range"); scopeErr != nil {
+		badRequest(w, started, scopeErr.Error())
+		return
+	}
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	sinceTs, err := parseTsParam("since_ts", query.Get("since_ts"))
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+	untilTs, err := parseTsParam("until_ts", query.Get("until_ts"))
+	if err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+	if err := validateTsRangeParams(sinceTs, untilTs); err != nil {
+		badRequest(w, started, err.Error())
+		return
+	}
+
+	buf, ok := api.store.getScope(scope)
+	if !ok {
+		writeJSONWithDuration(w, http.StatusOK, orderedFields{
+			{"ok", true},
+			{"hit", false},
+			{"count", 0},
+			{"truncated", false},
+			{"items", []Item{}},
+		}, started)
+		return
+	}
+
+	items, truncated := buf.tsRange(sinceTs, untilTs, limit)
+	if len(items) > 0 {
+		buf.recordRead(nowUnixMicro())
+	}
+
+	writeJSONWithDuration(w, http.StatusOK, orderedFields{
+		{"ok", true},
+		{"hit", len(items) > 0},
+		{"count", len(items)},
+		{"truncated", truncated},
 		{"items", items},
 	}, started)
 }
@@ -1048,8 +1120,11 @@ RULES:
 - payload must be present on writes; literal null is treated as missing
 - per-item size cap is 1 MiB by default (override with SCOPECACHE_MAX_ITEM_MB, integer MiB); measured against the raw JSON bytes of payload plus scope/id overhead
 - scope and id must be <= 128 bytes, with no surrounding whitespace and no control characters
-- filtering only operates on scope, id and seq
+- filtering only operates on scope, id, seq and the optional top-level ts
+- items carry an optional 'ts' field (signed int64, milliseconds since unix epoch by convention — the cache is opaque to the unit). ts is user-supplied on writes (absent → no ts); on /update, omitting ts preserves the existing value; on /upsert, omitting ts clears it (replace semantics).
+- /ts_range filters by the ts window; items without a ts are always excluded from ts-filtered reads
 - read endpoints use a default limit of 1,000 when ?limit is omitted, and a maximum of 10,000 (higher values are clamped, not rejected)
+- /head, /tail and /ts_range responses carry a "truncated" boolean: true when more matching items exist beyond the returned window
 - id is optional
 - if id is present, it must be unique within its scope
 - write operations reject duplicates for the same scope + id
@@ -1074,6 +1149,7 @@ POST /delete-scope - delete one entire scope from the cache
 POST /wipe - delete every scope from the cache in one atomic call (no request body); response carries {ok, deleted_scopes, deleted_items, freed_mb}
 GET  /head - get the oldest items from a scope; supports optional after_seq for cursor-based forward reads (offset is not supported, use /tail for position-based paging)
 GET  /tail - get the most recent items from a scope (supports optional offset)
+GET  /ts_range - get items whose optional top-level ts falls inside [since_ts, until_ts] (both inclusive, either may be omitted but at least one is required); returns seq-order, items without ts are skipped, no pagination cursor — narrow the window and retry if truncated=true
 GET  /get - get one item by scope + id or scope + seq
 GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss returns 404; JSON-string payloads are decoded one layer so cached HTML/XML/text is served as-is; Content-Type is application/octet-stream — fronting proxy is expected to set the real type if browser-facing
 GET  /stats - show store stats and approximate store size
@@ -1107,6 +1183,7 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/wipe", api.handleWipe)
 	mux.HandleFunc("/head", api.handleHead)
 	mux.HandleFunc("/tail", api.handleTail)
+	mux.HandleFunc("/ts_range", api.handleTsRange)
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
 	mux.HandleFunc("/stats", api.handleStats)

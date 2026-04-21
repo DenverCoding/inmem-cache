@@ -54,10 +54,18 @@ func (m MB) MarshalJSON() ([]byte, error) {
 // keeps the raw bytes as the client sent them, which both honors the
 // "cache must not inspect payload" contract and avoids a recursive walk
 // every time we need to estimate an item's size.
+//
+// Ts is an optional, client-supplied millisecond timestamp. The cache never
+// generates or mutates it on its own; its only server-side use is filtering
+// inside /ts_range. A pointer (not a plain int64) distinguishes "absent"
+// from the legitimate value 0 (unix epoch). Write-path semantics:
+//   - /append, /warm, /rebuild, /upsert: stored exactly as sent (absent → nil)
+//   - /update: absent → preserve existing, present → overwrite
 type Item struct {
 	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
 	Seq     uint64          `json:"seq,omitempty"`
+	Ts      *int64          `json:"ts,omitempty"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -203,6 +211,7 @@ func approxItemSize(item Item) int64 {
 	n += int64(len(item.Scope))
 	n += int64(len(item.ID))
 	n += 8
+	n += 8 // Ts pointer slot; the pointee (8 more bytes) when set is noise at this granularity
 	n += int64(len(item.Payload))
 	return n
 }

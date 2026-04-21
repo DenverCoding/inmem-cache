@@ -129,3 +129,68 @@ func BenchmarkStore_Append(b *testing.B) {
 		}
 	}
 }
+
+// benchTsScope builds a single scope populated with `n` items, each carrying
+// a monotonically increasing `ts` equal to its seq. Returns the scope buffer
+// so /ts_range benchmarks can call tsRange directly without the HTTP layer.
+func benchTsScope(b *testing.B, n int) *ScopeBuffer {
+	b.Helper()
+
+	store := NewStore(1_000_000, 1<<30, 1<<20)
+	buf, err := store.getOrCreateScope("bench_ts")
+	if err != nil {
+		b.Fatalf("getOrCreateScope: %v", err)
+	}
+
+	payload := json.RawMessage(`{"v":1}`)
+	for i := 0; i < n; i++ {
+		ts := int64(i + 1)
+		if _, err := buf.appendItem(Item{Scope: "bench_ts", Ts: &ts, Payload: payload}); err != nil {
+			b.Fatalf("appendItem: %v", err)
+		}
+	}
+	return buf
+}
+
+// BenchmarkStore_TsRange_Realistic measures /ts_range on a realistic 2,000-item
+// scope where every item matches the window. The scan collects 1,000 items and
+// early-exits on the 1,001st match — the "normal" case for a client paging
+// through a modestly-sized time window. Cost is dominated by ~1,001 loop
+// iterations plus one 1,000-cap slice allocation.
+func BenchmarkStore_TsRange_Realistic(b *testing.B) {
+	buf := benchTsScope(b, 2000)
+	since := int64(0)
+	until := int64(1 << 62)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		items, truncated := buf.tsRange(&since, &until, 1000)
+		if len(items) != 1000 || !truncated {
+			b.Fatalf("unexpected: len=%d truncated=%v", len(items), truncated)
+		}
+	}
+}
+
+// BenchmarkStore_TsRange_FullScope_Worst measures the upper bound: a maxed-out
+// 100,000-item scope where the matching window sits at the tail end. The scan
+// walks every non-matching item (98,999 of them) before entering the matching
+// tail, collects 1,000 items, sees the 1,001st, and returns truncated=true.
+// Total items touched: the full 100,000. This is the pathological /ts_range
+// cost at the default per-scope cap.
+func BenchmarkStore_TsRange_FullScope_Worst(b *testing.B) {
+	buf := benchTsScope(b, 100_000)
+	since := int64(99_000)
+	until := int64(1 << 62)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		items, truncated := buf.tsRange(&since, &until, 1000)
+		if len(items) != 1000 || !truncated {
+			b.Fatalf("unexpected: len=%d truncated=%v", len(items), truncated)
+		}
+	}
+}
