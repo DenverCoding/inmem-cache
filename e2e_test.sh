@@ -259,6 +259,119 @@ case $LAST_BODY in
     *) okmsg 'tail offset=5: seq 6..10 absent' ;;
 esac
 
+# --- ts_range filtering ------------------------------------------------------
+# The top-level `ts` is client-supplied (signed int64). Items without `ts`
+# must be excluded from every /ts_range response; bounds are inclusive;
+# output is seq-ordered (NOT ts-ordered) because ts is mutable and non-unique.
+say '== ts_range =='
+
+# Seed a fresh scope. a..e carry ts 1000..5000; f has no ts and must never
+# appear in any ts_range result.
+call 'ts seed a (ts=1000)'              200 POST   /append '{"scope":"tsr","id":"a","payload":1,"ts":1000}'
+call 'ts seed b (ts=2000)'              200 POST   /append '{"scope":"tsr","id":"b","payload":2,"ts":2000}'
+call 'ts seed c (ts=3000)'              200 POST   /append '{"scope":"tsr","id":"c","payload":3,"ts":3000}'
+call 'ts seed d (ts=4000)'              200 POST   /append '{"scope":"tsr","id":"d","payload":4,"ts":4000}'
+call 'ts seed e (ts=5000)'              200 POST   /append '{"scope":"tsr","id":"e","payload":5,"ts":5000}'
+call 'ts seed f (no ts)'                200 POST   /append '{"scope":"tsr","id":"f","payload":6}'
+
+# Window [2000, 4000] inclusive: b, c, d in seq order; a, e, f excluded.
+call 'ts_range [2000,4000]'             200 GET    '/ts_range?scope=tsr&since_ts=2000&until_ts=4000'
+case $LAST_BODY in
+    *'"id":"b"'*'"id":"c"'*'"id":"d"'*) okmsg 'ts_range [2000,4000]: b,c,d in seq order' ;;
+    *) bad "ts_range window: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":"a"'*|*'"id":"e"'*|*'"id":"f"'*) bad "ts_range leaked out-of-window ids: $LAST_BODY" ;;
+    *) okmsg 'ts_range: a,e,f absent' ;;
+esac
+case $LAST_BODY in
+    *'"count":3'*'"truncated":false'*) okmsg 'ts_range count=3, truncated=false' ;;
+    *) bad "ts_range count/truncated: $LAST_BODY" ;;
+esac
+
+# Only since_ts: everything from 3000 up (c, d, e). f (no ts) must stay out.
+call 'ts_range since_ts=3000'           200 GET    '/ts_range?scope=tsr&since_ts=3000'
+case $LAST_BODY in
+    *'"id":"c"'*'"id":"d"'*'"id":"e"'*) okmsg 'ts_range since_ts=3000: c,d,e present' ;;
+    *) bad "ts_range since_ts only: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":"f"'*) bad "ts_range since_ts leaked no-ts item f: $LAST_BODY" ;;
+    *) okmsg 'ts_range since_ts: no-ts item (f) excluded' ;;
+esac
+
+# Only until_ts: everything up to and including 2000 (a, b).
+call 'ts_range until_ts=2000'           200 GET    '/ts_range?scope=tsr&until_ts=2000'
+# Envelope orders count before items, so check count first, then id order.
+case $LAST_BODY in
+    *'"count":2'*'"id":"a"'*'"id":"b"'*) okmsg 'ts_range until_ts=2000: a,b (count=2)' ;;
+    *) bad "ts_range until_ts only: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"id":"c"'*|*'"id":"d"'*|*'"id":"e"'*|*'"id":"f"'*) bad "ts_range until_ts leaked: $LAST_BODY" ;;
+    *) okmsg 'ts_range until_ts: c,d,e,f excluded' ;;
+esac
+
+# Degenerate window [2000, 2000] — boundary inclusivity check. Must be
+# exactly b, and nothing else.
+call 'ts_range [2000,2000] (inclusive)' 200 GET    '/ts_range?scope=tsr&since_ts=2000&until_ts=2000'
+case $LAST_BODY in
+    *'"count":1'*'"id":"b"'*) okmsg 'ts_range [2000,2000]: exactly b (inclusive on both ends)' ;;
+    *) bad "ts_range inclusive: $LAST_BODY" ;;
+esac
+
+# Truncation: window spans a..e (5 matches) but limit=2 caps at 2 and flags it.
+call 'ts_range truncated'               200 GET    '/ts_range?scope=tsr&since_ts=1000&limit=2'
+case $LAST_BODY in
+    *'"count":2'*'"truncated":true'*) okmsg 'ts_range limit=2: count=2, truncated=true' ;;
+    *) bad "ts_range truncated: $LAST_BODY" ;;
+esac
+
+# Non-existent scope returns 200 with hit:false, count:0, truncated:false.
+call 'ts_range missing scope'           200 GET    '/ts_range?scope=tsr_nope&since_ts=0'
+case $LAST_BODY in
+    *'"hit":false'*'"count":0'*'"truncated":false'*) okmsg 'ts_range missing scope: empty result envelope' ;;
+    *) bad "ts_range missing scope: $LAST_BODY" ;;
+esac
+
+# Negative and zero ts are legal int64 values; window must span them correctly.
+call 'ts seed neg (ts=-5000)'           200 POST   /append '{"scope":"tsr_neg","id":"n1","payload":1,"ts":-5000}'
+call 'ts seed zero (ts=0)'              200 POST   /append '{"scope":"tsr_neg","id":"n2","payload":2,"ts":0}'
+call 'ts_range spans negative..0'       200 GET    '/ts_range?scope=tsr_neg&since_ts=-10000&until_ts=0'
+case $LAST_BODY in
+    *'"count":2'*'"id":"n1"'*'"id":"n2"'*) okmsg 'ts_range: negative and zero ts both present' ;;
+    *) bad "ts_range negative: $LAST_BODY" ;;
+esac
+
+# /update with an explicit ts overwrites; without a ts field it preserves.
+call 'ts /update overwrites ts'         200 POST   /update '{"scope":"tsr","id":"a","payload":1,"ts":9999}'
+call 'ts_range sees a at 9999'          200 GET    '/ts_range?scope=tsr&since_ts=9000&until_ts=10000'
+case $LAST_BODY in
+    *'"id":"a"'*'"ts":9999'*) okmsg 'ts_range: /update ts=9999 overwrote a' ;;
+    *) bad "ts /update overwrite: $LAST_BODY" ;;
+esac
+call 'ts /update without ts preserves'  200 POST   /update '{"scope":"tsr","id":"a","payload":1}'
+call 'ts_range still sees a at 9999'    200 GET    '/ts_range?scope=tsr&since_ts=9000&until_ts=10000'
+case $LAST_BODY in
+    *'"id":"a"'*'"ts":9999'*) okmsg 'ts_range: /update without ts preserved 9999' ;;
+    *) bad "ts /update preserve: $LAST_BODY" ;;
+esac
+
+# /upsert without ts CLEARS it (whole-item replace semantics) — a must drop
+# out of the [9000, 10000] window after the upsert.
+call 'ts /upsert without ts clears'     200 POST   /upsert '{"scope":"tsr","id":"a","payload":1}'
+call 'ts_range after upsert-no-ts'      200 GET    '/ts_range?scope=tsr&since_ts=9000&until_ts=10000'
+case $LAST_BODY in
+    *'"id":"a"'*) bad "ts /upsert: a should no longer have ts: $LAST_BODY" ;;
+    *) okmsg 'ts_range: /upsert without ts cleared a from window' ;;
+esac
+
+# Validation (400)
+call 'ts_range: missing both bounds'    400 GET    '/ts_range?scope=tsr'
+call 'ts_range: inverted bounds'        400 GET    '/ts_range?scope=tsr&since_ts=5000&until_ts=1000'
+call 'ts_range: non-numeric since_ts'   400 GET    '/ts_range?scope=tsr&since_ts=notanumber'
+call 'ts_range: non-integer until_ts'   400 GET    '/ts_range?scope=tsr&until_ts=1.5'
+
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='
 call 'wipe'                             200 POST   /wipe
