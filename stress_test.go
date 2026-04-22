@@ -40,7 +40,7 @@ func TestStress_MixedOps(t *testing.T) {
 		duration = 500 * time.Millisecond
 	}
 
-	s := NewStore(100_000, 500<<20, 1<<20)
+	s := NewStore(Config{ScopeMaxItems: 100_000, MaxStoreBytes: 500 << 20, MaxItemBytes: 1 << 20})
 
 	scopeNames := make([]string, numScopes)
 	for i := range scopeNames {

@@ -40,6 +40,26 @@ const (
 	MaxCounterValue int64 = (1 << 53) - 1 // 9,007,199,254,740,991
 )
 
+// Config bundles the three store-wide capacity knobs into one value that
+// every adapter (standalone, Caddy module) fills in its own way — env vars
+// for the standalone binary, JSON config for the Caddy module — and hands
+// to NewStore. Keeping the shape in one place means new knobs land in a
+// single file instead of rippling through every adapter's call site.
+//
+// Fields:
+//   - ScopeMaxItems: per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
+//   - MaxStoreBytes: aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
+//   - MaxItemBytes:  per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
+//
+// Bytes (not MiB) are the core unit because admission control arithmetic
+// lives in bytes; adapters convert their MiB-facing configuration at the
+// boundary.
+type Config struct {
+	ScopeMaxItems int
+	MaxStoreBytes int64
+	MaxItemBytes  int64
+}
+
 // MB is an int64 byte count that serializes to JSON as a number in MiB with
 // 4 decimals (e.g. 79845 bytes → 0.0762). One display unit across every
 // user-facing surface (/stats, /delete-scope-candidates, 507 responses) keeps clients from

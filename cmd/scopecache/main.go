@@ -126,12 +126,14 @@ func listenUnixSocket(path string) (net.Listener, error) {
 }
 
 func main() {
-	maxItems := scopeMaxItemsFromEnv()
-	maxStoreBytes := maxStoreBytesFromEnv()
-	maxItemBytes := maxItemBytesFromEnv()
-	store := scopecache.NewStore(maxItems, maxStoreBytes, maxItemBytes)
+	cfg := scopecache.Config{
+		ScopeMaxItems: scopeMaxItemsFromEnv(),
+		MaxStoreBytes: maxStoreBytesFromEnv(),
+		MaxItemBytes:  maxItemBytesFromEnv(),
+	}
+	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item", maxItems, maxStoreBytes>>20, maxItemBytes>>20)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

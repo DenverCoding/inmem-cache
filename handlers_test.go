@@ -16,7 +16,7 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// 100 MiB byte budget is more than enough for handler tests with tiny
 	// payloads; dedicated byte-cap behaviour tests construct stores with a
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
-	api := NewAPI(NewStore(maxItems, 100<<20, 1<<20))
+	api := NewAPI(NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}))
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux, api

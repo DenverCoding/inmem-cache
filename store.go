@@ -844,12 +844,12 @@ type Store struct {
 	totalBytes atomic.Int64
 }
 
-func NewStore(defaultMaxItems int, maxStoreBytes int64, maxItemBytes int64) *Store {
+func NewStore(c Config) *Store {
 	return &Store{
 		scopes:          make(map[string]*ScopeBuffer),
-		defaultMaxItems: defaultMaxItems,
-		maxStoreBytes:   maxStoreBytes,
-		maxItemBytes:    maxItemBytes,
+		defaultMaxItems: c.ScopeMaxItems,
+		maxStoreBytes:   c.MaxStoreBytes,
+		maxItemBytes:    c.MaxItemBytes,
 	}
 }
 
