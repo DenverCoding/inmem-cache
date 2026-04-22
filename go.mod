@@ -1,3 +1,3 @@
-module github.com/DenverCoding/scopecache
+module github.com/VeloxCoding/scopecache
 
 go 1.21

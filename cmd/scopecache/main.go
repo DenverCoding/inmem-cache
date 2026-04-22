@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/DenverCoding/scopecache"
+	"github.com/VeloxCoding/scopecache"
 )
 
 // UnixSocketPerm is applied to the listening socket file on POSIX systems

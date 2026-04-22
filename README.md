@@ -48,11 +48,11 @@ The service listens on `/run/scopecache.sock` inside the container (mounted to t
 
 ## Quickstart (Linux VPS)
 
-The fastest path is to download a prebuilt binary from the [Releases page](https://github.com/DenverCoding/scopecache/releases):
+The fastest path is to download a prebuilt binary from the [Releases page](https://github.com/VeloxCoding/scopecache/releases):
 
 ```bash
 # Pick the matching architecture (amd64 or arm64):
-wget https://github.com/DenverCoding/scopecache/releases/latest/download/scopecache-linux-amd64
+wget https://github.com/VeloxCoding/scopecache/releases/latest/download/scopecache-linux-amd64
 chmod +x scopecache-linux-amd64
 sudo mv scopecache-linux-amd64 /usr/local/bin/scopecache
 scopecache &
@@ -101,7 +101,7 @@ Note: `/usr/local/go/bin` is placed **first** on PATH so it wins over any prior 
 ### 2. Clone and build
 
 ```bash
-git clone https://github.com/DenverCoding/scopecache.git
+git clone https://github.com/VeloxCoding/scopecache.git
 cd scopecache
 go build -o scopecache ./cmd/scopecache
 ```
@@ -367,7 +367,7 @@ go build -o scopecache ./cmd/scopecache
 go test ./...
 ```
 
-Module path: `github.com/DenverCoding/scopecache`. Stdlib only.
+Module path: `github.com/VeloxCoding/scopecache`. Stdlib only.
 
 ## Testing
 
@@ -402,4 +402,4 @@ The full design and endpoint contract lives in [scopecache-rfc.md](scopecache-rf
 
 Licensed under the [Apache License, Version 2.0](LICENSE). See the `LICENSE` file for the full text.
 
-Copyright 2026 DenverCoding.
+Copyright 2026 VeloxCoding.
