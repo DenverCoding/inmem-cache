@@ -30,21 +30,61 @@ Three layers with clear boundaries:
 
 - **Core** — `package scopecache`. The cache engine itself. Stdlib-only, framework-agnostic, caller-anonymous: it registers HTTP routes on a standard `*http.ServeMux` and knows nothing about auth, identity, or who is calling. This is what the [spec](scopecache-rfc.md) describes.
 - **Standalone adapter** — `cmd/scopecache/`. Thin binary that reads env vars, opens a Unix socket, and serves the core. What you use if you're running behind nginx/apache, or with no reverse proxy at all.
-- **Caddy-module adapter** — `caddymodule/` (Phase 3, planned). Wraps the core as a Caddy module. Also the home for cross-cutting concerns that require request context: auth enforcement, identity-to-scope mapping, per-tenant logging and metrics.
+- **Caddy-module adapter** — `caddymodule/` (Phase 3). Published as a separate Go module (`github.com/VeloxCoding/scopecache/caddymodule`) so consumers of the core never pull in Caddy's dep tree. Wraps the core as a Caddy HTTP handler (`http.handlers.scopecache`), exposed in Caddyfile syntax and JSON config. This is also the home for cross-cutting concerns that require request context: auth enforcement, identity-to-scope mapping, per-tenant logging and metrics.
 
 The rule: new **cache features** go into the core. **Cross-cutting concerns** (auth, identity, per-tenant policy) go into an adapter. This keeps the core small and refactorable, keeps both adapters symmetrical, and means cache semantics cannot drift between standalone and Caddy deployments.
 
 ## Status
 
-Phase 2 — core logic lives in `package scopecache` at the repo root; the standalone binary is in `cmd/scopecache/`. A Caddy-module wrapper (Phase 3) is planned.
+Phase 3 — core in `package scopecache` (repo root), standalone binary in `cmd/scopecache/`, Caddy adapter in `caddymodule/` (its own Go module so the core stays stdlib-only for non-Caddy consumers).
 
 ## Quickstart (Docker)
+
+Standalone, listening on a Unix domain socket:
 
 ```bash
 docker compose up --build scopecache
 ```
 
 The service listens on `/run/scopecache.sock` inside the container (mounted to the host volume defined in `docker-compose.yml`).
+
+As a Caddy module, listening on TCP :8081:
+
+```bash
+docker compose up --build caddyscope
+curl http://localhost:8081/stats
+```
+
+## Quickstart (Caddy / FrankenPHP via xcaddy)
+
+Build a Caddy binary with scopecache baked in:
+
+```bash
+xcaddy build --with github.com/VeloxCoding/scopecache/caddymodule@v0.1.0
+```
+
+Combine with FrankenPHP in one binary:
+
+```bash
+xcaddy build \
+    --with github.com/dunglas/frankenphp/caddy \
+    --with github.com/VeloxCoding/scopecache/caddymodule@v0.1.0
+```
+
+Minimal Caddyfile:
+
+```caddyfile
+:8080 {
+    scopecache {
+        scope_max_items 100000
+        max_store_mb    100
+        max_item_mb     1
+    }
+    respond 404
+}
+```
+
+All three `scopecache { ... }` subdirectives are optional; omit any of them to fall back to the compile-time default. See [Caddyfile.caddyscope](Caddyfile.caddyscope) for a working example and [Dockerfile.caddyscope](Dockerfile.caddyscope) for the xcaddy build recipe.
 
 ## Quickstart (Linux VPS)
 
