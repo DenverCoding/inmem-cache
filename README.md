@@ -48,7 +48,7 @@ Phase 3 — core in `package scopecache` (repo root), standalone binary in `cmd/
 
 scopecache ships in two forms. Both run the exact same core; what differs is the glue around it.
 
-**Standalone binary (Unix socket).** A separate `scopecache` daemon listens on a Unix socket; nginx/apache/Caddy proxies to it. Pick this if you already run nginx or apache, or if multiple apps on the box need to share one cache instance without routing through Caddy.
+**Standalone binary (Unix socket).** A separate `scopecache` daemon listens on a Unix socket. Anything that can speak HTTP over that socket can use it — a fronting webserver (nginx/apache/Caddy), but equally a desktop application, a CLI tool, a local daemon, or a background sync process. Pick this if you already run nginx or apache, if multiple apps on the box need to share one cache instance without routing through Caddy, or if there is no webserver in the picture at all (desktop/CLI/daemon scenarios where the cache is just a local data store).
 
 **Caddy module (in-process).** scopecache is compiled into your Caddy binary as an HTTP handler. Pick this if Caddy is already your edge. It gets you:
 
