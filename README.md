@@ -337,6 +337,14 @@ Three independent caps apply; any violation returns **HTTP 507 Insufficient Stor
 - **Store-wide byte cap** — 100 MiB aggregate (default).
 - **Per-item cap** — 1 MiB (default); enforced on the approximate item size (overhead + scope + id + payload). Raise it via `SCOPECACHE_MAX_ITEM_MB` when the use-case stores larger blobs (rendered HTML, large JSON documents).
 
+## Eviction / TTL
+
+scopecache has no per-item TTL and no background eviction thread. This is deliberate: the cache is rebuildable-from-source by design, so the intended time-based eviction pattern is a **periodic `/warm` or `/rebuild`** — the client queries the source (`WHERE sent_at > now() - 24h`, or whatever window fits) and hands the resulting slice to scopecache in one atomic call. Items that fall outside the window simply disappear at the next refresh. This matches the materialized-view mental model (Postgres matviews, ISR-style static regeneration, build-artifact caches) rather than the Redis/Memcached per-key TTL model. The tradeoff is bursty (rebuilds re-allocate the scope in one shot) where TTL-based eviction is smoother — but in return you get atomic consistency: a scope is always either the previous complete slice or the new one, never half-expired.
+
+Items *can* carry an optional client-supplied `ts` (int64), but it is a **query primitive, not an eviction signal**: `/ts_range` uses it to filter a server-side time window (e.g. "messages for user:x in the last hour"), and the cache itself never reads `ts` to decide when to delete anything. Scope-level cleanup is operator-initiated via `/delete-scope-candidates`, which surfaces idle scopes ranked by cache-owned `last_access_ts`.
+
+**Caveat when a scope is used as a write-buffer.** `/rebuild` and `/warm` replace scope contents wholesale from whatever the client passes in. If the drain worker has not yet committed pending appends to the source of truth, rebuilding from that source will silently erase them — the undrained items are not there yet. Either drain first (trim with `/delete-up-to` after a successful commit, *then* rebuild if needed), or keep write-buffer scopes separate from cache scopes that are periodically rebuilt. The two patterns compose cleanly on *different* scopes; on the same scope they are mutually exclusive.
+
 ## Performance
 
 Two distinct numbers are worth reporting: the *core ceiling* (how fast the cache itself is when called in-process) and the *end-to-end throughput* a real client sees over the Unix socket. Both are measured on a populated 100 scope × 1000 item × ~580 B/item dataset (~57 MiB).
