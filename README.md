@@ -5,6 +5,8 @@ Tuned for modest VPS footprints, delivering around 10,000 HTTP requests per seco
 Data lives in scopes (namespaces) and is addressable only by scope, id, or seq; the entire cache is disposable and can be wiped and rebuilt from the source of truth at any time.
 Payloads can also be served directly via `/render`, allowing Caddy, nginx, or Apache to send cached HTML, JSON, or XML straight to the client without an application layer in between. This can substantially reduce per-request overhead and allow a single server to handle far more traffic on cacheable paths.
 
+**No client library required.** scopecache speaks standard HTTP rather than a bespoke wire protocol — any language with an HTTP client in its standard library (Python, PHP, Node, Ruby, Go, …) can call the cache directly, with no driver to install, pin, or keep version-aligned with the server. Redis and memcached by contrast require **two** layers before a cached value ever reaches the wire: a **per-language driver** (`redis-py`, `phpredis`, `node-redis`, …) to speak their custom binary protocol, and an **application layer** in front to translate that driver's reply into an HTTP response. scopecache collapses both into a single HTTP hop — and via `/render`, that hop can end at Caddy/nginx/apache without any application code in the loop at all.
+
 ## What it is
 
 - A scope-first hot-window cache / write-buffer that sits in front of your real data store. (A *scope* is what other systems call a **namespace** or **bucket** — conceptually comparable to a **table** in SQL terms: every item lives inside exactly one.)
