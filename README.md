@@ -88,76 +88,42 @@ All three `scopecache { ... }` subdirectives are optional; omit any of them to f
 
 ## Quickstart (Linux VPS)
 
-The fastest path is to download a prebuilt binary from the [Releases page](https://github.com/VeloxCoding/scopecache/releases):
+Two install routes — pick one, then the **Running**, **systemd**, and **proxy** sections below apply identically to both.
+
+### Install
+
+**Option A — prebuilt binary (recommended).** Statically linked (`CGO_ENABLED=0`), runs on any Linux distro — Debian, Ubuntu, Alpine, scratch containers — with no glibc or Go dependency.
 
 ```bash
-# Pick the matching architecture (amd64 or arm64):
+# Pick amd64 or arm64 to match your machine:
 wget https://github.com/VeloxCoding/scopecache/releases/latest/download/scopecache-linux-amd64
 chmod +x scopecache-linux-amd64
 sudo mv scopecache-linux-amd64 /usr/local/bin/scopecache
-scopecache &
 ```
 
-Verify the download against the published `SHA256SUMS` file on the same release page.
+Verify the download against the published `SHA256SUMS` file on the same [Releases page](https://github.com/VeloxCoding/scopecache/releases).
 
-The binary is statically linked (`CGO_ENABLED=0`), so it runs on any Linux distro — Debian, Ubuntu, Alpine, scratch containers — with no glibc or Go dependency.
-
-If you prefer to build from source, or the architecture you need isn't prebuilt, read on.
-
-Stdlib-only means the build has no external dependencies — just Go and git.
-
-### 1. Install Go
-
-`go.mod` requires **Go 1.21+**, which covers most modern distros out of the box. The distro package is the easy path:
-
-```bash
-sudo apt update && sudo apt install -y golang-go git
-go version   # must be >= 1.21
-```
-
-Distro coverage:
-
-| Distro            | Default Go      |
-|-------------------|-----------------|
-| Debian 12 (bookworm) | 1.19 — too old, use tarball below |
-| Debian 13 (trixie)   | 1.24 — ok |
-| Ubuntu 22.04 LTS  | 1.18 — too old, use tarball below |
-| Ubuntu 24.04 LTS  | 1.22 — ok |
-
-If your distro's Go is older than 1.21, install the official tarball instead:
-
-```bash
-sudo apt update && sudo apt install -y git curl
-sudo rm -rf /usr/local/go
-curl -L https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-echo 'export PATH=/usr/local/go/bin:$PATH' | sudo tee /etc/profile.d/go.sh
-export PATH=/usr/local/go/bin:$PATH
-hash -r
-go version   # should print: go version go1.23.4 linux/amd64
-```
-
-Note: `/usr/local/go/bin` is placed **first** on PATH so it wins over any prior apt-installed Go.
-
-### 2. Clone and build
+**Option B — build from source.** Requires **Go 1.25+** — install or upgrade via [go.dev/dl/](https://go.dev/dl/). The core is stdlib-only, so the build has no external dependencies beyond Go and git.
 
 ```bash
 git clone https://github.com/VeloxCoding/scopecache.git
 cd scopecache
 go build -o scopecache ./cmd/scopecache
+sudo mv scopecache /usr/local/bin/scopecache
 ```
 
-### 3. Run it
+### Running
 
 As root, the default socket path `/run/scopecache.sock` works out of the box:
 
 ```bash
-./scopecache &
+scopecache &
 ```
 
-As a non-root user, override the socket path to somewhere writable:
+As a non-root user, override the socket path to a user-owned location. `$XDG_RUNTIME_DIR` (typically `/run/user/<uid>/`) is the idiomatic choice — tmpfs-backed, user-owned, auto-cleaned on logout:
 
 ```bash
-SCOPECACHE_SOCKET_PATH=/tmp/scopecache.sock ./scopecache &
+SCOPECACHE_SOCKET_PATH="${XDG_RUNTIME_DIR}/scopecache.sock" scopecache &
 ```
 
 Smoke test:
@@ -173,9 +139,9 @@ Full end-to-end suite (75 assertions over every endpoint):
 bash e2e_test.sh
 ```
 
-### 4. Run under systemd (optional)
+### Running under systemd
 
-Create `/etc/systemd/system/scopecache.service`:
+For production, run scopecache as its own unprivileged system user under systemd. Create `/etc/systemd/system/scopecache.service`:
 
 ```ini
 [Unit]
@@ -188,7 +154,9 @@ User=scopecache
 Group=scopecache
 ExecStart=/usr/local/bin/scopecache
 Environment=SCOPECACHE_SOCKET_PATH=/run/scopecache/scopecache.sock
+Environment=SCOPECACHE_SCOPE_MAX_ITEMS=100000
 Environment=SCOPECACHE_MAX_STORE_MB=100
+Environment=SCOPECACHE_MAX_ITEM_MB=1
 RuntimeDirectory=scopecache
 RuntimeDirectoryMode=0750
 Restart=on-failure
@@ -197,20 +165,56 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
+All four `SCOPECACHE_*` variables are listed explicitly so every capacity knob is visible and tunable in one place — remove any line to fall back to the compile-time default. The socket lives under a systemd-managed `RuntimeDirectory` (`/run/scopecache/`), which is created at service start and cleaned up on stop.
+
 Then:
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin scopecache
-sudo cp scopecache /usr/local/bin/
 sudo systemctl daemon-reload
 sudo systemctl enable --now scopecache
 ```
 
-Add the proxy user (e.g. `www-data` for nginx/apache, `caddy` for Caddy) to the `scopecache` group so it can connect to the socket:
+### Connecting from Caddy / nginx / apache
+
+Two steps: (1) grant the proxy user read access to the socket by adding it to the `scopecache` group, and (2) point the proxy at the Unix socket.
 
 ```bash
-sudo usermod -aG scopecache www-data
+sudo usermod -aG scopecache caddy      # Caddy
+sudo usermod -aG scopecache www-data   # nginx or apache (Debian/Ubuntu)
 ```
+
+**Caddy** (`Caddyfile`):
+
+```caddyfile
+:8080 {
+    reverse_proxy unix//run/scopecache/scopecache.sock
+}
+```
+
+**nginx** (site config):
+
+```nginx
+upstream scopecache {
+    server unix:/run/scopecache/scopecache.sock;
+}
+
+server {
+    listen 8080;
+    location / {
+        proxy_pass http://scopecache;
+    }
+}
+```
+
+**apache** (site config; requires `mod_proxy` and `mod_proxy_http`, apache 2.4.9+):
+
+```apache
+ProxyPass        "/" "unix:/run/scopecache/scopecache.sock|http://localhost/"
+ProxyPassReverse "/" "unix:/run/scopecache/scopecache.sock|http://localhost/"
+```
+
+If you prefer scopecache as a **native Caddy handler** instead of proxying to the standalone binary over a socket, see the [xcaddy quickstart](#quickstart-caddy--frankenphp-via-xcaddy) above — it eliminates the socket hop entirely.
 
 ## Usage
 
