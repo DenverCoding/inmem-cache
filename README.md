@@ -59,7 +59,11 @@ scopecache ships in two forms. Both run the exact same core; what differs is the
 - **Middleware composition.** `basic_auth`, `jwt`, `forward_auth`, rate-limit plugins, `header` directives run *before* scopecache in the chain. This is where request-context-aware policy belongs (see [cross-cutting-concerns.md](cross-cutting-concerns.md)).
 - **Per-vhost mounting.** `handle /cache/*` with `uri strip_prefix`, or separate scopecache instances per site with different caps — all expressible in Caddyfile.
 
-**Tradeoffs of the module path:** tied to Caddy's lifecycle (a Caddy restart restarts the cache — usually fine since the cache is disposable by design), tied to Caddy's version (xcaddy rebuild on upgrades), and can't be shared across apps without routing everything through the same Caddy.
+**Tradeoffs of the module path:**
+
+- **Cache empties on restart *and* on `caddy reload`.** A full restart is obvious, but `caddy reload` is the subtle one: it re-provisions the scopecache module, which creates a fresh `*Store` — same effect as a cold start. Harmless by design (the cache is disposable), but plan for it: a periodic rebuild from your source of truth, or a warm-on-miss in your application code, keeps cold restarts from hammering the backend. A systemd-based option is also common — hang a rebuild script off `caddy.service` via `ExecStartPost=/usr/local/bin/scopecache-rebuild.sh` (or a separate oneshot unit with `ExecStart=…` and `After=caddy.service`) so it fires automatically after every Caddy start.
+- **Tied to Caddy's version** — `xcaddy` rebuild needed on upgrades to either side.
+- **Can't be shared across apps** without routing everything through the same Caddy.
 
 ## Quickstart (Docker)
 
