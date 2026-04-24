@@ -114,6 +114,20 @@ scopecache ships in two forms. Both run the exact same core; what differs is the
 - **Middleware composition.** `basic_auth`, `jwt`, `forward_auth`, rate-limit plugins, `header` directives run *before* scopecache in the chain. This is where request-context-aware policy belongs (see [cross-cutting-concerns.md](cross-cutting-concerns.md)).
 - **Per-vhost mounting.** `handle /cache/*` with `uri strip_prefix`, or separate scopecache instances per site with different caps — all expressible in Caddyfile.
 
+**The in-process path — why it matters.** The "No IPC" bullet is the largest structural advantage of the module deployment, and it is worth spelling out because nothing on the client side can substitute for it.
+
+In a standalone-plus-fronting-proxy setup, every client request costs a second HTTP hop *inside the server*: the request hits Caddy, Caddy opens (or reuses) a Unix-socket connection to the scopecache daemon, writes a second HTTP request on it, reads the response back, and forwards it to the client. Both sides parse an HTTP request; the socket round-trip is measured in milliseconds.
+
+The Caddy module folds that hop away entirely. Caddy's matcher chain dispatches to `scopecache.ServeHTTP()` as a direct Go function call — no TCP, no socket, no second HTTP encode/decode. The caddymodule routes through an internal `http.ServeMux` (a map lookup plus a function call, on the order of nanoseconds) to a handler that reads directly from a `*Store` living in the same Go heap. The HTTP request parsed at the outer listener is the only HTTP request the process ever sees.
+
+End-to-end latency for `GET /render?scope=html&id=<id>` at low concurrency on a 32-core host:
+
+```
+p50 0.21 ms · p95 0.44 ms · p99 0.72 ms
+```
+
+That 0.21 ms p50 breaks down as one TCP roundtrip from the client, one Caddy matcher evaluation, one scopecache map lookup, and one response write — the scopecache step inside the server is roughly 15 µs of Go work. An application layer between the client and scopecache (PHP, Python, Node, Ruby) cannot close this gap: none of those runtimes can call the Go handler in-process, so every cache lookup from application code pays an additional HTTP roundtrip on top of the runtime's own per-request cost. The module path is therefore not just a convenience over the standalone-plus-proxy setup — it is strictly faster than any deployment where another language sits between the edge and the cache.
+
 **Tradeoffs of the module path:**
 
 - **Cache empties on restart *and* on `caddy reload`.** A full restart is obvious, but `caddy reload` is the subtle one: it re-provisions the scopecache module, which creates a fresh `*Store` — same effect as a cold start. Harmless by design (the cache is disposable), but plan for it: a periodic rebuild from your source of truth, or a warm-on-miss in your application code, keeps cold restarts from hammering the backend. A systemd-based option is also common — hang a rebuild script off `caddy.service` via `ExecStartPost=/usr/local/bin/scopecache-rebuild.sh` (or a separate oneshot unit with `ExecStart=…` and `After=caddy.service`) so it fires automatically after every Caddy start.
