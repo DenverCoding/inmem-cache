@@ -64,6 +64,25 @@ What `/render` removes is therefore not the DB query but the whole PHP request l
 
 The preliminary signal: when the same bytes can be served from either path, the pre-compute-and-publish path saves an order of magnitude of CPU per response. That scales directly: a box handling ~1,200 req/s via PHP+SQLite on this harness can handle ~11,000 req/s via `/render` without re-entering the application layer.
 
+### The gap widens dramatically with more hardware
+
+To confirm that the ceiling really is the PHP request lifecycle rather than scarce CPU or cold page cache, the same harness was re-run on the host unconstrained — 32 CPU / 32 GB, DB fully in OS page cache. A second load generator (`wrk`) was added to rule out PHP-side client underestimation on the scopecache path:
+
+| config | SQLite `GET /?page=random` | scopecache `/render` | gap |
+|-|-|-|-|
+| 2 vCPU / 128 MB, conc=10 (PHP bench) | 1,197 req/s | 11,116 req/s | 9× |
+| 32 CPU / 32 GB, conc=50 (PHP bench) | 2,140 req/s | 36,098 req/s | 17× |
+| 32 CPU / 32 GB, conc=50 (wrk) | 2,049 req/s | 62,380 req/s | **30×** |
+| 32 CPU / 32 GB, conc=1000 (wrk, server ceiling) | 1,938 req/s | **80,962 req/s** | **~42×** |
+
+Two independent ceilings, one in each direction:
+
+**SQLite has a hard server-side ceiling of ~2,100 req/s** and does not cross it regardless of concurrency or load generator. `wrk` at conc=50 lands on 2,049 req/s — within 5% of the PHP bench's 2,140 — proving the PHP client was *not* the bottleneck on this path; the PHP-worker pool is. At conc=10 utilisation is already 89% of Little's-law theoretical, and conc=100 produces *lower* total throughput (1,938 req/s) because queueing latency climbs faster than throughput.
+
+**`/render` scales near-linearly until connection-handling overhead takes over.** Per-request p50 stays at 0.24 ms through conc=50 and climbs smoothly as the box fills: 1.06 ms at conc=100, 10.8 ms at conc=1000. The PHP-based bench client was underestimating scopecache by ~70% at conc=50 (36k measured vs 62k real); `wrk` at conc=1000 finds the actual server ceiling around **~80k req/s on this 32-core host**.
+
+**The gap widens dramatically, not linearly**, as hardware grows — from 9× on 2 vCPU to ~42× on 32 CPU. Adding cores to a PHP+SQLite server buys a little headroom (≈1.8× for 16× more CPU) before hitting the per-request lifecycle wall; adding the same cores to a `/render`-fronted path keeps scaling because every saved PHP invocation compounds. The comparison is not "cache vs database", it is "serving bytes with vs without invoking a dynamic language runtime per request" — and that difference does not get smaller when you give both sides more hardware.
+
 *Harness lives in `phase4/` (git-ignored local testbench); measurement notes, caveats, and known artefacts in `phase4/CLAUDE.md`.*
 
 ## Architecture
