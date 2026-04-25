@@ -132,7 +132,7 @@ case $LAST_BODY in
 esac
 call 'post-rebuild: new scope reads'    200 GET    '/get?scope=only&id=one'
 
-# --- candidates / delete-up-to / delete / delete-scope ------------------------
+# --- candidates / delete_up_to / delete / delete_scope ------------------------
 say '== deletes =='
 call 'append bulk for trim'  200 POST /append '{"scope":"trim","id":"a","payload":1}'
 call 'append bulk for trim'  200 POST /append '{"scope":"trim","id":"b","payload":2}'
@@ -140,7 +140,7 @@ call 'append bulk for trim'  200 POST /append '{"scope":"trim","id":"c","payload
 
 # After three /append calls to a fresh "trim" scope the seqs are 1,2,3.
 # Trimming up to seq 2 should leave a single item behind.
-call 'delete-up-to (trims oldest)'      200 POST   /delete-up-to '{"scope":"trim","max_seq":2}'
+call 'delete_up_to (trims oldest)'      200 POST   /delete_up_to '{"scope":"trim","max_seq":2}'
 
 call 'delete by id'                     200 POST   /delete   '{"scope":"only","id":"one"}'
 # /delete on a non-existent id returns 200 with "hit":false (same envelope
@@ -150,8 +150,8 @@ case $LAST_BODY in
     *'"hit":false'*) okmsg 'delete miss has "hit":false' ;;
     *) bad "delete miss body: $LAST_BODY" ;;
 esac
-call 'delete-scope'                     200 POST   /delete-scope '{"scope":"trim"}'
-call 'delete-scope-candidates'          200 GET    /delete-scope-candidates
+call 'delete_scope'                     200 POST   /delete_scope '{"scope":"trim"}'
+call 'delete_scope_candidates'          200 GET    /delete_scope_candidates
 
 # --- validation errors (400) --------------------------------------------------
 say '== validation =='
@@ -163,7 +163,7 @@ call 'append: bad JSON'                 400 POST   /append   '{not-json'
 call 'counter_add: zero by'             400 POST   /counter_add '{"scope":"c","id":"hits","by":0}'
 call 'counter_add: missing by'          400 POST   /counter_add '{"scope":"c","id":"hits"}'
 call 'update: both id and seq'          400 POST   /update   '{"scope":"s","id":"a","seq":1,"payload":{}}'
-call 'delete-up-to: missing max_seq'    400 POST   /delete-up-to '{"scope":"x"}'
+call 'delete_up_to: missing max_seq'    400 POST   /delete_up_to '{"scope":"x"}'
 
 # --- counter-on-non-integer (409) ---------------------------------------------
 say '== counter conflict =='
@@ -191,12 +191,12 @@ case $LAST_BODY in
     *) bad "counter math body: $LAST_BODY" ;;
 esac
 
-# delete-up-to: 10 appends, trim up to seq 6, only t7..t10 must survive
+# delete_up_to: 10 appends, trim up to seq 6, only t7..t10 must survive
 i=1; while [ $i -le 10 ]; do
     req POST /append "{\"scope\":\"tmath\",\"id\":\"t$i\",\"payload\":$i}" >/dev/null
     i=$((i+1))
 done
-call 'trim: delete-up-to seq=6'         200 POST   /delete-up-to '{"scope":"tmath","max_seq":6}'
+call 'trim: delete_up_to seq=6'         200 POST   /delete_up_to '{"scope":"tmath","max_seq":6}'
 call 'trim: head after trim'            200 GET    '/head?scope=tmath'
 case $LAST_BODY in
     *'"id":"t7"'*'"id":"t10"'*) okmsg 'trim: t7..t10 still present' ;;

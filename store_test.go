@@ -1033,7 +1033,7 @@ func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
 // by an in-flight /append must be detached — otherwise reserveBytes on the
 // post-rebuild counter inflates totalBytes permanently, while the item
 // lands in an orphan buffer that no reader can reach. Mirrors the wipe and
-// delete-scope guarantees.
+// delete_scope guarantees.
 func TestStore_RebuildAll_DetachesOrphanedBuffers(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 

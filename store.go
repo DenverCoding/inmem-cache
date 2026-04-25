@@ -16,7 +16,7 @@ type ScopeBuffer struct {
 	// tests exercise item-count and seq logic without spinning up a store.
 	store *Store
 	// detached is set true when the buffer has been unlinked from its Store
-	// by /delete-scope, /wipe or /rebuild. Writes that reach a detached
+	// by /delete_scope, /wipe or /rebuild. Writes that reach a detached
 	// buffer via a stale pointer return *ScopeDetachedError so the caller
 	// learns the write did not take effect, rather than silently writing
 	// into an orphan buffer that is unreachable and about to be GC'd.
@@ -55,7 +55,7 @@ func NewScopeBuffer(maxItems int) *ScopeBuffer {
 // approxSizeBytes is a richer estimate than the raw approxItemSize sum: it
 // also folds in Go map/slice overhead for b.byID, b.bySeq, and the heat
 // buckets. It drives the per-scope approx_scope_mb field in /stats and the
-// Candidate.ApproxScopeMB field in /delete-scope-candidates. It is NOT used for
+// Candidate.ApproxScopeMB field in /delete_scope_candidates. It is NOT used for
 // cap enforcement — admission control uses Store.totalBytes (a pure
 // approxItemSize sum) so the 507 budget matches what reserveBytes accounts
 // for.
@@ -971,7 +971,7 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 
 // wipe removes every scope from the store and resets the byte counter to
 // zero in one atomic step. Each scope buffer is detached under its own
-// write-lock before the store map is replaced, mirroring the /delete-scope
+// write-lock before the store map is replaced, mirroring the /delete_scope
 // pattern: any in-flight write waiting on buf.mu wakes up on a detached
 // buffer and returns *ScopeDetachedError, so orphaned work cannot silently
 // "succeed" into a buffer that nobody can ever read from again.
@@ -1176,7 +1176,7 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// via getOrCreateScope would run AFTER the swap and call reserveBytes
 	// against the freshly reset counter, permanently inflating totalBytes
 	// (its item lands in an unreachable orphan buffer). Mirrors wipe and
-	// /delete-scope; see ScopeBuffer.detached.
+	// /delete_scope; see ScopeBuffer.detached.
 	//
 	// The scope count is returned to the /rebuild handler, so it must
 	// reflect the state as handed over — not the state after a concurrent

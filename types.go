@@ -20,7 +20,7 @@ const (
 
 	// SingleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
-	// (/append, /update, /upsert, /delete, /delete-scope, /delete-up-to,
+	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to,
 	// /counter_add). Covers JSON framing — keys ("scope","id","payload"),
 	// quotes, colons, braces — on top of the item payload. The scope and id
 	// bytes themselves are already counted inside approxItemSize, so the
@@ -72,7 +72,7 @@ type Config struct {
 
 // MB is an int64 byte count that serializes to JSON as a number in MiB with
 // 4 decimals (e.g. 79845 bytes → 0.0762). One display unit across every
-// user-facing surface (/stats, /delete-scope-candidates, 507 responses) keeps clients from
+// user-facing surface (/stats, /delete_scope_candidates, 507 responses) keeps clients from
 // juggling units. The underlying byte value is preserved for arithmetic.
 type MB int64
 
@@ -216,7 +216,7 @@ func (e *CounterOverflowError) Error() string {
 }
 
 // ScopeDetachedError is returned by a scope-buffer write method when the
-// buffer has been unlinked from its Store (by /delete-scope, /wipe, or
+// buffer has been unlinked from its Store (by /delete_scope, /wipe, or
 // /rebuild) between the handler's getScope/getOrCreateScope call and the
 // buffer-level mutation. The write would otherwise succeed into an orphan
 // buffer that no subsequent reader can reach, so the caller is told the

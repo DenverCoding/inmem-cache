@@ -659,14 +659,14 @@ func TestDelete_RejectsNeitherIDNorSeq(t *testing.T) {
 	}
 }
 
-// --- /delete-scope ------------------------------------------------------------
+// --- /delete_scope ------------------------------------------------------------
 
 func TestDeleteScope_Hit(t *testing.T) {
 	h, _ := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"b","payload":{"v":2}}`)
 
-	code, out, _ := doRequest(t, h, "POST", "/delete-scope", `{"scope":"s"}`)
+	code, out, _ := doRequest(t, h, "POST", "/delete_scope", `{"scope":"s"}`)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -680,7 +680,7 @@ func TestDeleteScope_Hit(t *testing.T) {
 
 func TestDeleteScope_Miss(t *testing.T) {
 	h, _ := newTestHandler(10)
-	code, out, _ := doRequest(t, h, "POST", "/delete-scope", `{"scope":"nope"}`)
+	code, out, _ := doRequest(t, h, "POST", "/delete_scope", `{"scope":"nope"}`)
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
@@ -833,7 +833,7 @@ func TestHead_RejectsOffset(t *testing.T) {
 	h, _ := newTestHandler(10)
 	// offset was dropped on /head — any attempt to use it must 400 so
 	// clients are nudged toward after_seq or /tail instead of silently
-	// getting position-paged results that drift under /delete-up-to.
+	// getting position-paged results that drift under /delete_up_to.
 	code, _, _ := doRequest(t, h, "GET", "/head?scope=s&offset=1", "")
 	if code != 400 {
 		t.Fatalf("code=%d want 400", code)
@@ -1097,7 +1097,7 @@ func TestRender_BySeq(t *testing.T) {
 }
 
 // /render hits feed scope read-heat the same way /get hits do, so
-// /delete-scope-candidates reflects render-driven traffic. Misses must not
+// /delete_scope_candidates reflects render-driven traffic. Misses must not
 // count (same rule as /get) — otherwise a hot 404 would skew eviction.
 func TestRender_HitBumpsReadHeat_MissDoesNot(t *testing.T) {
 	h, api := newTestHandler(10)
@@ -1134,14 +1134,14 @@ func TestStats_Structure(t *testing.T) {
 	}
 }
 
-// --- /delete-scope-candidates ------------------------------------------------
+// --- /delete_scope_candidates ------------------------------------------------
 
 func TestDeleteScopeCandidates_Basic(t *testing.T) {
 	h, _ := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","payload":{"v":1}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"b","payload":{"v":1}}`)
 
-	_, out, _ := doRequest(t, h, "GET", "/delete-scope-candidates", "")
+	_, out, _ := doRequest(t, h, "GET", "/delete_scope_candidates", "")
 	if mustFloat(t, out, "count") != 2 {
 		t.Errorf("count=%v want 2", out["count"])
 	}
@@ -1220,10 +1220,10 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 		t.Fatalf("delete bySeq: code=%d body=%s", code, body)
 	}
 
-	// 7. delete-up-to x: drop every item with seq <= 30. Does NOT rewind lastSeq.
-	if code, _, body := doRequest(t, h, "POST", "/delete-up-to",
+	// 7. delete_up_to x: drop every item with seq <= 30. Does NOT rewind lastSeq.
+	if code, _, body := doRequest(t, h, "POST", "/delete_up_to",
 		`{"scope":"x","max_seq":30}`); code != 200 {
-		t.Fatalf("delete-up-to: code=%d body=%s", code, body)
+		t.Fatalf("delete_up_to: code=%d body=%s", code, body)
 	}
 
 	// 8. head x with a limit that returns >= 1 item (otherwise recordRead is skipped).
@@ -1267,7 +1267,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	if got := mustFloat(t, stats, "scope_count"); got != 2 {
 		t.Errorf("scope_count=%v want 2 (rejected too-long-scope must not register)", got)
 	}
-	// x: 100 rebuilt − 1 deleted (item_050) − 30 (delete-up-to) = 69
+	// x: 100 rebuilt − 1 deleted (item_050) − 30 (delete_up_to) = 69
 	// y: 50 warmed + 100 appended − 1 deleted (seq 75)         = 149
 	if got := mustFloat(t, stats, "total_items"); got != 218 {
 		t.Errorf("total_items=%v want 218", got)
@@ -1286,7 +1286,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 		t.Errorf("x.item_count=%v want 69", got)
 	}
 	if got := mustFloat(t, xStats, "last_seq"); got != 100 {
-		t.Errorf("x.last_seq=%v want 100 (delete-up-to must not rewind lastSeq)", got)
+		t.Errorf("x.last_seq=%v want 100 (delete_up_to must not rewind lastSeq)", got)
 	}
 	if got := mustFloat(t, xStats, "last_7d_read_count"); got < 1 {
 		t.Errorf("x.last_7d_read_count=%v want >= 1 after /head", got)
@@ -1351,7 +1351,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 // and checks the state that survives against concretely tallied expectations.
 //
 // Each worker keeps its own counters (successful appends, deleted items via
-// /delete and /delete-up-to, reads-with-hit) so the hot loop is lock-free. At
+// /delete and /delete_up_to, reads-with-hit) so the hot loop is lock-free. At
 // the end we sum the tallies and require the API's own state to match to the
 // item. Everything we can derive from the workload is checked exactly:
 //
@@ -1365,8 +1365,8 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 //     trigger recordRead, so the two counts are equal, not just related)
 //
 // Ops per workload are chosen to exercise every mutation path that takes the
-// scope write lock (append, delete, update, delete-up-to) as well as the read
-// paths that take RLock + recordRead. /warm, /rebuild and /delete-scope are
+// scope write lock (append, delete, update, delete_up_to) as well as the read
+// paths that take RLock + recordRead. /warm, /rebuild and /delete_scope are
 // intentionally excluded here: they wipe or swap scope state, which would
 // destroy the "Σ appends − Σ deletes = current items" relation that makes the
 // concrete check possible. Races touching those paths live in separate tests.
@@ -1382,7 +1382,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 
 	type tally struct {
 		appendsOK int64 // successful /append (200 response)
-		deletedN  int64 // sum of deleted_count from /delete and /delete-up-to
+		deletedN  int64 // sum of deleted_count from /delete and /delete_up_to
 		readsHit  int64 // /head and /tail calls that returned hit=true
 	}
 	tallies := make([]tally, workers)
@@ -1444,7 +1444,7 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 					// while appends are still extending the tail.
 					maxSeq := rng.Intn(50) + 1
 					body := fmt.Sprintf(`{"scope":"%s","max_seq":%d}`, scope, maxSeq)
-					if _, out, _ := doRequest(t, h, "POST", "/delete-up-to", body); out != nil {
+					if _, out, _ := doRequest(t, h, "POST", "/delete_up_to", body); out != nil {
 						if n, ok := out["deleted_count"].(float64); ok {
 							ts.deletedN += int64(n)
 						}

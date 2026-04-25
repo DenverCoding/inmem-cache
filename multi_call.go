@@ -41,10 +41,10 @@ func (api *API) buildMultiCallSpecs() map[string]subCallSpec {
 		"/upsert":                  {http.MethodPost, api.handleUpsert},
 		"/counter_add":             {http.MethodPost, api.handleCounterAdd},
 		"/delete":                  {http.MethodPost, api.handleDelete},
-		"/delete-up-to":            {http.MethodPost, api.handleDeleteUpTo},
-		"/delete-scope":            {http.MethodPost, api.handleDeleteScope},
+		"/delete_up_to":            {http.MethodPost, api.handleDeleteUpTo},
+		"/delete_scope":            {http.MethodPost, api.handleDeleteScope},
 		"/stats":                   {http.MethodGet, api.handleStats},
-		"/delete-scope-candidates": {http.MethodGet, api.handleDeleteScopeCandidates},
+		"/delete_scope_candidates": {http.MethodGet, api.handleDeleteScopeCandidates},
 	}
 }
 

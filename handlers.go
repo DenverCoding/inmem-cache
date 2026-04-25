@@ -18,7 +18,7 @@ type API struct {
 	// a fully-loaded store can always be expressed as a single bulk request.
 	maxBulkBytes int64
 	// maxSingleBytes is the per-request body cap for single-item endpoints
-	// (/append, /update, /upsert, /delete, /delete-scope, /delete-up-to,
+	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to,
 	// /counter_add). Derived from the store's per-item cap via
 	// singleRequestBytesFor so the HTTP guardrail always sits just above the
 	// semantic item-size limit enforced in the validator.
@@ -182,8 +182,8 @@ func conflict(w http.ResponseWriter, started time.Time, message string) {
 
 // scopeFull responds with 507 Insufficient Storage and the full offender list.
 // Used when an /append, /warm, or /rebuild would push one or more scopes past
-// the per-scope capacity. The client is expected to drain (e.g. /delete-up-to
-// or /delete-scope) or chunk the batch and retry.
+// the per-scope capacity. The client is expected to drain (e.g. /delete_up_to
+// or /delete_scope) or chunk the batch and retry.
 func scopeFull(w http.ResponseWriter, started time.Time, offenders []ScopeCapacityOffender) {
 	msg := "scope is at capacity"
 	if len(offenders) > 1 {
@@ -397,7 +397,7 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	// An empty items[] would wipe the entire store. That is almost always a
 	// client bug (missing payload, wrong key, serialization glitch) rather
 	// than an intentional "clear everything" call. Refuse it explicitly;
-	// clients that really want to clear the cache should /delete-scope per
+	// clients that really want to clear the cache should /delete_scope per
 	// scope or restart the service.
 	if len(req.Items) == 0 {
 		badRequest(w, started, "the 'items' array must not be empty for the '/rebuild' endpoint")
@@ -722,12 +722,12 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleWipe clears the entire store: every scope, every item, every byte
-// reservation. It is the store-wide complement of /delete-scope — destructive
+// reservation. It is the store-wide complement of /delete_scope — destructive
 // in one call, with no request body. The response carries the counts and
 // freed bytes so the client can verify what was released.
 //
 // This is *not* an eviction policy: the cache never wipes on its own.
-// /wipe exists because a client-side "for each scope: /delete-scope" is
+// /wipe exists because a client-side "for each scope: /delete_scope" is
 // N calls and not atomic, whereas a server-side wipe is one lock and one
 // map replacement.
 func (api *API) handleWipe(w http.ResponseWriter, r *http.Request) {
@@ -769,7 +769,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	// /head reads forward by cursor only. Positional 'offset' addressing
 	// lives on /tail exclusively because seq-based forward reads are stable
-	// under /delete-up-to while position-based forward reads are not.
+	// under /delete_up_to while position-based forward reads are not.
 	if query.Has("offset") {
 		badRequest(w, started, "the 'offset' parameter is not supported on /head; use 'after_seq' instead, or call /tail for position-based paging")
 		return
@@ -968,7 +968,7 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	// Only a hit counts toward scope read-heat. A miss by explicit id/seq
 	// should not inflate last_7d_read_count, since the signal is surfaced
-	// on /delete-scope-candidates for client-side eviction decisions.
+	// on /delete_scope_candidates for client-side eviction decisions.
 	buf.recordRead(nowUnixMicro())
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
@@ -1180,12 +1180,12 @@ RULES:
 - if id is present, it must be unique within its scope
 - write operations reject duplicates for the same scope + id
 - per-scope capacity is 100,000 items by default (override with SCOPECACHE_SCOPE_MAX_ITEMS); writes that would exceed the cap are rejected with 507 Insufficient Storage — nothing is silently evicted
-- /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete-up-to or /delete-scope
-- store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries approx_store_mb, added_mb, and max_store_mb; free room with /delete-scope or /delete-up-to
+- /append past the cap returns 507 with the offending scope. /warm and /rebuild reject the entire batch with the full list of over-cap scopes; make room first with /delete_up_to or /delete_scope
+- store-wide byte cap is 100 MiB by default (override with SCOPECACHE_MAX_STORE_MB, integer MiB); writes that would push the aggregate approxItemSize past it are rejected with 507. The response carries approx_store_mb, added_mb, and max_store_mb; free room with /delete_scope or /delete_up_to
 - per-response byte cap is 25 MiB by default (override with SCOPECACHE_MAX_RESPONSE_MB, integer MiB); applied to /head, /tail, /ts_range and /multi_call whose response size scales with limit × per-item-cap (or with batch fanout). A response that would exceed the cap is rejected with 507 carrying approx_response_mb and max_response_mb; narrow with a smaller ?limit (or fewer sub-calls). Already-applied side effects are not rolled back — same as every other 507 in this cache.
 - per-request body cap for /warm and /rebuild scales with the store cap (~store + 10% + 16 MiB), so a full cache always fits in one bulk request. Single-item endpoints use a body cap derived from the per-item cap (item + 4 KiB). /multi_call has its own input body cap of 16 MiB by default (override with SCOPECACHE_MAX_MULTI_CALL_MB, integer MiB).
 - /multi_call accepts at most 10 sub-calls per batch by default (override with SCOPECACHE_MAX_MULTI_CALL_COUNT, positive int)
-- every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete-scope-candidates and 507 responses
+- every byte-ish field in JSON responses (approx_store_mb, max_store_mb, approx_scope_mb, added_mb) is expressed in MiB with 4 decimals — one unit across /stats, /delete_scope_candidates and 507 responses
 - the listening socket path defaults to /run/scopecache.sock on Linux and $TMPDIR/scopecache.sock on macOS/Windows; override with SCOPECACHE_SOCKET_PATH
 
 ENDPOINTS:
@@ -1197,8 +1197,8 @@ POST /update - update one item by scope + id or scope + seq (exactly one of id/s
 POST /upsert - create or replace one item by scope + id; response carries "created": true for a fresh item, false for a replace
 POST /counter_add - atomically add 'by' (signed int64, non-zero, within ±(2^53-1)) to the integer counter at scope + id; creates a fresh counter with starting value 'by' on miss; 409 if the existing item is not a counter-valued integer; response carries {ok, created, value}
 POST /delete - delete one item by scope + id or scope + seq (exactly one of id/seq required)
-POST /delete-up-to - delete every item in a scope with seq <= max_seq
-POST /delete-scope - delete one entire scope from the cache
+POST /delete_up_to - delete every item in a scope with seq <= max_seq
+POST /delete_scope - delete one entire scope from the cache
 POST /wipe - delete every scope from the cache in one atomic call (no request body); response carries {ok, deleted_scopes, deleted_items, freed_mb}
 GET  /head - get the oldest items from a scope; supports optional after_seq for cursor-based forward reads (offset is not supported, use /tail for position-based paging)
 GET  /tail - get the most recent items from a scope (supports optional offset)
@@ -1206,16 +1206,16 @@ GET  /ts_range - get items whose optional top-level ts falls inside [since_ts, u
 GET  /get - get one item by scope + id or scope + seq
 GET  /render - serve one item's payload as raw bytes (no JSON envelope); miss returns 404; JSON-string payloads are decoded one layer so cached HTML/XML/text is served as-is; Content-Type is application/octet-stream — fronting proxy is expected to set the real type if browser-facing
 GET  /stats - show store stats and approximate store size
-GET  /delete-scope-candidates - list scope eviction candidates, sorted by oldest last_access_ts (response includes last_7d_read_count for client-side filtering/sorting)
-POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete-up-to, /delete-scope, /stats, /delete-scope-candidates; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
+GET  /delete_scope_candidates - list scope eviction candidates, sorted by oldest last_access_ts (response includes last_7d_read_count for client-side filtering/sorting)
+POST /multi_call - sequentially dispatch N independent sub-calls in one HTTP roundtrip; body is {"calls": [{"path": "/get|/append|...", "query": {...}, "body": {...}}, ...]}; allowed paths: /append, /get, /head, /tail, /ts_range, /update, /upsert, /counter_add, /delete, /delete_up_to, /delete_scope, /stats, /delete_scope_candidates; response is {ok, count, results: [{status, body}, ...], approx_response_mb, duration_us} in input order. No cross-call atomicity — a write at index 0 stays applied even if index 1 fails. Outer envelope honours the per-response cap (SCOPECACHE_MAX_RESPONSE_MB); slot bodies that would push the envelope past the cap are replaced with a minimal {"ok":true|false,"response_truncated":true} marker while the slot's status is preserved.
 
 NOTES:
 - /warm replaces only the scopes present in the request
 - /rebuild replaces the entire store
-- /delete-up-to is designed for write-buffer patterns: read with /head?after_seq=…, commit to the DB, then trim with /delete-up-to up to the last committed seq
-- /delete-scope removes all items, indexes and scope-level metadata for one scope
-- /delete-scope-candidates is advisory only: returns candidates, never deletes; the client decides
-- /delete-scope-candidates supports optional ?hours=N to exclude recently created scopes
+- /delete_up_to is designed for write-buffer patterns: read with /head?after_seq=…, commit to the DB, then trim with /delete_up_to up to the last committed seq
+- /delete_scope removes all items, indexes and scope-level metadata for one scope
+- /delete_scope_candidates is advisory only: returns candidates, never deletes; the client decides
+- /delete_scope_candidates supports optional ?hours=N to exclude recently created scopes
 - /render has a deliberately envelope-free hit/miss contract: 200 carries raw payload bytes, 404 carries an empty body; both use Content-Type application/octet-stream. Validation errors (400) still use the JSON error envelope. The cache does not sniff or guess MIME types — browser-facing setups must set Content-Type in the fronting proxy.
 `
 
@@ -1232,8 +1232,8 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/upsert", api.handleUpsert)
 	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
-	mux.HandleFunc("/delete-up-to", api.handleDeleteUpTo)
-	mux.HandleFunc("/delete-scope", api.handleDeleteScope)
+	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
+	mux.HandleFunc("/delete_scope", api.handleDeleteScope)
 	mux.HandleFunc("/wipe", api.handleWipe)
 	mux.HandleFunc("/head", api.capResponse(api.handleHead))
 	mux.HandleFunc("/tail", api.capResponse(api.handleTail))
@@ -1242,6 +1242,6 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/render", api.handleRender)
 	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/help", api.handleHelp)
-	mux.HandleFunc("/delete-scope-candidates", api.handleDeleteScopeCandidates)
+	mux.HandleFunc("/delete_scope_candidates", api.handleDeleteScopeCandidates)
 	mux.HandleFunc("/multi_call", api.capResponse(api.handleMultiCall))
 }

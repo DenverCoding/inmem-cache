@@ -252,15 +252,15 @@ func validateDeleteRequest(req DeleteRequest) error {
 }
 
 func validateDeleteScopeRequest(req DeleteScopeRequest) error {
-	return validateScope(req.Scope, "/delete-scope")
+	return validateScope(req.Scope, "/delete_scope")
 }
 
 func validateDeleteUpToRequest(req DeleteUpToRequest) error {
-	if err := validateScope(req.Scope, "/delete-up-to"); err != nil {
+	if err := validateScope(req.Scope, "/delete_up_to"); err != nil {
 		return err
 	}
 	if req.MaxSeq == 0 {
-		return errors.New("the 'max_seq' field is required and must be a positive integer for the '/delete-up-to' endpoint")
+		return errors.New("the 'max_seq' field is required and must be a positive integer for the '/delete_up_to' endpoint")
 	}
 	return nil
 }

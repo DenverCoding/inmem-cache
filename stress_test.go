@@ -14,7 +14,7 @@ import (
 
 // TestStress_MixedOps hammers the store from many goroutines with a realistic
 // mix of operations (reads, appends, upserts, counter_add, updates, deletes,
-// trims, delete-scope, rebuilds) for a fixed duration. After the storm it
+// trims, delete_scope, rebuilds) for a fixed duration. After the storm it
 // verifies the invariants the rest of the code relies on:
 //
 //   - s.totalBytes (atomic counter) == sum of buf.bytes across all scopes
@@ -154,7 +154,7 @@ func TestStress_MixedOps(t *testing.T) {
 				deletes.Add(1)
 
 			case kind < 975:
-				// 2.5% delete-up-to — trim the oldest half of whatever is there
+				// 2.5% delete_up_to — trim the oldest half of whatever is there
 				buf, ok := s.getScope(scope)
 				if !ok {
 					continue
@@ -171,7 +171,7 @@ func TestStress_MixedOps(t *testing.T) {
 				trims.Add(1)
 
 			case kind < 993:
-				// 1.8% delete-scope + immediate recreate
+				// 1.8% delete_scope + immediate recreate
 				_, _ = s.deleteScope(scope)
 				buf, _ := s.getOrCreateScope(scope)
 				_, _ = buf.appendItem(Item{

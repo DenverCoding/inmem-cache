@@ -85,7 +85,7 @@ Note: items do not carry a *server-generated* `ts`. The `ts` field above is
 client-supplied and opaque to the cache (beyond int64 ordering for
 `/ts_range`). Scope-level timing data (`created_ts`, `last_access_ts`) is
 separate, cache-owned, and surfaces only in `/stats` and
-`/delete-scope-candidates`.
+`/delete_scope_candidates`.
 
 ---
 
@@ -96,13 +96,13 @@ separate, cache-owned, and surfaces only in `/stats` and
 - per-item cap: `1 MiB` by default (enforced on `approxItemSize` = overhead + scope + id + payload, not on raw payload alone), overridable via the `SCOPECACHE_MAX_ITEM_MB` environment variable (integer MiB).
 - per-scope item cap: `100000` items by default, overridable via the `SCOPECACHE_SCOPE_MAX_ITEMS` environment variable
 - store-wide byte cap: `100 MiB` of aggregate `approxItemSize` by default, overridable via the `SCOPECACHE_MAX_STORE_MB` environment variable (integer MiB). Tuned for modest VPS deployments (~1 GB total RAM alongside DB + app).
-- per-request body cap (single-item endpoints `/append`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-scope`, `/delete-up-to`): **derived at startup from the configured per-item cap** — `item_cap + 4 KiB`. The 4 KiB overhead covers JSON framing (keys, quotes, braces) on top of the item bytes; scope and id bytes themselves are already counted inside `approxItemSize`. Raising `SCOPECACHE_MAX_ITEM_MB` raises this cap in lockstep.
+- per-request body cap (single-item endpoints `/append`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_scope`, `/delete_up_to`): **derived at startup from the configured per-item cap** — `item_cap + 4 KiB`. The 4 KiB overhead covers JSON framing (keys, quotes, braces) on top of the item bytes; scope and id bytes themselves are already counted inside `approxItemSize`. Raising `SCOPECACHE_MAX_ITEM_MB` raises this cap in lockstep.
 - counter value range: `±(2^53 − 1) = ±9,007,199,254,740,991`. This matches the JavaScript safe-integer range so counter values round-trip through every JSON client without precision loss. It applies to `by`, to the existing counter value, and to the result of `/counter_add`.
 - per-request body cap (bulk endpoints `/warm`, `/rebuild`): **derived at startup from the configured store cap** — roughly `store_cap + 10% + 16 MiB`. This guarantees a fully-loaded cache can always be expressed in one bulk request, with headroom for JSON framing. Concretely: default 100 MiB store → ~126 MiB request cap; `SCOPECACHE_MAX_STORE_MB=1024` → ~1.15 GiB request cap.
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
 
-Writes that would exceed **either** cap are **rejected** with HTTP `507 Insufficient Storage`. There is no automatic eviction, no TTL, and no silent truncation — the cache never drops items on its own. To free capacity the client issues `/delete-up-to`, `/delete-scope`, or a `/warm`/`/rebuild` that fits within the caps.
+Writes that would exceed **either** cap are **rejected** with HTTP `507 Insufficient Storage`. There is no automatic eviction, no TTL, and no silent truncation — the cache never drops items on its own. To free capacity the client issues `/delete_up_to`, `/delete_scope`, or a `/warm`/`/rebuild` that fits within the caps.
 
 - `/append` past the per-scope item cap → `507` with one offender: the target scope.
 - `/warm` and `/rebuild` with any single scope over the item cap → `507` with the **full list** of offending scopes. The batch is atomic: nothing is applied when any scope would overflow.
@@ -149,7 +149,7 @@ GET /get
 GET /render
 GET /stats
 GET /help
-GET /delete-scope-candidates
+GET /delete_scope_candidates
 ```
 
 ### `GET /head`
@@ -247,12 +247,12 @@ Hits count toward scope read-heat (`last_access_ts`, `last_7d_read_count`) exact
 ### `GET /stats`
 Returns store-level and scope-level operational metadata.
 
-### `GET /delete-scope-candidates`
+### `GET /delete_scope_candidates`
 Query:
 - `limit` optional
 - `hours` optional
 
-Returns scope-level eviction candidates sorted by ascending `last_access_ts`. Named to mirror `/delete-scope`: these are the candidates a client would feed to that endpoint.
+Returns scope-level eviction candidates sorted by ascending `last_access_ts`. Named to mirror `/delete_scope`: these are the candidates a client would feed to that endpoint.
 
 If `hours` is provided, only scopes whose `created_ts` is at least that many hours in the past are included.
 
@@ -260,14 +260,14 @@ Each candidate also carries `last_7d_read_count`, so clients that want a differe
 
 This endpoint only returns metadata. It does not delete anything.
 
-**Time model.** All timing used by `/delete-scope-candidates` is scope-level and cache-owned:
+**Time model.** All timing used by `/delete_scope_candidates` is scope-level and cache-owned:
 - `created_ts` — when the scope was first created in the cache
 - `last_access_ts` — when any item in the scope was last read
 - `last_7d_read_count` — reads against the scope over a rolling 7-day window
 
 None of these are derived from items. The item-level `ts` (client-supplied,
 see §3) is a separate concept and is deliberately **not** used to rank
-delete-scope candidates — scope heat is a cache-owned signal, not a
+delete_scope candidates — scope heat is a cache-owned signal, not a
 business-timestamp projection.
 
 ---
@@ -282,8 +282,8 @@ POST /update
 POST /upsert
 POST /counter_add
 POST /delete
-POST /delete-up-to
-POST /delete-scope
+POST /delete_up_to
+POST /delete_scope
 POST /wipe
 ```
 
@@ -330,7 +330,7 @@ Input:
 Behavior:
 - replace the entire store
 - intended for restart/cold rebuild
-- reject `400` if `items[]` is empty; to clear state, use `/delete-scope` per scope
+- reject `400` if `items[]` is empty; to clear state, use `/delete_scope` per scope
 - reject duplicate non-empty `id` values within a provided scope set
 - reject the entire batch with `507 Insufficient Storage` if any scope in the request exceeds the per-scope capacity; the response lists every offending scope
 
@@ -392,10 +392,10 @@ Input:
 
 Behavior:
 - delete exactly one item, addressed by `scope + id` or `scope + seq`
-- `seq` addressing lets clients remove id-less items without resorting to `/delete-up-to` or `/delete-scope`
+- `seq` addressing lets clients remove id-less items without resorting to `/delete_up_to` or `/delete_scope`
 - return hit/miss metadata
 
-### `POST /delete-up-to`
+### `POST /delete_up_to`
 Input:
 - `scope` required
 - `max_seq` required, positive integer
@@ -407,11 +407,11 @@ Behavior:
 - return hit/miss metadata and the number of items removed
 
 Intended use: write-buffer drain pattern. The client reads a batch via
-`/head?after_seq=…`, commits it to the database, then calls `/delete-up-to`
+`/head?after_seq=…`, commits it to the database, then calls `/delete_up_to`
 with the seq of the last committed item. If the client crashes between read
 and commit, the items remain in the buffer for the next drain — no data loss.
 
-### `POST /delete-scope`
+### `POST /delete_scope`
 Input:
 - `scope` required
 
@@ -426,10 +426,10 @@ Input:
 
 Behavior:
 - clear the entire store in one atomic call: every scope, every item, every byte reservation
-- the store-wide complement of `/delete-scope`: a client-side equivalent would be `N` `/delete-scope` calls and would not be atomic
+- the store-wide complement of `/delete_scope`: a client-side equivalent would be `N` `/delete_scope` calls and would not be atomic
 - the cache never wipes on its own — this is an explicit client action intended for test teardown, emergency reset, or preparing a fresh slate before a `/rebuild`
 - response carries `{ "ok", "deleted_scopes", "deleted_items", "freed_mb" }`: `freed_mb` is the store-wide byte budget released back to the cap (in MiB, 4 decimals, matching `/stats`)
-- holders of stale scope buffer pointers see a detached buffer: any write they complete after the wipe stays local to the orphan and cannot corrupt the post-wipe byte counter (same guarantee as `/delete-scope`)
+- holders of stale scope buffer pointers see a detached buffer: any write they complete after the wipe stays local to the orphan and cannot corrupt the post-wipe byte counter (same guarantee as `/delete_scope`)
 
 ---
 
@@ -447,8 +447,8 @@ Input:
 - each entry: `path` required (must be in the whitelist below), `query` optional (object → URL-query string), `body` optional (forwarded verbatim for POST sub-calls)
 
 Allowed paths (closed whitelist):
-- per-scope/per-item ops: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`
-- aggregate reads: `/stats`, `/delete-scope-candidates`
+- per-scope/per-item ops: `/append`, `/get`, `/head`, `/tail`, `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/delete_scope`
+- aggregate reads: `/stats`, `/delete_scope_candidates`
 
 Excluded paths (rejected with `400` for the whole batch):
 - store-wide locks: `/warm`, `/rebuild`, `/wipe` — would block unrelated calls behind a store-wide lock; a `/get` after `/rebuild` in the same batch would read a totally different dataset than the caller expected
@@ -496,7 +496,7 @@ The outer `duration_us` is total dispatcher time including all sub-calls; per-sl
 ### Durability contract
 
 A 2xx response from any write endpoint (`/append`, `/warm`, `/update`,
-`/upsert`, `/counter_add`, `/delete`, `/delete-up-to`, `/delete-scope`,
+`/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/delete_scope`,
 `/wipe`, `/rebuild`) confirms the write was applied to the cache at the
 moment of commit. It is **not** a persistence guarantee:
 
@@ -504,7 +504,7 @@ moment of commit. It is **not** a persistence guarantee:
   and will erase writes that committed moments earlier. This is intentional:
   both endpoints express "the source of truth says this is the new state,"
   and the cache is explicitly subordinate to that source.
-- `/delete-scope` and `/delete-up-to` erase earlier writes within their
+- `/delete_scope` and `/delete_up_to` erase earlier writes within their
   scope by design. Concurrent appends that happened to succeed just before
   a delete can vanish.
 - The orphan-detach mechanism (`*ScopeDetachedError`) protects the store's
@@ -518,7 +518,7 @@ durable acknowledgment. The cache is deliberately disposable; see §1.
 
 ### Read consistency
 
-`/stats` and `/delete-scope-candidates` are advisory snapshots, not transactional:
+`/stats` and `/delete_scope_candidates` are advisory snapshots, not transactional:
 
 - Each scope is read under its own lock so per-scope values are internally
   consistent, but the response as a whole is not a global snapshot — writes
@@ -565,7 +565,7 @@ This section lists the invariants that the test harness enforces. The tests live
 
 - `s.totalBytes == Σ buf.bytes` across all scopes — the atomic counter matches ground truth even after concurrent load.
 - Within each scope: `buf.bytes == Σ approxItemSize(item)`; `len(buf.items) == len(buf.bySeq)`; items strictly ordered by ascending `seq`; every `buf.byID[id]` points at a matching entry in `buf.bySeq`.
-- After `/delete-scope`, `/wipe`, or a `/rebuild` swap, stale scope-buffer pointers are detached: writes on orphans stay local and cannot decrement the post-swap byte counter.
+- After `/delete_scope`, `/wipe`, or a `/rebuild` swap, stale scope-buffer pointers are detached: writes on orphans stay local and cannot decrement the post-swap byte counter.
 
 **HTTP contract invariants** (handlers + E2E):
 
@@ -584,9 +584,9 @@ The stress harness drives a realistic mix of reads, appends, upserts, counter in
 **Where `scopecache` wins**
 
 - **Operational simplicity.** One Go binary; Phase 3 embeds it in Caddy so there are zero extra processes. No `redis.conf`, AOF/RDB, or eviction policies. Unix socket only — no TCP, auth, ACLs, or TLS.
-- **Domain fit.** The `scope/id/seq` model maps directly to how clients use the cache, with no translation to generic primitives. `/warm` and `/rebuild` are atomic all-or-nothing in a single call where Redis needs MULTI/EXEC or Lua. Scope-level read-heat and `/delete-scope-candidates` ranking are built in.
+- **Domain fit.** The `scope/id/seq` model maps directly to how clients use the cache, with no translation to generic primitives. `/warm` and `/rebuild` are atomic all-or-nothing in a single call where Redis needs MULTI/EXEC or Lua. Scope-level read-heat and `/delete_scope_candidates` ranking are built in.
 - **Debuggability.** HTTP + JSON. `curl` works, every language already speaks it, no client-library versioning.
-- **Predictable-when-full behaviour.** The cache never evicts on its own. Writes past a cap return `507` with exact numbers (`approx_store_mb`, `added_mb`, `max_store_mb`); clients free space via `/delete-up-to`, `/delete-scope`, or a fitting `/warm`/`/rebuild`.
+- **Predictable-when-full behaviour.** The cache never evicts on its own. Writes past a cap return `507` with exact numbers (`approx_store_mb`, `added_mb`, `max_store_mb`); clients free space via `/delete_up_to`, `/delete_scope`, or a fitting `/warm`/`/rebuild`.
 
 **Where Redis wins**
 
@@ -1032,7 +1032,7 @@ A miss returns `200` with `hit: false` and `deleted_count: 0`.
 ### 13.16 Delete-up-to (write-buffer drain)
 
 ```bash
-curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete_up_to \
   -H "Content-Type: application/json" \
   -d '{
     "scope": "pending_orders",
@@ -1056,7 +1056,7 @@ Response:
 ### 13.17 Delete-scope
 
 ```bash
-curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-scope \
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete_scope \
   -H "Content-Type: application/json" \
   -d '{ "scope": "thread:900" }'
 ```
@@ -1078,7 +1078,7 @@ Response:
 ### 13.18 Delete-scope-candidates
 
 ```bash
-curl -s --unix-socket /run/scopecache.sock "http://localhost/delete-scope-candidates?limit=10&hours=3"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/delete_scope_candidates?limit=10&hours=3"
 ```
 
 `hours=3` excludes scopes created within the last 3 hours; omit it (or `hours=0`) to include all scopes.
@@ -1112,7 +1112,7 @@ Response:
 }
 ```
 
-Candidates are sorted by ascending `last_access_ts`. `last_7d_read_count` is exposed so clients can re-rank or filter client-side without the server offering multiple sort orders. This endpoint never deletes anything — feed the chosen scopes to `/delete-scope` (§13.17).
+Candidates are sorted by ascending `last_access_ts`. `last_7d_read_count` is exposed so clients can re-rank or filter client-side without the server offering multiple sort orders. This endpoint never deletes anything — feed the chosen scopes to `/delete_scope` (§13.17).
 
 ### 13.19 Wipe the entire store
 
@@ -1290,4 +1290,4 @@ Response (trimmed to two scopes for readability — the real response carries ev
 }
 ```
 
-`approx_store_mb` and `max_store_mb` pair so a client can compute headroom in one call. Per-scope `read_count_total` is the lifetime read count; `last_7d_read_count` is the rolling 7-day read count that drives `/delete-scope-candidates`.
+`approx_store_mb` and `max_store_mb` pair so a client can compute headroom in one call. Per-scope `read_count_total` is the lifetime read count; `last_7d_read_count` is the rolling 7-day read count that drives `/delete_scope_candidates`.
