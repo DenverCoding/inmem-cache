@@ -578,13 +578,17 @@ Its core identity is:
 
 The service listens on a Unix domain socket (default `/run/scopecache.sock`), so every curl example passes `--unix-socket` and uses `http://localhost/...` as a dummy URL host. Set `SCOPECACHE_SOCKET_PATH` to override the path; adjust `--unix-socket` accordingly.
 
-### 12.1 Help
+Response examples were captured from a running scopecache, then pretty-printed for readability — the wire format is compact JSON. `duration_us` values are illustrative and depend on host load. `approx_response_mb` reports the body's own byte length in MiB with 4 decimals (see §4); on a multi-item read it is the same value the per-response cap is checked against.
+
+### 13.1 Help
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/help"
 ```
 
-### 12.2 Append
+Returns plain text (`text/plain; charset=utf-8`) — the live RULES + ENDPOINTS + NOTES reference. Not reproduced here; the response body of `/help` is the canonical version.
+
+### 13.2 Append
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/append \
@@ -592,35 +596,105 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/append \
   -d '{
     "scope": "thread:900",
     "id": "post_1",
-    "payload": {
-      "text": "hello"
-    }
+    "payload": { "text": "hello" }
   }'
 ```
 
-### 12.3 Head
+Response:
+
+```json
+{
+  "ok": true,
+  "item": {
+    "scope": "thread:900",
+    "id": "post_1",
+    "seq": 1,
+    "payload": { "text": "hello" }
+  },
+  "duration_us": 35
+}
+```
+
+`/append` without an `id` is also valid; the response item then carries only `scope`, `seq`, and `payload`.
+
+### 13.3 Head
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/head?scope=thread:900&limit=10"
 ```
 
-### 12.4 Tail
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 2,
+  "truncated": false,
+  "items": [
+    { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
+    { "scope": "thread:900",                 "seq": 2, "payload": { "text": "world" } }
+  ],
+  "duration_us": 5,
+  "approx_response_mb": 0.0002
+}
+```
+
+A scope that does not exist returns `200` with `"hit": false`, an empty `items` array, and `count: 0`.
+
+### 13.4 Tail
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/tail?scope=thread:900&limit=10"
 ```
 
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 2,
+  "offset": 0,
+  "truncated": false,
+  "items": [
+    { "scope": "thread:900", "id": "post_1", "seq": 1, "payload": { "text": "hello" } },
+    { "scope": "thread:900",                 "seq": 2, "payload": { "text": "world" } }
+  ],
+  "duration_us": 4,
+  "approx_response_mb": 0.0002
+}
+```
+
+`offset` paginates further from the end:
+
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/tail?scope=thread:900&limit=10&offset=10"
 ```
 
-### 12.5 Head with cursor
+### 13.5 Head with cursor
 
 ```bash
-curl -s --unix-socket /run/scopecache.sock "http://localhost/head?scope=thread:900&after_seq=5&limit=10"
+curl -s --unix-socket /run/scopecache.sock "http://localhost/head?scope=thread:900&after_seq=1&limit=10"
 ```
 
-### 12.5a Ts range (server-side time-window filter)
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 1,
+  "truncated": false,
+  "items": [
+    { "scope": "thread:900", "seq": 2, "payload": { "text": "world" } }
+  ],
+  "duration_us": 4,
+  "approx_response_mb": 0.0002
+}
+```
+
+### 13.6 Ts range (server-side time-window filter)
 
 Append an item with a client-supplied timestamp (ms since unix epoch):
 
@@ -654,31 +728,71 @@ curl -s --unix-socket /run/scopecache.sock \
   "http://localhost/ts_range?scope=events&until_ts=1745300000000"
 ```
 
-Response shape:
+Response:
 
 ```json
 {
   "ok": true,
-  "items": [ { "scope": "events", "id": "e1", "seq": 1, "ts": 1745236800000, "payload": { "kind": "login" } } ],
-  "truncated": false
+  "hit": true,
+  "count": 2,
+  "truncated": false,
+  "items": [
+    { "scope": "events", "id": "e1", "seq": 1, "ts": 1745236800000, "payload": { "kind": "login" } },
+    { "scope": "events", "id": "e2", "seq": 2, "ts": 1745273400000, "payload": { "kind": "logout" } }
+  ],
+  "duration_us": 7,
+  "approx_response_mb": 0.0003
 }
 ```
 
 Items are returned in ascending `seq` order (not `ts` order). Items without a `ts` are excluded. `truncated: true` means at least one more matching item sits beyond the returned `limit`; narrow the window or raise `limit` to retrieve them (there is no pagination cursor).
 
-### 12.6 Get by id
+### 13.7 Get by id
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/get?scope=thread:900&id=post_1"
 ```
 
-### 12.7 Get by seq
+Response (hit):
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 1,
+  "item": {
+    "scope": "thread:900",
+    "id": "post_1",
+    "seq": 1,
+    "payload": { "text": "hello" }
+  },
+  "duration_us": 5,
+  "approx_response_mb": 0.0001
+}
+```
+
+Response (miss — same `200`, `hit: false`, `count: 0`, `item: null`):
+
+```json
+{
+  "ok": true,
+  "hit": false,
+  "count": 0,
+  "item": null,
+  "duration_us": 2,
+  "approx_response_mb": 0.0001
+}
+```
+
+### 13.8 Get by seq
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/get?scope=thread:900&seq=1"
 ```
 
-### 12.7a Render (serve raw payload, no envelope)
+Response shape is identical to §13.7 (`hit`, `count`, `item`, `duration_us`, `approx_response_mb`).
+
+### 13.9 Render (serve raw payload, no envelope)
 
 Cache an HTML fragment as a JSON string, then serve it raw:
 
@@ -693,7 +807,12 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/append \
 
 curl -s --unix-socket /run/scopecache.sock \
   "http://localhost/render?scope=pages&id=home"
-# → <html><body>Hi</body></html>
+```
+
+Response (`200 OK`, `Content-Type: application/octet-stream`, no JSON envelope):
+
+```
+<html><body>Hi</body></html>
 ```
 
 A JSON object stored under the same pattern is served with its raw JSON bytes:
@@ -701,62 +820,70 @@ A JSON object stored under the same pattern is served with its raw JSON bytes:
 ```bash
 curl -s --unix-socket /run/scopecache.sock \
   "http://localhost/render?scope=thread:900&id=post_1"
-# → {"text":"hello"}
 ```
 
-Response for a miss is `404 Not Found` with an empty body.
+Response:
 
-### 12.8 Warm
+```
+{"text":"hello"}
+```
+
+Miss → `404 Not Found`, empty body, `Content-Type: application/octet-stream`. Validation errors (missing `scope`, malformed `seq`, …) keep the standard JSON error envelope.
+
+### 13.10 Warm
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/warm \
   -H "Content-Type: application/json" \
   -d '{
     "items": [
-      {
-        "scope": "thread:900",
-        "id": "post_1",
-        "payload": {
-          "text": "hello"
-        }
-      },
-      {
-        "scope": "thread:900",
-        "id": "post_2",
-        "payload": {
-          "text": "world"
-        }
-      }
+      { "scope": "thread:900", "id": "post_1", "payload": { "text": "hello" } },
+      { "scope": "thread:900", "id": "post_2", "payload": { "text": "world" } }
     ]
   }'
 ```
 
-### 12.9 Rebuild
+Response:
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "replaced_scopes": 1,
+  "duration_us": 34
+}
+```
+
+`replaced_scopes` is the number of distinct scopes touched by the batch; every other scope in the store is left untouched.
+
+### 13.11 Rebuild
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/rebuild \
   -H "Content-Type: application/json" \
   -d '{
     "items": [
-      {
-        "scope": "thread:900",
-        "id": "post_1",
-        "payload": {
-          "text": "hello"
-        }
-      },
-      {
-        "scope": "thread:901",
-        "id": "post_2",
-        "payload": {
-          "text": "world"
-        }
-      }
+      { "scope": "thread:900", "id": "post_1", "payload": { "text": "hello" } },
+      { "scope": "thread:901", "id": "post_1", "payload": { "text": "world" } }
     ]
   }'
 ```
 
-### 12.10 Update
+Response:
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "rebuilt_scopes": 2,
+  "rebuilt_items": 2,
+  "duration_us": 10360
+}
+```
+
+After a `/rebuild`, every scope not present in the request is gone — the entire store has been replaced.
+
+### 13.12 Update
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/update \
@@ -764,13 +891,24 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/update \
   -d '{
     "scope": "thread:900",
     "id": "post_1",
-    "payload": {
-      "text": "updated text"
-    }
+    "payload": { "text": "updated" }
   }'
 ```
 
-### 12.11 Upsert
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "updated_count": 1,
+  "duration_us": 65
+}
+```
+
+A miss (no item at that `scope + id` / `scope + seq`) returns `200` with `hit: false` and `updated_count: 0`.
+
+### 13.13 Upsert
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/upsert \
@@ -782,7 +920,7 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/upsert \
   }'
 ```
 
-Response:
+Response (first call — create):
 
 ```json
 {
@@ -793,20 +931,21 @@ Response:
     "id": "article:42",
     "seq": 1,
     "payload": 1000
-  }
+  },
+  "duration_us": 1282
 }
 ```
 
 A second call with the same `scope + id` replaces the payload and returns `"created": false`; the `seq` stays the same.
 
-### 12.12 Counter add
+### 13.14 Counter add
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/counter_add \
   -H "Content-Type: application/json" \
   -d '{
-    "scope": "views",
-    "id": "article:42",
+    "scope": "counters",
+    "id": "hits",
     "by": 1
   }'
 ```
@@ -817,13 +956,14 @@ Response (first call — auto-create):
 {
   "ok": true,
   "created": true,
-  "value": 1
+  "value": 1,
+  "duration_us": 255
 }
 ```
 
-A second call with the same `scope + id` increments and returns `"created": false, "value": 2`. Pass a negative `by` to decrement. A subsequent `/get?scope=views&id=article:42` returns the item with `"payload": 2`.
+A subsequent call with the same `scope + id` increments and returns `"created": false`, `"value": 6` (after `by: 5`). Pass a negative `by` to decrement. A `/get?scope=counters&id=hits` returns the item with `"payload": 6`.
 
-### 12.13 Delete
+### 13.15 Delete
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete \
@@ -834,7 +974,20 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete \
   }'
 ```
 
-### 12.14 Delete-through (write-buffer drain)
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "deleted_count": 1,
+  "duration_us": 21
+}
+```
+
+A miss returns `200` with `hit: false` and `deleted_count: 0`.
+
+### 13.16 Delete-up-to (write-buffer drain)
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to \
@@ -845,13 +998,81 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-up-to
   }'
 ```
 
-### 12.15 Candidate scopes older than 3 hours
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "deleted_count": 1,
+  "duration_us": 36
+}
+```
+
+`deleted_count` is the number of items whose `seq <= max_seq` that were removed. Items past `max_seq` are untouched, so writes that arrived during the drain are preserved for the next round.
+
+### 13.17 Delete-scope
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/delete-scope \
+  -H "Content-Type: application/json" \
+  -d '{ "scope": "thread:900" }'
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "deleted_scope": true,
+  "deleted_items": 1,
+  "duration_us": 61
+}
+```
+
+`hit: false`, `deleted_scope: false`, `deleted_items: 0` when the scope did not exist.
+
+### 13.18 Delete-scope-candidates
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/delete-scope-candidates?limit=10&hours=3"
 ```
 
-### 12.16 Wipe the entire store
+`hours=3` excludes scopes created within the last 3 hours; omit it (or `hours=0`) to include all scopes.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "hours": 3,
+  "candidates": [
+    {
+      "scope": "warmscope",
+      "created_ts": 1777129877881480,
+      "last_access_ts": 0,
+      "last_7d_read_count": 0,
+      "item_count": 2,
+      "approx_scope_mb": 0.0004
+    },
+    {
+      "scope": "events",
+      "created_ts": 1777129877945548,
+      "last_access_ts": 1777129877952071,
+      "last_7d_read_count": 1,
+      "item_count": 2,
+      "approx_scope_mb": 0.0005
+    }
+  ],
+  "duration_us": 7
+}
+```
+
+Candidates are sorted by ascending `last_access_ts`. `last_7d_read_count` is exposed so clients can re-rank or filter client-side without the server offering multiple sort orders. This endpoint never deletes anything — feed the chosen scopes to `/delete-scope` (§13.17).
+
+### 13.19 Wipe the entire store
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/wipe
@@ -862,18 +1083,52 @@ Response:
 ```json
 {
   "ok": true,
-  "deleted_scopes": 42,
-  "deleted_items": 1337,
-  "freed_mb": 12.4512
+  "deleted_scopes": 5,
+  "deleted_items": 6,
+  "freed_mb": 0.0004,
+  "duration_us": 1
 }
 ```
 
-Atomic: when the call returns, every scope, every item and every byte
-reservation has been released. A follow-up `/stats` reports
-`scope_count: 0`, `total_items: 0`, `approx_store_mb: 0`.
+Atomic: when the call returns, every scope, every item and every byte reservation has been released. A follow-up `/stats` reports `scope_count: 0`, `total_items: 0`, `approx_store_mb: 0`.
 
-### 12.17 Stats
+### 13.20 Stats
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock "http://localhost/stats"
 ```
+
+Response (trimmed to two scopes for readability — the real response carries every scope in the store):
+
+```json
+{
+  "ok": true,
+  "scope_count": 6,
+  "total_items": 9,
+  "approx_store_mb": 0.0006,
+  "max_store_mb": 100.0000,
+  "scopes": {
+    "thread:900": {
+      "item_count": 2,
+      "last_seq": 2,
+      "approx_scope_mb": 0.0004,
+      "created_ts": 1777129877833274,
+      "last_access_ts": 1777129877961422,
+      "read_count_total": 7,
+      "last_7d_read_count": 7
+    },
+    "events": {
+      "item_count": 2,
+      "last_seq": 2,
+      "approx_scope_mb": 0.0005,
+      "created_ts": 1777129877945548,
+      "last_access_ts": 1777129877952071,
+      "read_count_total": 1,
+      "last_7d_read_count": 1
+    }
+  },
+  "duration_us": 9
+}
+```
+
+`approx_store_mb` and `max_store_mb` pair so a client can compute headroom in one call. Per-scope `read_count_total` is the lifetime read count; `last_7d_read_count` is the rolling 7-day read count that drives `/delete-scope-candidates`.
