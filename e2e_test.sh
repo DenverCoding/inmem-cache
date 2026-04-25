@@ -391,6 +391,118 @@ call 'ts_range: inverted bounds'        400 GET    '/ts_range?scope=tsr&since_ts
 call 'ts_range: non-numeric since_ts'   400 GET    '/ts_range?scope=tsr&since_ts=notanumber'
 call 'ts_range: non-integer until_ts'   400 GET    '/ts_range?scope=tsr&until_ts=1.5'
 
+# --- /multi_call --------------------------------------------------------------
+# Sequential dispatch of N self-contained sub-calls in one HTTP roundtrip.
+# Each slot reflects what the standalone endpoint would have returned, so the
+# inner shapes are the same as their dedicated tests above — what we verify
+# here is the dispatcher: ordering, whitelist enforcement, count/body caps,
+# and the no-cross-call-atomicity contract.
+say '== multi_call =='
+
+# Wipe so /stats inside the batch sees a deterministic shape.
+call 'mc: wipe for clean slate'         200 POST   /wipe
+
+# Happy path: write, then read it back inside the same batch, then aggregate.
+# The /get at index 1 must see the /append from index 0 — proves sequential
+# dispatch (not parallel, not snapshot-isolated).
+call 'mc: mixed read/write/read'        200 POST   /multi_call \
+    '{"calls":[{"path":"/append","body":{"scope":"mc","id":"a","payload":{"v":1}}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/tail","query":{"scope":"mc","limit":10}},{"path":"/stats"}]}'
+case $LAST_BODY in
+    *'"ok":true'*'"count":4'*) okmsg 'mc: outer ok=true, count=4' ;;
+    *) bad "mc happy outer: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'"approx_response_mb"'*'"duration_us"'*) okmsg 'mc: outer envelope carries approx_response_mb + duration_us' ;;
+    *) bad "mc outer envelope shape: $LAST_BODY" ;;
+esac
+# Sub-call /get at index 1 must see the just-appended item — sequential dispatch.
+case $LAST_BODY in
+    *'"status":200'*'"hit":true'*'"seq":1'*) okmsg 'mc: /get inside batch saw the prior /append (sequential)' ;;
+    *) bad "mc sequential dispatch: $LAST_BODY" ;;
+esac
+# /stats sub-call must see the new scope as item_count:1 — proves writes
+# in earlier slots are visible to /stats in a later slot.
+case $LAST_BODY in
+    *'"mc"'*'"item_count":1'*) okmsg 'mc: /stats slot reflects in-batch write' ;;
+    *) bad "mc stats slot: $LAST_BODY" ;;
+esac
+
+# Empty calls array: 200 with count:0, results empty. N=0 calls produces
+# N=0 results — not an error.
+call 'mc: empty calls array'            200 POST   /multi_call '{"calls":[]}'
+case $LAST_BODY in
+    *'"ok":true'*'"count":0'*'"results":[]'*) okmsg 'mc: empty calls -> count=0, results=[]' ;;
+    *) bad "mc empty: $LAST_BODY" ;;
+esac
+
+# Missing 'calls' field is malformed input — distinct from explicitly empty.
+call 'mc: missing calls field'          400 POST   /multi_call '{}'
+call 'mc: malformed JSON'               400 POST   /multi_call '{"calls":['
+call 'mc: GET rejected'                 405 GET    /multi_call
+
+# Whitelist: /wipe is excluded (store-wide lock, doesn't compose with a
+# sequential dispatcher). The /get at index 0 must NOT execute — the whole
+# batch is rejected up-front.
+call 'mc: whitelist reject /wipe'       400 POST   /multi_call \
+    '{"calls":[{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/wipe"}]}'
+case $LAST_BODY in
+    *"calls[1]"*) okmsg 'mc: whitelist error names offending index' ;;
+    *) bad "mc whitelist error shape: $LAST_BODY" ;;
+esac
+
+# Each excluded endpoint individually: /warm, /rebuild, /wipe, /render,
+# /help, /multi_call self-reference — all 400.
+call 'mc: exclude /warm'                400 POST   /multi_call '{"calls":[{"path":"/warm","body":{"items":[]}}]}'
+call 'mc: exclude /rebuild'             400 POST   /multi_call '{"calls":[{"path":"/rebuild","body":{"items":[]}}]}'
+call 'mc: exclude /render'              400 POST   /multi_call '{"calls":[{"path":"/render","query":{"scope":"mc","id":"a"}}]}'
+call 'mc: exclude /help'                400 POST   /multi_call '{"calls":[{"path":"/help"}]}'
+call 'mc: exclude self /multi_call'     400 POST   /multi_call '{"calls":[{"path":"/multi_call","body":{"calls":[]}}]}'
+call 'mc: unknown path'                 400 POST   /multi_call '{"calls":[{"path":"/does-not-exist"}]}'
+
+# Count overflow: default cap is 10 sub-calls per batch. 11 must 400 with
+# the configured maximum visible in the error message.
+call 'mc: count overflow (11 > 10)'     400 POST   /multi_call \
+    '{"calls":[{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}},{"path":"/get","query":{"scope":"mc","id":"a"}}]}'
+case $LAST_BODY in
+    *'maximum is 10'*) okmsg 'mc: count overflow names the cap' ;;
+    *) bad "mc count error shape: $LAST_BODY" ;;
+esac
+
+# Side-effect non-rollback: an /append at slot 0 succeeds, an invalid /get
+# (missing id/seq) at slot 1 lands a 400 in its own slot. The batch keeps
+# running — there is no rollback. Verify both slot statuses *and* the post-
+# batch state.
+call 'mc: partial failure does not roll back'  200 POST   /multi_call \
+    '{"calls":[{"path":"/append","body":{"scope":"mcsticky","id":"alive","payload":{"v":1}}},{"path":"/get","query":{"scope":"mcsticky"}}]}'
+case $LAST_BODY in
+    *'"status":200'*'"status":400'*) okmsg 'mc: slot0=200 (write), slot1=400 (bad get)' ;;
+    *) bad "mc partial slots: $LAST_BODY" ;;
+esac
+# Post-batch the write must still be present.
+call 'mc: post-batch /get sees the write' 200 GET '/get?scope=mcsticky&id=alive'
+case $LAST_BODY in
+    *'"hit":true'*) okmsg 'mc: slot0 write survived the slot1 failure' ;;
+    *) bad "mc rollback check: $LAST_BODY" ;;
+esac
+
+# Query coercion: numbers and booleans in the query map are passed through as
+# raw URL-query values. limit:2 must actually cap the /tail to 2 items.
+i=1; while [ $i -le 5 ]; do
+    req POST /append "{\"scope\":\"mcq\",\"id\":\"q$i\",\"payload\":$i}" >/dev/null
+    i=$((i+1))
+done
+call 'mc: number query value (limit:2)' 200 POST   /multi_call \
+    '{"calls":[{"path":"/tail","query":{"scope":"mcq","limit":2}}]}'
+case $LAST_BODY in
+    *'"status":200'*'"count":2'*'"truncated":true'*) okmsg 'mc: number query coerced -> /tail limit=2 honoured' ;;
+    *) bad "mc query coercion: $LAST_BODY" ;;
+esac
+
+# Nested object in a query value would silently lose shape when flattened
+# to a URL query string — rejected for the whole batch.
+call 'mc: nested query value rejected'  400 POST   /multi_call \
+    '{"calls":[{"path":"/get","query":{"scope":{"nested":true}}}]}'
+
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='
 call 'wipe'                             200 POST   /wipe
