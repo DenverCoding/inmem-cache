@@ -599,13 +599,29 @@ with two extra steps:
   never leaves the cache. (The strip is parse-and-walk, not
   string-replace, so a payload that happens to contain the prefix
   literal is left untouched.)
-- **Usage counters.** After each request the cache calls `counterAdd`
-  on two reserved scopes — `_counters_count_calls` (one per
-  `capability_id` per request) and `_counters_count_kb` (KiB of
-  outer-envelope response bytes per request). Both scopes auto-create
-  on first use via `ensureScope` and are queryable through `/admin`
-  `/tail` for usage tracking. Counter failures are silently ignored —
-  this is observability, not auth.
+- **Usage counters.** After each successful `/guarded` request the cache
+  calls `counterAdd` on two reserved scopes:
+    - `_counters_count_calls`, item id = `<capability_id>`, value
+      `+= len(calls)` — one unit per *sub-call*, not per HTTP request.
+      A batch of 5 sub-calls counts the same as 5 solo `/guarded`
+      requests, so a tenant who batches their work cannot hide it.
+    - `_counters_count_kb`, item id = `<capability_id>`, value
+      `+= ⌊response_bytes / 1024⌋`, where `response_bytes` is the
+      outer envelope's body size including all slot bodies. The
+      increment is skipped entirely when the rounded KiB value is `0`
+      so the counter never tries to `counterAdd` with `by: 0`
+      (which would `400`).
+  Both counters are monotonic and have no built-in reset endpoint — to
+  zero a `<capability_id>` the operator runs `/admin /upsert` on the
+  counter scope with `payload: 0` (or `/admin /delete_scope` to wipe
+  every tenant's counter at once). Whole-batch rejections (missing
+  token, whitelist miss, scope not provisioned) increment nothing —
+  they `return` before the dispatch loop. Counter failures inside the
+  loop are silently ignored — this is observability, not auth, and
+  must not affect the tenant's response. Both scopes auto-create on
+  first use via `ensureScope` and survive `/wipe` (the next `/guarded`
+  call re-creates them); they are queryable through `/admin /tail` or
+  `/admin /get`.
 
 Failure modes:
 
@@ -1683,12 +1699,71 @@ noted):
 After each successful `/guarded` request, two reserved scopes get an
 atomic counter increment:
 
-- `_counters_count_calls`, item id = `<capability_id>`, value += 1
-- `_counters_count_kb`, item id = `<capability_id>`, value += response
-  KiB
+- `_counters_count_calls`, item id = `<capability_id>`, value
+  `+= len(calls)` — one unit per sub-call, not per HTTP request.
+- `_counters_count_kb`, item id = `<capability_id>`, value
+  `+= ⌊response_bytes / 1024⌋` — outer envelope body size including
+  all slot bodies. Increment skipped when the rounded value is `0`.
 
 Both scopes auto-create on first hit and survive `/wipe` (next call
-auto-recreates them). Operators read them via `/admin` `/tail` for
-per-tenant usage tracking. Counter writes are best-effort — a counter
-failure is silently swallowed and does not affect the tenant's
-response, since this is an observability signal, not auth.
+auto-recreates them). Counters are monotonic — to zero a
+`capability_id` the operator runs `/admin /upsert` with `payload: 0`
+(or `/admin /delete_scope` to wipe every tenant's counter at once).
+Counter writes are best-effort: a counter failure is silently swallowed
+and does not affect the tenant's response, since this is an
+observability signal, not auth.
+
+Reading per-tenant usage end-to-end. Operator queries the calls counter
+for one `capability_id`:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "calls": [
+      { "path": "/get", "query": {
+          "scope": "_counters_count_calls",
+          "id":    "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3"
+      }}
+    ]
+  }'
+```
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "results": [
+    {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "hit": true,
+        "count": 1,
+        "item": {
+          "scope":   "_counters_count_calls",
+          "id":      "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3",
+          "seq":     1,
+          "payload": 47
+        },
+        "duration_us": 4
+      }
+    }
+  ],
+  "duration_us": 92,
+  "approx_response_mb": 0.0002
+}
+```
+
+`payload: 47` means this `capability_id` has dispatched 47 sub-calls
+through `/guarded` since the counter scope was last reset. Pair with a
+`/get` on `_counters_count_kb` for byte-level usage. Use `/tail` (or
+`/admin /tail` since the scope is reserved) to enumerate every active
+capability_id at once when building a billing report or hunting an
+abusive tenant.
+
+Scopecache does not enforce a quota itself — there is no "calls/day"
+cap, no `429 Too Many Requests`, no automatic suspension. Counters are
+raw signal; rate-limiting and suspension live in whatever process polls
+them (cron job that compares against per-tenant budgets, dashboard, or
+an upstream API gateway).

@@ -530,7 +530,25 @@ Response (the `scope` in the slot's `item` reads `"events"` — the prefix is st
 }
 ```
 
-Whitelist excludes `/delete_scope` (a tenant cannot deprovision their own namespace), `/stats` and `/delete_scope_candidates` (cross-tenant visibility), and every store-wide op. After each successful request the cache atomically increments two reserved scopes — `_counters_count_calls` and `_counters_count_kb`, item id = `<capability_id>` — for usage tracking; both auto-create on first use and are queryable via `/admin` `/tail`.
+Whitelist excludes `/delete_scope` (a tenant cannot deprovision their own namespace), `/stats` and `/delete_scope_candidates` (cross-tenant visibility), and every store-wide op.
+
+After each successful request the cache atomically increments two reserved scopes for per-tenant usage tracking:
+
+- `_counters_count_calls`, item id = `<capability_id>`, `+= len(calls)` — **one unit per sub-call**, not per HTTP request, so a tenant who batches 5 sub-calls into one `/guarded` call counts the same as a tenant making 5 solo calls.
+- `_counters_count_kb`, item id = `<capability_id>`, `+= ⌊response_bytes / 1024⌋` — outer envelope size, skipped when it rounds to `0`.
+
+Both scopes auto-create on first use, survive `/wipe`, and are monotonic (no built-in reset — operator zeroes a tenant via `/admin /upsert` with `payload: 0`). Read one tenant's call count:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{"calls":[{"path":"/get","query":{
+      "scope": "_counters_count_calls",
+      "id":    "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3"
+  }}]}'
+```
+
+The slot's `body.item.payload` is the total sub-call count for that `capability_id`. Counters are raw signal — scopecache does not enforce quotas, return `429`, or suspend tenants on its own. Rate-limiting and billing decisions live in whatever process polls these counters.
 
 `/guarded` is registered only when `SCOPECACHE_SERVER_SECRET` is set. Unset → the route is not in the mux, `POST /guarded` returns `404`. See [§6.4](scopecache-rfc.md) and [§13.22-13.23](scopecache-rfc.md) of the spec for the full contract and worked examples.
 
