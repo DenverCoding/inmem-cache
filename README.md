@@ -91,7 +91,7 @@ Three layers with clear boundaries:
 
 - **Core** — `package scopecache`. The cache engine itself. Stdlib-only, framework-agnostic, caller-anonymous: it registers HTTP routes on a standard `*http.ServeMux` and knows nothing about auth, identity, or who is calling. This is what the [spec](scopecache-rfc.md) describes.
 - **Standalone adapter** — `cmd/scopecache/`. Thin binary that reads env vars, opens a Unix socket, and serves the core. What you use if you're running behind nginx/apache, or with no reverse proxy at all.
-- **Caddy-module adapter** — `caddymodule/` (Phase 3). Published as a separate Go module (`github.com/VeloxCoding/scopecache/caddymodule`) so consumers of the core never pull in Caddy's dep tree. Wraps the core as a Caddy HTTP handler (`http.handlers.scopecache`), exposed in Caddyfile syntax and JSON config. This is also the home for cross-cutting concerns that require request context: auth enforcement, identity-to-scope mapping, per-tenant logging and metrics.
+- **Caddy-module adapter** — `caddymodule/`. Published as a separate Go module (`github.com/VeloxCoding/scopecache/caddymodule`) so consumers of the core never pull in Caddy's dep tree. Wraps the core as a Caddy HTTP handler (`http.handlers.scopecache`), exposed in Caddyfile syntax and JSON config. This is also the home for cross-cutting concerns that require request context: auth enforcement, identity-to-scope mapping, per-tenant logging and metrics.
 
 The rule: new **cache features** go into the core. **Cross-cutting concerns** (auth, identity, per-tenant policy) go into an adapter. This keeps the core small and refactorable, keeps both adapters symmetrical, and means cache semantics cannot drift between standalone and Caddy deployments.
 
@@ -115,7 +115,7 @@ The same `xcaddy --with github.com/VeloxCoding/scopecache/caddymodule@vX.Y.Z` bu
 
 ## Status
 
-Phase 3 — core in `package scopecache` (repo root), standalone binary in `cmd/scopecache/`, Caddy adapter in `caddymodule/` (its own Go module so the core stays stdlib-only for non-Caddy consumers).
+Phase 4 — testing, benchmarking, and real-life validation under realistic workloads. The core (`package scopecache` at the repo root), the standalone binary (`cmd/scopecache/`), and the Caddy adapter (`caddymodule/`, its own Go module so the core stays stdlib-only for non-Caddy consumers) are all shipping on tagged releases. New features are admitted only when measurement exposes a design gap; expect bug fixes, clarity improvements, and benchmarking work before the v1.0 API freeze. See [scopecache-rfc.md §9](scopecache-rfc.md) for the phase model in full.
 
 ## Deployment modes
 

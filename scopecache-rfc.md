@@ -99,6 +99,9 @@ separate, cache-owned, and surfaces only in `/stats` and
 - per-request body cap (single-item endpoints `/append`, `/update`, `/upsert`, `/counter_add`, `/delete`, `/delete_scope`, `/delete_up_to`): **derived at startup from the configured per-item cap** — `item_cap + 4 KiB`. The 4 KiB overhead covers JSON framing (keys, quotes, braces) on top of the item bytes; scope and id bytes themselves are already counted inside `approxItemSize`. Raising `SCOPECACHE_MAX_ITEM_MB` raises this cap in lockstep.
 - counter value range: `±(2^53 − 1) = ±9,007,199,254,740,991`. This matches the JavaScript safe-integer range so counter values round-trip through every JSON client without precision loss. It applies to `by`, to the existing counter value, and to the result of `/counter_add`.
 - per-request body cap (bulk endpoints `/warm`, `/rebuild`): **derived at startup from the configured store cap** — roughly `store_cap + 10% + 16 MiB`. This guarantees a fully-loaded cache can always be expressed in one bulk request, with headroom for JSON framing. Concretely: default 100 MiB store → ~126 MiB request cap; `SCOPECACHE_MAX_STORE_MB=1024` → ~1.15 GiB request cap.
+- per-response cap: `25 MiB` by default, overridable via the `SCOPECACHE_MAX_RESPONSE_MB` environment variable (integer MiB). Applies uniformly to every HTTP response, including `/multi_call`'s outer envelope. Responses that would exceed the cap are rejected with `507`; already-applied side effects are not rolled back (same stance as every other `507` in this cache). Bounds pathological responses from `/tail?limit=10000` over 1 MiB items, multi-tenant `/stats` enumeration, and accumulated `/multi_call` aggregates.
+- per-request body cap (`/multi_call` input): `16 MiB` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_MB` environment variable (integer MiB). Independent of the per-response cap (input vs. output are separate concerns).
+- per-batch sub-call count (`/multi_call`): `10` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_COUNT` environment variable. Bounds dispatcher work per HTTP request; batches over the cap return `400` for the whole batch (no partial dispatch).
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
 
@@ -530,18 +533,27 @@ durable acknowledgment. The cache is deliberately disposable; see §1.
 
 ---
 
-## 9. Implementation priorities
+## 9. Implementation status
 
-Phase 1 (current) — standalone `package main` HTTP server on a Unix socket.
-API surface, capacity model, and scope heat/access metadata are stable.
+Phase 4 (current) — testing, benchmarking, and real-life validation. The
+core, the standalone binary, and the Caddy module are functionally complete
+and shipping on tagged releases (`vX.Y.Z` for the core,
+`caddymodule/vX.Y.Z` for the adapter). API surface, capacity model, and
+scope heat/access metadata are stable. The phase exists to stress the
+design under realistic workloads before the v1.0 freeze; new features are
+admitted only when measurement exposes a design gap. `/multi_call` (§6.3)
+is one such addition: a fan-out workload in the phase-4 harness paid
+~3 ms × N HTTP roundtrips on loopback while the cache itself answered each
+sub-call in microseconds, so collapsing N calls into one was a clean
+core-level fix.
 
-Next:
+Earlier phases are complete:
 
-1. Client-side helpers (PHP first): `/head`-loop dump to JSONL file, and
-   warm-/rebuild-from-file that wraps JSONL into `{"items":[...]}` on the wire.
-2. Phase 3: convert to a Caddy module (`package scopecache`,
-   `caddy.RegisterModule()`, `Provision` / `Validate` / `Cleanup`).
-   No API changes; the HTTP surface is reused.
+1. Phase 1 — flat standalone, single `package main`.
+2. Phase 2 — core/cmd split, core in `package scopecache`, standalone in
+   `cmd/scopecache/`. Stdlib-only.
+3. Phase 3 — Caddy-module split-out, `caddymodule/` lives in its own Go
+   submodule so the core graph stays stdlib-only for non-Caddy consumers.
 
 Out of scope (by design):
 
@@ -583,7 +595,7 @@ The stress harness drives a realistic mix of reads, appends, upserts, counter in
 
 **Where `scopecache` wins**
 
-- **Operational simplicity.** One Go binary; Phase 3 embeds it in Caddy so there are zero extra processes. No `redis.conf`, AOF/RDB, or eviction policies. Unix socket only — no TCP, auth, ACLs, or TLS.
+- **Operational simplicity.** One Go binary; the Caddy module embeds the same core in-process so there are zero extra processes when fronted by Caddy. No `redis.conf`, AOF/RDB, or eviction policies. Unix socket only — no TCP, auth, ACLs, or TLS.
 - **Domain fit.** The `scope/id/seq` model maps directly to how clients use the cache, with no translation to generic primitives. `/warm` and `/rebuild` are atomic all-or-nothing in a single call where Redis needs MULTI/EXEC or Lua. Scope-level read-heat and `/delete_scope_candidates` ranking are built in.
 - **Debuggability.** HTTP + JSON. `curl` works, every language already speaks it, no client-library versioning.
 - **Predictable-when-full behaviour.** The cache never evicts on its own. Writes past a cap return `507` with exact numbers (`approx_store_mb`, `added_mb`, `max_store_mb`); clients free space via `/delete_up_to`, `/delete_scope`, or a fitting `/warm`/`/rebuild`.
