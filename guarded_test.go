@@ -186,6 +186,37 @@ func TestGuarded_PrefixInjectionAttempt(t *testing.T) {
 	}
 }
 
+// A scope_not_provisioned reject must leave the store untouched — no
+// side effect, in particular no lazy scope creation. Guards against a
+// future regression that swaps the pre-dispatch existence check from
+// getScope() (read-only) to ensureScope() (creates), which would let
+// any token holder fill the store with empty buffers by spamming
+// non-provisioned scope names.
+func TestGuarded_RejectLeavesNoSideEffect(t *testing.T) {
+	h, api := newTestHandler(10)
+	provisionTenantScope(t, h, "tok-noside", "events")
+	capID := computeCapForTest(testServerSecret, "tok-noside")
+	rewritten := "_guarded:" + capID + ":ghosts"
+
+	// Tenant has 'events' provisioned but not 'ghosts'. Attempting to
+	// /append into 'ghosts' must be rejected.
+	body := `{"token":"tok-noside","calls":[{"path":"/append","body":{"scope":"ghosts","id":"x","payload":1}}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400, body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "not provisioned") {
+		t.Errorf("expected scope_not_provisioned, got: %s", raw)
+	}
+
+	// Store check: the rewritten scope must still not exist. If a
+	// regression swapped getScope() for ensureScope() in the existence
+	// check, this assertion fires.
+	if _, ok := api.store.getScope(rewritten); ok {
+		t.Errorf("rejected /append created scope %q as a side effect", rewritten)
+	}
+}
+
 // --- whitelist enforcement ----------------------------------------------------
 
 func TestGuarded_WhitelistMiss(t *testing.T) {

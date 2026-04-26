@@ -675,6 +675,25 @@ case $LAST_BODY in
     *) bad "gd: expected scope_not_provisioned: $LAST_BODY" ;;
 esac
 
+# Side-effect-free reject: a legit tenant trying to write to a scope
+# they never had provisioned must NOT cause the cache to lazily create
+# the scope. This guards against a future regression that swaps the
+# pre-dispatch existence check from getScope() (read-only) to
+# ensureScope() (creates) — that swap would let any token holder fill
+# the store with empty buffers by spamming non-provisioned scope names.
+guarded_call 'gd: write to unprovisioned scope rejected' 400 "$TENANT_A_TOKEN" /append \
+    '{"scope":"ghosts","id":"x","payload":1}'
+case $LAST_BODY in
+    *'not provisioned'*) okmsg 'gd: ghosts scope rejected with scope_not_provisioned' ;;
+    *) bad "gd: expected scope_not_provisioned for ghosts: $LAST_BODY" ;;
+esac
+admin_call_query 'gd: post-reject scope still absent' 200 /get \
+    "{\"scope\":\"_guarded:${TENANT_A_CAP}:ghosts\",\"id\":\"x\"}"
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: rejected /append did not lazily create the scope' ;;
+    *) bad "gd: rejected /append leaked a side effect: $LAST_BODY" ;;
+esac
+
 # Whitelist enforcement: /wipe inside /guarded is rejected.
 call 'gd: rejects /wipe sub-call'         400 POST /guarded \
     "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/wipe\"}]}"
