@@ -280,6 +280,33 @@ func TestGuarded_RejectsBodyAndQueryScopeSmuggle(t *testing.T) {
 	}
 }
 
+// /guarded shares the pre-flight response-cap check with /multi_call.
+// Runs before the token check so an undersized cap surfaces directly,
+// not as a misleading 401.
+func TestGuarded_TinyResponseCapRejectedPreflight(t *testing.T) {
+	api := NewAPI(NewStore(Config{
+		ScopeMaxItems:     10,
+		MaxStoreBytes:     100 << 20,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  200,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+		ServerSecret:      "test-secret",
+	}))
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// No token, no scope provisioning — pre-flight must fire first.
+	body := `{"token":"any","calls":[{"path":"/get","query":{"scope":"events","id":"a"}}]}`
+	code, out, raw := doRequest(t, mux, "POST", "/guarded", body)
+	if code != http.StatusInsufficientStorage {
+		t.Fatalf("code=%d want 507, body=%s", code, raw)
+	}
+	if errStr, _ := out["error"].(string); !strings.Contains(errStr, "response cap too small") {
+		t.Errorf("error message does not name the cap: %s", raw)
+	}
+}
+
 // /guarded runs prepareSubCalls AFTER scope rewrite, so a malformed
 // query at calls[k] still rejects the whole batch before calls[0..k-1]
 // commit. Same regression class as the /multi_call and /admin tests.

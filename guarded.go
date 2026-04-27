@@ -153,6 +153,13 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-flight response cap (see preflightResponseCap doc). Runs
+	// before the token check so a misconfigured tenant doesn't think
+	// auth failed when the real issue is operator-side cap sizing.
+	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
+		return
+	}
+
 	// Step 2: extract token.
 	if req.Token == "" {
 		writeJSONWithDuration(w, http.StatusUnauthorized, orderedFields{

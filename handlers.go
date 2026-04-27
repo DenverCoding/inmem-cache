@@ -1324,11 +1324,19 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/help", api.handleHelp)
 	mux.HandleFunc("/delete_scope_candidates", api.handleDeleteScopeCandidates)
-	mux.HandleFunc("/multi_call", api.capResponse(api.handleMultiCall))
+	// /multi_call, /admin and /guarded are NOT wrapped with capResponse:
+	// they manage the per-response cap themselves via preflightResponseCap
+	// (rejects batches the cap can't fit) plus the per-slot trim mechanism
+	// (replaces oversized slot bodies with response_truncated markers).
+	// Wrapping them again would buffer the whole envelope twice and turn
+	// the pre-flight 507's specific error message into the wrapper's
+	// generic "response would exceed maximum" — losing the actionable
+	// guidance to either raise the cap or reduce the call count.
+	mux.HandleFunc("/multi_call", api.handleMultiCall)
 	// Admin-elevated endpoint. /wipe, /warm, /rebuild, /delete_scope are
 	// reachable only via /admin (their handler functions still exist;
 	// they're removed from the public mux). See guardedflow.md §J, §K.
-	mux.HandleFunc("/admin", api.capResponse(api.handleAdmin))
+	mux.HandleFunc("/admin", api.handleAdmin)
 	// Tenant-facing /guarded gateway. Registered only when the operator
 	// configured a server secret — without one, HMAC computation would
 	// produce identical capability_ids for every token, defeating
@@ -1341,6 +1349,6 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	// way. Eager provisioning would clutter `/stats` for operators who
 	// haven't yet seen any /guarded traffic.
 	if api.store.serverSecret != "" {
-		mux.HandleFunc("/guarded", api.capResponse(api.handleGuarded))
+		mux.HandleFunc("/guarded", api.handleGuarded)
 	}
 }

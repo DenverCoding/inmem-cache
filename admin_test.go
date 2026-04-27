@@ -80,6 +80,36 @@ func TestAdmin_WhitelistMissRejectsBatch(t *testing.T) {
 	}
 }
 
+// /admin shares the pre-flight response-cap check with /multi_call. A
+// pathologically small MaxResponseBytes must be rejected upfront with
+// 507 (no side effects), not after dispatch when the wrapper would
+// erase per-slot status.
+func TestAdmin_TinyResponseCapRejectedPreflight(t *testing.T) {
+	api := NewAPI(NewStore(Config{
+		ScopeMaxItems:     10,
+		MaxStoreBytes:     100 << 20,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  200,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+		ServerSecret:      "test-secret",
+	}))
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	body := `{"calls":[{"path":"/upsert","body":{"scope":"_test:x","id":"a","payload":1}}]}`
+	code, out, raw := doRequest(t, mux, "POST", "/admin", body)
+	if code != http.StatusInsufficientStorage {
+		t.Fatalf("code=%d want 507, body=%s", code, raw)
+	}
+	if errStr, _ := out["error"].(string); !strings.Contains(errStr, "response cap too small") {
+		t.Errorf("error message does not name the cap: %s", raw)
+	}
+	if _, ok := api.store.getScope("_test:x"); ok {
+		t.Errorf("preflight reject leaked side effect: scope created")
+	}
+}
+
 // /admin runs through the same prepareSubCalls pre-pass as /multi_call,
 // so a malformed query at calls[k] must reject the whole batch before
 // calls[0..k-1] commit. Same regression class as the /multi_call test.

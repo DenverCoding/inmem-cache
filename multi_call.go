@@ -192,7 +192,45 @@ func prepareSubCalls(calls []multiCallEntry, specs map[string]subCallSpec) ([]pr
 const (
 	multiCallEnvelopeOverhead = 256
 	multiCallSlotOverhead     = 32
+	// multiCallMaxTrimMarkerSize is the byte length of the largest
+	// truncation marker (multiCallErrorTrim, currently 38 bytes) plus a
+	// small slack. The pre-flight check uses it to verify that the
+	// per-response cap can fit at minimum an all-trimmed envelope —
+	// otherwise the trim mechanism cannot guarantee the outer response
+	// stays under cap, and the wrapper would 507 the whole envelope
+	// after slot-by-slot side effects already landed.
+	multiCallMaxTrimMarkerSize = 40
 )
+
+// minMultiCallResponseSize returns the lower bound on the outer
+// envelope's wire size for a batch of n sub-calls — the size produced
+// when every slot's body has been trimmed to its `response_truncated`
+// marker. If respCap is below this, even the trim mechanism cannot
+// keep the response under cap, and the dispatcher must reject the
+// whole batch up-front before any side effect lands.
+func minMultiCallResponseSize(n int) int64 {
+	return multiCallEnvelopeOverhead + int64(n)*(multiCallSlotOverhead+multiCallMaxTrimMarkerSize)
+}
+
+// preflightResponseCap returns true when respCap is too small to fit
+// even an all-trimmed envelope for a batch of n sub-calls. The caller
+// rejects with 507 and the canonical store-cap error shape, naming
+// the minimum size the response would need vs. the configured cap so
+// the operator can either raise SCOPECACHE_MAX_RESPONSE_MB or shrink
+// the batch.
+func preflightResponseCap(w http.ResponseWriter, started time.Time, n int, respCap int64) bool {
+	minSize := minMultiCallResponseSize(n)
+	if minSize <= respCap {
+		return false
+	}
+	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
+		{"ok", false},
+		{"error", "response cap too small to dispatch this batch even with every slot trimmed; raise SCOPECACHE_MAX_RESPONSE_MB or reduce the call count"},
+		{"approx_response_mb", MB(minSize)},
+		{"max_response_mb", MB(respCap)},
+	}, started)
+	return true
+}
 
 // handleMultiCall dispatches N self-contained sub-calls through the
 // existing API handlers and assembles the outer JSON envelope. See
@@ -218,6 +256,18 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 	calls := *req.Calls
 	if len(calls) > api.store.maxMultiCallCount {
 		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
+		return
+	}
+
+	// Pre-flight: if the per-response cap is too small to fit even an
+	// all-trimmed envelope for this batch size, reject with 507 before
+	// any sub-call runs. Without this check the dispatch loop runs and
+	// every slot trims to a marker, but the accumulated response can
+	// still exceed respCap — the outer capResponse wrapper then 507's
+	// the whole envelope after side effects already landed, and the
+	// client loses the per-slot status info that's the whole point of
+	// /multi_call.
+	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
 		return
 	}
 

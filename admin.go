@@ -75,6 +75,11 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-flight response cap (see preflightResponseCap doc).
+	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
+		return
+	}
+
 	// Pre-validate the whitelist. Same stance as /multi_call: a bad
 	// path in any slot rejects the whole batch up-front.
 	for i, call := range calls {

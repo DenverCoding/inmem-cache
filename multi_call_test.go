@@ -282,6 +282,43 @@ func TestMultiCall_QueryNestedRejected(t *testing.T) {
 	}
 }
 
+// Pre-flight: when MaxResponseBytes is too small to fit even an
+// all-trimmed envelope for the requested batch size, /multi_call must
+// reject with 507 BEFORE any sub-call runs. Without this the dispatch
+// loop would land side effects, the trim mechanism would still
+// produce more bytes than respCap, and the outer capResponse wrapper
+// would 507 the whole envelope — losing all per-slot status info that
+// is the whole point of /multi_call.
+func TestMultiCall_TinyResponseCapRejectedPreflight(t *testing.T) {
+	// 200 bytes is below minMultiCallResponseSize for any non-trivial
+	// batch (envelope ~256 alone). Single /append batch easily trips it.
+	api := NewAPI(NewStore(Config{
+		ScopeMaxItems:     10,
+		MaxStoreBytes:     100 << 20,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  200,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+		ServerSecret:      "test-secret",
+	}))
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	body := `{"calls":[{"path":"/append","body":{"scope":"x","id":"a","payload":1}}]}`
+	code, out, raw := doRequest(t, mux, "POST", "/multi_call", body)
+	if code != http.StatusInsufficientStorage {
+		t.Fatalf("code=%d want 507 (preflight cap), body=%s", code, raw)
+	}
+	if errStr, _ := out["error"].(string); !strings.Contains(errStr, "response cap too small") {
+		t.Errorf("error message does not name the response cap: %s", raw)
+	}
+
+	// Side-effect-free: the scope must not have been created.
+	if _, ok := api.store.getScope("x"); ok {
+		t.Errorf("preflight reject leaked side effect: scope x was created")
+	}
+}
+
 // Pre-fix /multi_call validated the path whitelist up-front but built
 // each subURL inside the dispatch loop. A malformed query on calls[k]
 // then 400'd the whole batch only after calls[0..k-1] had committed.
