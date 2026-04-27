@@ -423,6 +423,27 @@ call 'tail limit=5 offset=5 (oldest)'   200 GET    '/tail?scope=tail10&limit=5&o
 json_assert 'tail offset=5: items[].id == [t1..t5]' '[.items[].id] == ["t1","t2","t3","t4","t5"]'
 json_assert 'tail offset=5: items[].seq == [1..5]' '[.items[].seq] == [1,2,3,4,5]'
 
+# Cross-field consistency on a fresh scope: 10 appends produce
+# count=10 and three parallel arrays (id, seq, payload) that all
+# agree on the same row index. The bestaande appn-test only checks
+# item_count via /stats — that would still pass if seq numbering
+# rewound, if a row was dropped and another duplicated, or if
+# payload landed against the wrong id. This jq filter pins all four
+# invariants in one assertion: a single regression on any of them
+# fails the line.
+i=1
+while [ $i -le 10 ]; do
+    quiet_call "exact10 /append #$i" 200 POST /append "{\"scope\":\"exact10\",\"id\":\"a$i\",\"payload\":$i}"
+    i=$((i+1))
+done
+call 'exact10: head limit=10' 200 GET '/head?scope=exact10&limit=10'
+json_assert 'exact10: count + ids + seqs + payloads all align' '
+    .count == 10 and
+    [.items[].id] == ["a1","a2","a3","a4","a5","a6","a7","a8","a9","a10"] and
+    [.items[].seq] == [1,2,3,4,5,6,7,8,9,10] and
+    [.items[].payload] == [1,2,3,4,5,6,7,8,9,10]
+'
+
 # --- ts_range filtering ------------------------------------------------------
 # The top-level `ts` is client-supplied (signed int64). Items without `ts`
 # must be excluded from every /ts_range response; bounds are inclusive;
