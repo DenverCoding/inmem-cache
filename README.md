@@ -143,7 +143,7 @@ scopecache supports two ways to apply this pattern. They are deployable separate
 
 **1. Reverse-proxy rewrite (no `server_secret` needed).** The integrator does the scope rewrite outside the cache. Application server issues a bearer token, client returns it on each request, Caddy/nginx prepends it to the scope before forwarding. A client `GET /render?scope=privatethread:432` carrying `Authorization: Bearer aaa-bbb-ccc` reaches scopecache as `GET /render?scope=aaa-bbb-ccc:privatethread:432`. The cache sees only opaque scope strings; the token never appears in cache logic. The Caddy helper `scopecache_bearer_prefix` ([Helpers](#helpers-optional-caddy-middleware)) automates this rewrite. Fits when you already have a proxy doing token validation, when public reads need to be cacheable at the proxy layer, or when integrators want full control over the prefix shape.
 
-**2. Built-in `/guarded` gateway (requires `server_secret`).** scopecache itself does the rewrite. Tenant POSTs to `/guarded` with `{"token": "...", "calls": [...]}`; the cache derives a deterministic 64-hex `capability_id = HMAC_SHA256(server_secret, token)` and rewrites every sub-call's scope to `_guarded:<capability_id>:<original-scope>`. The rewritten scope must already exist in the store (operator pre-provisions it via `/admin`) or the whole batch is rejected — possession of *any* token is not enough; only tokens whose HMAC names a provisioned scope can land. Responses get the prefix stripped before the tenant sees them. Fits when no proxy is doing token validation, when revocation is needed (delete the provisioned scope and the token is dead), or when usage tracking per token is wanted (the cache auto-counts calls and KiB per `capability_id`). See [Multi-tenant gateways](#multi-tenant-gateways) below for curl examples and the [spec §6.4](scopecache-rfc.md) for the full contract.
+**2. Built-in `/guarded` gateway (requires `server_secret`).** scopecache itself does the rewrite. Tenant POSTs to `/guarded` with `{"token": "...", "calls": [...]}`; the cache derives a deterministic 64-hex `capability_id = HMAC_SHA256(server_secret, token)` and rewrites every sub-call's scope to `_guarded:<capability_id>:<original-scope>`. Auth is gated by a single lookup in the reserved `_tokens` scope: an item with `id = capability_id` must exist there, otherwise the batch rejects with `400 tenant_not_provisioned`. Operator manages `_tokens` membership at token issuance (`/admin /upsert`) and revocation (`/admin /delete`). Within their own `_guarded:<capability_id>:*` namespace tenants self-organize freely — no per-scope operator approval; the underlying scope buffer auto-creates on first /append. Responses get the prefix stripped before the tenant sees them. Fits when no proxy is doing token validation, when revocation must be cache-side immediate (one item delete), or when per-tenant usage tracking is wanted (the cache auto-counts calls and KiB per `capability_id`). See [Multi-tenant gateways](#multi-tenant-gateways) below for curl examples and the [spec §6.4](scopecache-rfc.md) for the full contract.
 
 The two patterns compose: a deployment can let internal services use the proxy-rewrite path (cheap, cacheable) while exposing `/guarded` to external API tenants (revocable, usage-tracked).
 
@@ -495,10 +495,10 @@ Contract: hit returns `200` with the raw payload bytes; miss returns `404` with 
 Same `{"calls": [...]}` body and `{"results": [...]}` response as `/multi_call`. Three things make it different:
 
 - **Wider whitelist.** Includes the four operator-only paths that no longer live on the public mux (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`), plus everything `/multi_call` allows.
-- **Reaches reserved scopes.** Scope names beginning with `_` are blocked on every public endpoint (and on `/guarded`). `/admin` is the one path that can write them — that is how the operator provisions tenant namespaces (`_guarded:<capability_id>:*`) for `/guarded` to hand out.
+- **Reaches reserved scopes.** Scope names beginning with `_` are blocked on every public endpoint (and on `/guarded`). `/admin` is the one path that can write them — that is how the operator manages the `_tokens` auth-gate that gates `/guarded` (one item per active tenant, keyed by `capability_id`).
 - **No body-level auth.** `/admin` trusts that whoever reached the listener was authorised to do so. The deployment story is socket-permission-based on the standalone binary, and Caddyfile-route-restricted on the module path (`@operator { client_ip 10.0.0.0/8 } handle /admin { ... }` or similar). Treat the `/admin` path the same way you would treat root access to `/etc`: gated outside the cache, by the same boundary that gates the rest of the deployment.
 
-Provision a tenant scope:
+Register a tenant in the auth-gate (one call per token issuance):
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
@@ -506,13 +506,23 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
   -d '{
     "calls": [
       { "path": "/upsert", "body": {
-          "scope":   "_guarded:14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3:events",
-          "id":      "_provisioned",
-          "payload": { "t": 1 }
+          "scope":   "_tokens",
+          "id":      "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3",
+          "payload": { "user_id": 42, "issued_at": "2026-04-27T..." }
       }}
     ]
   }'
 ```
+
+Revoke a tenant (one call):
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{"calls":[{"path":"/delete","body":{"scope":"_tokens","id":"14071b…"}}]}'
+```
+
+The `id` is the tenant's `capability_id` — `hex(HMAC_SHA256(server_secret, token))`, computed by the operator the same way `/guarded` does at request time. Item payload is opaque to the cache; operators commonly store user metadata there for their own bookkeeping.
 
 Wipe the store (`/wipe` is reachable only here):
 
@@ -530,9 +540,9 @@ Body shape:
 { "token": "<opaque token>", "calls": [{ "path": "/append", "body": {...} }, ...] }
 ```
 
-For each request the cache derives `capability_id = HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token)` (64-char lowercase hex), rewrites every sub-call's `scope` to `_guarded:<capability_id>:<original-scope>`, and verifies that scope already exists. If it does not — because the operator never provisioned it for this token — the whole batch is rejected with `400 scope_not_provisioned` and no sub-call runs. Possession of *any* token is not enough; only tokens whose HMAC names a provisioned scope can land. Response bodies have the prefix stripped before the tenant sees them; the rewritten form never leaves the cache.
+For each request the cache derives `capability_id = HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token)` (64-char lowercase hex). Auth is then a single lookup in the reserved `_tokens` scope: an item with `id = capability_id` must exist there. If not, the whole batch is rejected with `400 tenant_not_provisioned` and no sub-call runs. Operator manages `_tokens` membership at token issuance and revocation. After the auth-gate passes, every sub-call's `scope` is rewritten to `_guarded:<capability_id>:<original-scope>`; the underlying scope buffer auto-creates on first /append, so tenants self-organize within their own prefix without per-scope operator approval. Response bodies have the prefix stripped before the tenant sees them; the rewritten form never leaves the cache.
 
-Append (after the operator has provisioned `_guarded:14071b…:events` via `/admin` above):
+Append (after the operator has registered the tenant in `_tokens` — see [§13.22](scopecache-rfc.md) for the operator flow):
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/guarded \

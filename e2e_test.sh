@@ -607,14 +607,15 @@ call 'admin: public /warm is 404'        404 POST   /warm '{"items":[]}'
 call 'admin: public /rebuild is 404'     404 POST   /rebuild '{"items":[{"scope":"x","payload":1}]}'
 call 'admin: public /delete_scope 404'   404 POST   /delete_scope '{"scope":"x"}'
 
-# /admin can write to reserved scopes (provisions a tenant namespace).
-admin_call 'admin: provision tenant scope' 200 /upsert '{"scope":"_guarded:capX:events","id":"_provisioned","payload":{"t":1}}'
+# /admin can write to reserved scopes — used here to set up the
+# auth-gate: register a tenant's capability_id in _tokens.
+admin_call 'admin: register tenant in _tokens' 200 /upsert '{"scope":"_tokens","id":"capX","payload":{"issued_at":"test"}}'
 
-# /admin /stats sees the provisioned scope.
-admin_call 'admin: stats sees provisioned' 200 /stats
+# /admin /stats sees the _tokens scope.
+admin_call 'admin: stats sees _tokens' 200 /stats
 case $LAST_BODY in
-    *'_guarded:capX:events'*) okmsg 'admin: provisioned scope visible in stats' ;;
-    *) bad "admin stats body missing scope: $LAST_BODY" ;;
+    *'_tokens'*) okmsg 'admin: _tokens scope visible in stats' ;;
+    *) bad "admin stats body missing _tokens: $LAST_BODY" ;;
 esac
 
 # /admin's whitelist excludes self-reference, /multi_call, /guarded, /help.
@@ -648,8 +649,8 @@ TENANT_B_TOKEN="tenant-B-token"
 TENANT_A_CAP=$(printf '%s' "$TENANT_A_TOKEN" | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
 TENANT_B_CAP=$(printf '%s' "$TENANT_B_TOKEN" | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
 
-admin_call 'gd: provision tenant A scope' 200 /upsert "{\"scope\":\"_guarded:${TENANT_A_CAP}:events\",\"id\":\"_provisioned\",\"payload\":{\"t\":1}}"
-admin_call 'gd: provision tenant B scope' 200 /upsert "{\"scope\":\"_guarded:${TENANT_B_CAP}:events\",\"id\":\"_provisioned\",\"payload\":{\"t\":1}}"
+admin_call 'gd: register tenant A in _tokens' 200 /upsert "{\"scope\":\"_tokens\",\"id\":\"${TENANT_A_CAP}\",\"payload\":{\"issued_at\":\"e2e\"}}"
+admin_call 'gd: register tenant B in _tokens' 200 /upsert "{\"scope\":\"_tokens\",\"id\":\"${TENANT_B_CAP}\",\"payload\":{\"issued_at\":\"e2e\"}}"
 
 # Happy path: tenant A appends to their own events scope.
 guarded_call 'gd: tenant A append'        200 "$TENANT_A_TOKEN" /append '{"scope":"events","id":"e1","payload":{"v":1}}'
@@ -666,32 +667,37 @@ case $LAST_BODY in
     *) okmsg 'gd: no _guarded: prefix in response body' ;;
 esac
 
-# Random-token attack: forged token's HMAC names a non-existent scope →
-# whole-batch reject with scope_not_provisioned.
+# Random-token attack: forged token has no _tokens entry → whole-batch
+# reject with tenant_not_provisioned, no side effect.
+ROGUE_CAP=$(printf '%s' 'random-attacker' | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
 call 'gd: random token rejected'         400 POST /guarded \
     '{"token":"random-attacker","calls":[{"path":"/append","body":{"scope":"events","payload":"junk"}}]}'
 case $LAST_BODY in
-    *'not provisioned'*) okmsg 'gd: scope_not_provisioned error returned' ;;
-    *) bad "gd: expected scope_not_provisioned: $LAST_BODY" ;;
+    *'tenant_not_provisioned'*) okmsg 'gd: tenant_not_provisioned error returned' ;;
+    *) bad "gd: expected tenant_not_provisioned: $LAST_BODY" ;;
 esac
-
-# Side-effect-free reject: a legit tenant trying to write to a scope
-# they never had provisioned must NOT cause the cache to lazily create
-# the scope. This guards against a future regression that swaps the
-# pre-dispatch existence check from getScope() (read-only) to
-# ensureScope() (creates) — that swap would let any token holder fill
-# the store with empty buffers by spamming non-provisioned scope names.
-guarded_call 'gd: write to unprovisioned scope rejected' 400 "$TENANT_A_TOKEN" /append \
-    '{"scope":"ghosts","id":"x","payload":1}'
-case $LAST_BODY in
-    *'not provisioned'*) okmsg 'gd: ghosts scope rejected with scope_not_provisioned' ;;
-    *) bad "gd: expected scope_not_provisioned for ghosts: $LAST_BODY" ;;
-esac
-admin_call_query 'gd: post-reject scope still absent' 200 /get \
-    "{\"scope\":\"_guarded:${TENANT_A_CAP}:ghosts\",\"id\":\"x\"}"
+# Side-effect-free: the rogue's would-be scope must not exist in the
+# store. Pre-v0.5.12 this property fell out of the per-scope existence
+# check; post-v0.5.12 it depends on the auth-gate firing before any
+# /append handler runs, which is the load-bearing line for the
+# empty-scope-spam DoS class.
+admin_call_query 'gd: rogue scope still absent' 200 /get \
+    "{\"scope\":\"_guarded:${ROGUE_CAP}:events\",\"id\":\"x\"}"
 case $LAST_BODY in
     *'"hit":false'*) okmsg 'gd: rejected /append did not lazily create the scope' ;;
     *) bad "gd: rejected /append leaked a side effect: $LAST_BODY" ;;
+esac
+
+# Tenant with valid token writes to a scope the operator never touched
+# — auto-creates within the tenant's prefix. Replaces the pre-v0.5.12
+# "scope_not_provisioned" rejection on legit tokens.
+guarded_call 'gd: tenant auto-creates fresh scope' 200 "$TENANT_A_TOKEN" /append \
+    '{"scope":"ghosts","id":"x","payload":1}'
+admin_call_query 'gd: auto-created scope is in store' 200 /get \
+    "{\"scope\":\"_guarded:${TENANT_A_CAP}:ghosts\",\"id\":\"x\"}"
+case $LAST_BODY in
+    *'"hit":true'*) okmsg 'gd: tenant self-organized scope visible to operator' ;;
+    *) bad "gd: auto-created scope missing from store: $LAST_BODY" ;;
 esac
 
 # Cross-tenant smuggle attempt: tenant A token + body.scope=own +

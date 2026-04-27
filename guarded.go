@@ -18,6 +18,15 @@ import (
 const (
 	countersScopeCalls = "_counters_count_calls"
 	countersScopeKB    = "_counters_count_kb"
+
+	// tokensScope is the cache-internal auth-gate. Each active tenant
+	// has one item under this scope, keyed by the tenant's
+	// capability_id. /guarded checks for the item's presence as the
+	// single "is this token valid?" gate. Operator manages the items
+	// via /admin: /upsert at token issuance, /delete at revocation.
+	// Item payload is opaque to the cache — operators commonly store
+	// {user_id, issued_at, ...} for their own bookkeeping.
+	tokensScope = "_tokens"
 )
 
 // buildGuardedCallSpecs returns the closed whitelist of paths /guarded
@@ -52,6 +61,25 @@ func (api *API) buildGuardedCallSpecs() map[string]subCallSpec {
 type guardedRequest struct {
 	Token string             `json:"token"`
 	Calls *[]multiCallEntry  `json:"calls"`
+}
+
+// tenantIsProvisioned answers /guarded's auth-gate: is there an item
+// with id=capabilityID in the _tokens scope? Returns false when the
+// scope itself does not exist (no tokens issued yet) or when the
+// tenant's id is missing (token never issued, or revoked via
+// /admin /delete).
+//
+// Lookup is two map operations (s.scopes -> _tokens, then byID), both
+// under read locks — no contention with concurrent /guarded reads.
+func (api *API) tenantIsProvisioned(capabilityID string) bool {
+	buf, ok := api.store.getScope(tokensScope)
+	if !ok {
+		return false
+	}
+	buf.mu.RLock()
+	_, hit := buf.byID[capabilityID]
+	buf.mu.RUnlock()
+	return hit
 }
 
 // computeCapabilityID returns hex(HMAC_SHA256(serverSecret, token)) as a
@@ -173,7 +201,23 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 	capabilityID := computeCapabilityID(api.store.serverSecret, req.Token)
 	prefix := "_guarded:" + capabilityID + ":"
 
-	// Step 5: whitelist check per call. Whole-batch reject on miss.
+	// Step 5: auth-gate. Single lookup in the _tokens scope: does an
+	// item with id=capabilityID exist? If yes, this token was issued
+	// by the operator and not revoked. If no (or _tokens itself does
+	// not exist yet), reject the whole batch — no further work runs,
+	// no side effects, no counter ticks.
+	//
+	// This replaces the previous per-scope existence check
+	// (`_guarded:<capId>:<scope>` provisioning per tenant per scope).
+	// Tenants now self-organize within their `_guarded:<capId>:*`
+	// prefix; the operator's only obligation is to register/revoke
+	// the tenant's capabilityID in _tokens.
+	if !api.tenantIsProvisioned(capabilityID) {
+		badRequest(w, started, "tenant_not_provisioned")
+		return
+	}
+
+	// Step 6: whitelist check per call. Whole-batch reject on miss.
 	for i, call := range calls {
 		if _, ok := api.guardedCallSpecs[call.Path]; !ok {
 			badRequest(w, started, fmt.Sprintf("path '%s' (calls[%d]) is not allowed in /guarded", call.Path, i))
@@ -181,29 +225,19 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 6: scope rewrite per call. Track the rewritten scope per slot
-	// so step 7 can verify existence without re-parsing.
-	rewrittenScopes := make([]string, len(calls))
+	// Step 7: scope rewrite per call. The rewrite itself never fails
+	// (any string is acceptable as a prefixed scope); but a call that
+	// carries no scope at all is malformed and rejects the batch.
 	for i := range calls {
 		rewritten, err := rewriteCallScope(&calls[i], prefix)
 		if err != nil {
 			badRequest(w, started, fmt.Sprintf("calls[%d]: %s", i, err.Error()))
 			return
 		}
-		rewrittenScopes[i] = rewritten
-	}
-
-	// Step 7: scope-existence check per call. Whole-batch reject on
-	// any miss — see guardedflow.md §F for the rationale.
-	for i, scope := range rewrittenScopes {
-		if scope == "" {
-			// No scope in this call. /guarded's whitelist is per-scope
-			// only; a call with no scope is malformed.
+		if rewritten == "" {
+			// /guarded's whitelist is per-scope only; a call with no
+			// scope in body or query is malformed.
 			badRequest(w, started, fmt.Sprintf("calls[%d]: missing 'scope'", i))
-			return
-		}
-		if _, ok := api.store.getScope(scope); !ok {
-			badRequest(w, started, fmt.Sprintf("calls[%d]: scope '%s' is not provisioned", i, scope))
 			return
 		}
 	}

@@ -576,17 +576,23 @@ visibility), or any store-wide op.
 Per-request validation (whole-batch reject on any failure):
 
 1. `token` is required (`401` on empty/missing).
-2. Every sub-call's `path` must be in the whitelist.
-3. For each sub-call: `capability_id = hex(HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token))`
-   (lowercase, 64 hex chars). The cache rewrites `scope` (in body or
-   query) to `_guarded:<capability_id>:<original-scope>`.
-4. Each rewritten scope must already exist in the store. If not, the
-   whole batch is rejected with `400 scope_not_provisioned` and no
-   sub-call runs. This is the load-bearing security check: tenant
-   isolation depends on the operator pre-provisioning every legitimate
-   `_guarded:<capability_id>:*` scope via `/admin`. A forged token
-   produces a deterministic-but-different `capability_id`, names a
-   scope that was never provisioned, and is rejected.
+2. `capability_id = hex(HMAC_SHA256(SCOPECACHE_SERVER_SECRET, token))`
+   (lowercase, 64 hex chars).
+3. **Auth-gate**: a single lookup in the reserved `_tokens` scope —
+   does an item with `id = capability_id` exist? If yes, this token
+   was issued by the operator and not revoked. If not (or if
+   `_tokens` itself does not exist yet), the batch is rejected with
+   `400 tenant_not_provisioned` and no sub-call runs. This is the
+   load-bearing security check: a forged token produces a
+   deterministic-but-different `capability_id` whose item was never
+   added, and is rejected.
+4. Every sub-call's `path` must be in the whitelist.
+5. For each sub-call the cache rewrites `scope` (in body or query)
+   to `_guarded:<capability_id>:<original-scope>`. The underlying
+   scope buffer is auto-created if it doesn't yet exist (via
+   `getOrCreateScope`); tenants self-organize freely within their
+   own `_guarded:<capability_id>:*` namespace, no per-scope operator
+   approval needed.
 
 Sub-calls then dispatch through the same loop as `/admin`/`/multi_call`,
 with two extra steps:
@@ -615,8 +621,9 @@ with two extra steps:
   zero a `<capability_id>` the operator runs `/admin /upsert` on the
   counter scope with `payload: 0` (or `/admin /delete_scope` to wipe
   every tenant's counter at once). Whole-batch rejections (missing
-  token, whitelist miss, scope not provisioned) increment nothing —
-  they `return` before the dispatch loop. Counter failures inside the
+  token, tenant_not_provisioned, whitelist miss, malformed input)
+  increment nothing — they `return` before the dispatch loop. Counter
+  failures inside the
   loop are silently ignored — this is observability, not auth, and
   must not affect the tenant's response. Both scopes auto-create on
   first use via `ensureScope` and survive `/wipe` (the next `/guarded`
@@ -626,13 +633,15 @@ with two extra steps:
 Failure modes:
 
 - Empty token → `401` envelope-level (no body shape echo).
+- Token's capability_id not in `_tokens` (or `_tokens` doesn't exist)
+  → `400 tenant_not_provisioned`. Operator manages `_tokens`
+  membership via `/admin /upsert` (issuance) and `/admin /delete`
+  (revocation).
 - Path outside the whitelist → `400` envelope-level, naming the offending
   index (`calls[2]: path '/wipe' not allowed`).
 - Sub-call missing `scope` → `400 missing 'scope'`. Every `/guarded`
   sub-call must address a scope; calls that don't take one (e.g.
   `/stats`) aren't on the whitelist.
-- Rewritten scope not provisioned → `400 scope_not_provisioned`, naming
-  the offending index and the rewritten scope.
 - Body over `SCOPECACHE_MAX_MULTI_CALL_MB`, count over
   `SCOPECACHE_MAX_MULTI_CALL_COUNT`, response over
   `SCOPECACHE_MAX_RESPONSE_MB` → same as `/multi_call` (§6.3).
@@ -1496,7 +1505,7 @@ Response (trimmed to two scopes for readability — the real response carries ev
 `/admin` is the only path that can write to reserved scopes (anything
 starting with `_`), and the only path that can run store-wide ops
 (`/wipe`, `/warm`, `/rebuild`, `/delete_scope`). Typical first call
-after process start: provision a new tenant's namespace.
+after process start: register a new tenant in the `_tokens` auth-gate.
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
@@ -1504,9 +1513,9 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
   -d '{
     "calls": [
       { "path": "/upsert", "body": {
-          "scope":   "_guarded:14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3:events",
-          "id":      "_provisioned",
-          "payload": { "t": 1 }
+          "scope":   "_tokens",
+          "id":      "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3",
+          "payload": { "user_id": 42, "issued_at": "2026-04-27T..." }
       }}
     ]
   }'
@@ -1525,10 +1534,10 @@ Response:
         "ok": true,
         "created": true,
         "item": {
-          "scope": "_guarded:14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3:events",
-          "id":    "_provisioned",
+          "scope": "_tokens",
+          "id":    "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3",
           "seq":   1,
-          "payload": { "t": 1 }
+          "payload": { "user_id": 42, "issued_at": "2026-04-27T..." }
         },
         "duration_us": 568
       }
@@ -1539,10 +1548,10 @@ Response:
 }
 ```
 
-The `_provisioned` sentinel item has no semantic meaning — the cache
-checks scope *existence*, not item presence, so any single item is
-enough to bring the scope into being. The hex string in the scope name
-is the tenant's `capability_id` (see §6.4): `hex(HMAC_SHA256(server_secret,
+Once this item exists, the tenant can /guarded into any scope under
+their `_guarded:<capability_id>:*` namespace — the underlying scope
+buffer auto-creates on first /append. The hex string is the tenant's
+`capability_id` (see §6.4): `hex(HMAC_SHA256(server_secret,
 token))`, computed by the operator the same way `/guarded` does at request
 time. As long as both sides feed the same secret and token into HMAC-SHA256,
 the rewritten scope names match.
@@ -1675,17 +1684,18 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/guarded \
 ```json
 {
   "ok": false,
-  "error": "calls[0]: scope '_guarded:b4bfb82f45b123de68a8c0ef51a90930c43c56e176a1d0593cae8ee7b1cb994d:events' is not provisioned",
-  "duration_us": 108
+  "error": "tenant_not_provisioned",
+  "duration_us": 11
 }
 ```
 
-Note the rewritten scope appears in this error message: that is
-deliberate, so an operator debugging a misconfigured tenant can match
-the rejected name against `/admin` `/stats`. Tenants only see this when
-they target a scope the operator has not provisioned for them — i.e.
-when something is already wrong. Successful responses still strip the
-prefix.
+The error is intentionally minimal — the cache doesn't echo the
+forged token's derived `capability_id` back, since echoing would just
+confirm to the attacker that their HMAC matched a deterministic
+output. Operators debugging a real tenant whose calls all fail can
+compute the capability_id offline (same HMAC the cache uses) and
+look up `_tokens.byID[<capId>]` via `/admin /get` to confirm
+membership.
 
 Other envelope-level failures (omitted for brevity, all `400` unless
 noted):
