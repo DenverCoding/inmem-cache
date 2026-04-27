@@ -881,6 +881,127 @@ func TestStore_GetOrCreateScope_ReturnsSameBuffer(t *testing.T) {
 	}
 }
 
+// Race regression: /warm's Phase 1.5 reservation and Phase 2 commit must
+// serialise against /wipe and /rebuild. Pre-fix /wipe's Swap(0) (or
+// /rebuild's Store) erased a /warm reservation, and the drift comp in
+// commitReplacementPreReserved then over-credited totalBytes by the
+// snapshot's oldBytes — leaving the store-wide invariant
+// (totalBytes == Σ buf.bytes) violated.
+//
+// The race window is tiny (a few ns between reserveBytes and the per-
+// scope commit), so a naive "fire both goroutines and see what happens"
+// test mostly observes one finishing before the other starts. Stress
+// with many iterations to make the race probabilistic. With the fix in
+// place every iteration should pass.
+func TestStore_ReplaceScopes_RaceVsWipe(t *testing.T) {
+	const iterations = 5000
+
+	for i := 0; i < iterations; i++ {
+		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+		// Seed multiple scopes so /warm has multiple oldBytes snapshots and
+		// a wider Phase 1.5 → Phase 2 window for /wipe to slip into.
+		seed := map[string][]Item{}
+		for s2 := 0; s2 < 5; s2++ {
+			scope := "s" + string(rune('0'+s2))
+			items := []Item{}
+			for j := 0; j < 4; j++ {
+				items = append(items, Item{Scope: scope, ID: "k" + string(rune('0'+j)), Payload: jsonRaw(`{"v":1}`)})
+			}
+			seed[scope] = items
+		}
+		if _, err := s.replaceScopes(seed); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		// Concurrent /warm (replace all 5 scopes with smaller payloads) + /wipe.
+		// Either order is legal; what's NOT legal is them interleaving in a
+		// way that leaves totalBytes != Σ buf.bytes.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			repl := map[string][]Item{}
+			for s2 := 0; s2 < 5; s2++ {
+				scope := "s" + string(rune('0'+s2))
+				repl[scope] = []Item{{Scope: scope, ID: "newkey", Payload: jsonRaw(`{"v":42}`)}}
+			}
+			_, _ = s.replaceScopes(repl)
+		}()
+		go func() {
+			defer wg.Done()
+			s.wipe()
+		}()
+		wg.Wait()
+
+		assertBytesInvariant(t, s, i, "warm-vs-wipe")
+	}
+}
+
+func TestStore_ReplaceScopes_RaceVsRebuild(t *testing.T) {
+	const iterations = 5000
+
+	for i := 0; i < iterations; i++ {
+		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+		seed := map[string][]Item{}
+		for s2 := 0; s2 < 5; s2++ {
+			scope := "s" + string(rune('0'+s2))
+			items := []Item{}
+			for j := 0; j < 4; j++ {
+				items = append(items, Item{Scope: scope, ID: "k" + string(rune('0'+j)), Payload: jsonRaw(`{"v":1}`)})
+			}
+			seed[scope] = items
+		}
+		if _, err := s.replaceScopes(seed); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			repl := map[string][]Item{}
+			for s2 := 0; s2 < 5; s2++ {
+				scope := "s" + string(rune('0'+s2))
+				repl[scope] = []Item{{Scope: scope, ID: "newkey", Payload: jsonRaw(`{"v":42}`)}}
+			}
+			_, _ = s.replaceScopes(repl)
+		}()
+		go func() {
+			defer wg.Done()
+			rebuildItems := map[string][]Item{
+				"new-after-rebuild": {{Scope: "new-after-rebuild", ID: "x", Payload: jsonRaw(`{"v":99}`)}},
+			}
+			_, _, _ = s.rebuildAll(rebuildItems)
+		}()
+		wg.Wait()
+
+		assertBytesInvariant(t, s, i, "warm-vs-rebuild")
+	}
+}
+
+func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
+	t.Helper()
+
+	s.mu.RLock()
+	var sum int64
+	for _, buf := range s.scopes {
+		buf.mu.RLock()
+		sum += buf.bytes
+		buf.mu.RUnlock()
+	}
+	s.mu.RUnlock()
+
+	total := s.totalBytes.Load()
+	if total != sum {
+		t.Errorf("[%s iter %d] totalBytes=%d but Σ buf.bytes=%d (drift=%d)",
+			label, iter, total, sum, total-sum)
+	}
+}
+
+func jsonRaw(s string) []byte { return []byte(s) }
+
 func TestStore_GetScope_Miss(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	if _, ok := s.getScope("nope"); ok {

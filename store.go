@@ -1113,21 +1113,34 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		return 0, &ScopeCapacityError{Offenders: offenders}
 	}
 
-	// Phase 1.5 — atomically reserve the net byte delta of the batch. Per-
-	// scope old sizes are snapshotted under each scope's RLock so we can
-	// compute totalDelta, then reserveBytes() CASes against the store
-	// counter. A successful reservation holds capacity against every
-	// concurrent write path (append/update/upsert/counter_add) on every
-	// other scope, so the store-wide cap is strict even under batch +
-	// single-write load. Snapshots may be stale by the time the CAS runs;
-	// that is fine because Phase 2 uses the same oldBytes to release any
-	// drift (concurrent appends/deletes that landed on scopes being
-	// replaced), so the per-scope net contribution to totalBytes ends up
-	// exactly (newBytes - oldBytes) regardless of interleaving.
+	// Phase 1.5 + Phase 2 run under the store-level write lock to serialise
+	// against /delete_scope, /wipe, and /rebuild. Without that mutual
+	// exclusion the byte counter desyncs from Σ buf.bytes when one of those
+	// destructive ops fires between snapshot and commit:
+	//
+	//   - /wipe does totalBytes.Swap(0), erasing this batch's pre-reservation.
+	//     The drift comp then over-credits by oldSnapshot, leaving totalBytes
+	//     too high by exactly the original scope size.
+	//   - /rebuild does totalBytes.Store(newAggregate), same shape.
+	//   - /delete_scope's per-scope Add(-scopeBytes) happens to balance the
+	//     drift comp by accident, but only when the deleted scope's b.bytes
+	//     equals the snapshot — fragile, and we'd rather not depend on that.
+	//
+	// Concurrent appends/updates/etc. on the SAME scopes /warm is replacing
+	// still proceed: they take buf.mu, not s.mu, and the drift comp inside
+	// commitReplacementPreReserved still reconciles per-scope races as
+	// before. What this lock blocks is the destructive store-map ops and
+	// new-scope creation (getOrCreateScope's slow path) — both intentional.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Phase 1.5 — snapshot per-scope b.bytes (under each scope's RLock so
+	// concurrent in-scope writers are observed consistently), compute the
+	// net batch delta, and CAS-reserve it against the store counter.
 	var totalDelta int64
 	for i := range plans {
 		var old int64
-		if buf, ok := s.getScope(plans[i].scope); ok {
+		if buf, ok := s.scopes[plans[i].scope]; ok {
 			buf.mu.RLock()
 			old = buf.bytes
 			buf.mu.RUnlock()
@@ -1143,12 +1156,16 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		}
 	}
 
-	// Phase 2 — get-or-create and commit. Neither step can fail, so either
+	// Phase 2 — create-on-demand and commit. We hold s.mu.Lock() so we can
+	// touch s.scopes directly (calling getOrCreateScope here would deadlock
+	// on its internal RLock/Lock pair). Neither step can fail, so either
 	// every scope is replaced or (if an earlier phase aborted) none are.
-	// commitReplacementPreReserved honours the upfront reservation: it only
-	// releases drift on this scope, it does not re-add (newBytes - oldBytes).
 	for _, p := range plans {
-		buf, _ := s.getOrCreateScope(p.scope)
+		buf, ok := s.scopes[p.scope]
+		if !ok {
+			buf = s.newScopeBuffer()
+			s.scopes[p.scope] = buf
+		}
 		buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
 	}
 
