@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -895,6 +896,11 @@ type Store struct {
 	// is not registered. Operator opt-in for shared write-only
 	// ingestion patterns.
 	inboxScopes map[string]bool
+	// maxInboxBytes caps the per-call payload size on /inbox. Tighter
+	// than maxItemBytes by design — see Config.MaxInboxBytes for the
+	// full reasoning. Enforced as a 400 (per-request shape rule, same
+	// status class as the per-item cap), not a 507.
+	maxInboxBytes int64
 	// enableAdmin gates whether /admin is registered. False → /admin
 	// returns 404. Operator opt-in to expose the operator-elevated
 	// dispatcher. See Config.EnableAdmin for the rationale.
@@ -930,6 +936,7 @@ func NewStore(c Config) *Store {
 		maxMultiCallCount: c.MaxMultiCallCount,
 		serverSecret:      c.ServerSecret,
 		inboxScopes:       inboxSet,
+		maxInboxBytes:     c.MaxInboxBytes,
 		enableAdmin:       c.EnableAdmin,
 	}
 }
@@ -1214,6 +1221,55 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	buf.store = nil
 	buf.mu.Unlock()
 	return itemCount, true
+}
+
+// deleteGuardedTenant removes every scope under the prefix
+// `_guarded:<capabilityID>:` and releases the bytes those scopes occupy
+// (per-item bytes plus the per-scope overhead reserved at create time).
+// Mirrors deleteScope's detach-then-account discipline so a concurrent
+// in-flight write reaching a stale buf pointer either commits before
+// detach (bytes counted in scopeBytes) or wakes up after and returns
+// *ScopeDetachedError. Holds the store-wide write lock for the whole
+// sweep — same lock discipline as wipe(); revocation is rare, traffic
+// is hot, and the alternative (per-scope locking with an unlocked map
+// walk) would race with concurrent /append creating a fresh tenant
+// scope mid-sweep.
+//
+// The capabilityID is treated as an opaque string (the handler enforces
+// the 64-hex-char shape upstream); the store concatenates the literal
+// prefix and matches with strings.HasPrefix. No validation here.
+func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
+	prefix := "_guarded:" + capabilityID + ":"
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var (
+		deletedScopes int
+		deletedItems  int
+		freedBytes    int64
+	)
+
+	for scope, buf := range s.scopes {
+		if !strings.HasPrefix(scope, prefix) {
+			continue
+		}
+		buf.mu.Lock()
+		deletedItems += len(buf.items)
+		scopeBytes := buf.bytes
+		delete(s.scopes, scope)
+		// Combined into one Add so observers never see a transient state
+		// with one released and the other still charged. Same shape as
+		// deleteScope: item bytes + per-scope overhead, in lockstep.
+		s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
+		freedBytes += scopeBytes + scopeBufferOverhead
+		buf.detached = true
+		buf.store = nil
+		buf.mu.Unlock()
+		deletedScopes++
+	}
+
+	return deletedScopes, deletedItems, freedBytes
 }
 
 // wipe removes every scope from the store and resets the byte counter to

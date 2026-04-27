@@ -167,6 +167,26 @@ func enableAdminFromEnv() bool {
 	}
 }
 
+// maxInboxBytesFromEnv returns SCOPECACHE_MAX_INBOX_KB (in KiB,
+// converted to bytes) if set to a positive integer, otherwise the
+// compile-time default. KiB-granular (not MiB like the other byte
+// knobs) because the meaningful range is sub-MiB — /inbox is meant
+// for small fire-and-forget event payloads, not blob uploads. Same
+// lenient policy as the other env helpers: malformed or non-positive
+// values log a warning and the server keeps running on the default.
+func maxInboxBytesFromEnv() int64 {
+	raw := os.Getenv("SCOPECACHE_MAX_INBOX_KB")
+	if raw == "" {
+		return int64(scopecache.MaxInboxKiB) << 10
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("SCOPECACHE_MAX_INBOX_KB=%q is not a positive integer; using default %d KiB", raw, scopecache.MaxInboxKiB)
+		return int64(scopecache.MaxInboxKiB) << 10
+	}
+	return int64(n) << 10
+}
+
 // inboxScopesFromEnv returns SCOPECACHE_INBOX_SCOPES split on
 // newlines (the robust separator — scope names may contain ":" or
 // "," but not "\n"). Empty value, missing var, or all-whitespace
@@ -226,6 +246,7 @@ func main() {
 		MaxMultiCallCount: maxMultiCallCountFromEnv(),
 		ServerSecret:      os.Getenv("SCOPECACHE_SERVER_SECRET"),
 		InboxScopes:       inboxScopesFromEnv(),
+		MaxInboxBytes:     maxInboxBytesFromEnv(),
 		EnableAdmin:       enableAdminFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
@@ -245,7 +266,7 @@ func main() {
 	} else if len(cfg.InboxScopes) > 0 {
 		inboxStatus = "enabled, scopes=" + strings.Join(cfg.InboxScopes, ",")
 	}
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch, %d KiB per /inbox payload", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount, cfg.MaxInboxBytes>>10)
 	log.Printf("scopecache features: /admin %s; /guarded %s; /inbox %s", adminStatus, guardedStatus, inboxStatus)
 
 	mux := http.NewServeMux()

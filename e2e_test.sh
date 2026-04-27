@@ -1065,6 +1065,139 @@ call 'gd: GET rejected'                  405 GET /guarded
 # Malformed body → 400.
 call 'gd: malformed body'                400 POST /guarded '{not-json'
 
+# --- /delete_guarded ----------------------------------------------------------
+# Operator-only namespace cleanup. Takes a capability_id (validated as
+# 64 lowercase hex chars) and drops every scope under
+# `_guarded:<capability_id>:*` in one atomic call. Reachable only via
+# /admin — not on the public mux, not in /multi_call's whitelist, not
+# in /guarded's whitelist. See scopecache-rfc.md §6.2.
+#
+# Strategy: two FRESH tenants (DG_A, DG_B) so the deleted_scopes /
+# deleted_items counts are deterministic regardless of the state the
+# /guarded section above accumulated under TENANT_A / TENANT_B.
+say '== delete_guarded =='
+
+DG_A_TOKEN="dg-tenant-A"
+DG_B_TOKEN="dg-tenant-B"
+DG_A_CAP=$(printf '%s' "$DG_A_TOKEN" | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
+DG_B_CAP=$(printf '%s' "$DG_B_TOKEN" | openssl dgst -sha256 -hmac "test-secret" -hex | sed 's/^.*= //')
+
+admin_call 'dg: register tenant A in _tokens' 200 /upsert \
+    "{\"scope\":\"_tokens\",\"id\":\"${DG_A_CAP}\",\"payload\":{\"u\":1}}"
+admin_call 'dg: register tenant B in _tokens' 200 /upsert \
+    "{\"scope\":\"_tokens\",\"id\":\"${DG_B_CAP}\",\"payload\":{\"u\":2}}"
+
+# Tenant A appends to two scopes via /guarded → creates
+# _guarded:DG_A_CAP:data and _guarded:DG_A_CAP:logs.
+guarded_call 'dg: A appends to scope data' 200 "$DG_A_TOKEN" /append \
+    '{"scope":"data","id":"x","payload":{"v":1}}'
+guarded_call 'dg: A appends to scope logs' 200 "$DG_A_TOKEN" /append \
+    '{"scope":"logs","id":"y","payload":{"v":2}}'
+
+# Tenant B appends to a scope of the same NAME → creates
+# _guarded:DG_B_CAP:data, which is a different store-space scope than
+# A's _guarded:DG_A_CAP:data despite the visible name collision.
+guarded_call 'dg: B appends to scope data' 200 "$DG_B_TOKEN" /append \
+    '{"scope":"data","id":"x","payload":{"v":3}}'
+
+# Pre-delete sanity: all three rewritten scopes are visible via
+# /admin /get. The hit:true here is the baseline that the post-delete
+# hit:false assertions below are measured against.
+admin_call_query 'dg: A.data exists pre-delete' 200 /get \
+    "{\"scope\":\"_guarded:${DG_A_CAP}:data\",\"id\":\"x\"}"
+json_assert 'dg: A.data hit pre-delete' '.hit == true'
+admin_call_query 'dg: A.logs exists pre-delete' 200 /get \
+    "{\"scope\":\"_guarded:${DG_A_CAP}:logs\",\"id\":\"y\"}"
+json_assert 'dg: A.logs hit pre-delete' '.hit == true'
+admin_call_query 'dg: B.data exists pre-delete' 200 /get \
+    "{\"scope\":\"_guarded:${DG_B_CAP}:data\",\"id\":\"x\"}"
+json_assert 'dg: B.data hit pre-delete' '.hit == true'
+
+# Drop tenant A's entire namespace in one /admin call.
+admin_call 'dg: delete A namespace' 200 /delete_guarded \
+    "{\"capability_id\":\"${DG_A_CAP}\"}"
+json_assert 'dg: deleted_scopes == 2' '.deleted_scopes == 2'
+json_assert 'dg: deleted_items  == 2' '.deleted_items  == 2'
+json_assert 'dg: response carries freed_mb' 'has("freed_mb")'
+
+# Post-delete: both A scopes are gone.
+admin_call_query 'dg: A.data hit:false post-delete' 200 /get \
+    "{\"scope\":\"_guarded:${DG_A_CAP}:data\",\"id\":\"x\"}"
+json_assert 'dg: A.data miss post-delete' '.hit == false'
+admin_call_query 'dg: A.logs hit:false post-delete' 200 /get \
+    "{\"scope\":\"_guarded:${DG_A_CAP}:logs\",\"id\":\"y\"}"
+json_assert 'dg: A.logs miss post-delete' '.hit == false'
+
+# Critical assertion (the user's requested test): B's namespace is
+# untouched even though A and B used identical scope names.
+admin_call_query 'dg: B.data still exists post-delete' 200 /get \
+    "{\"scope\":\"_guarded:${DG_B_CAP}:data\",\"id\":\"x\"}"
+json_assert 'dg: B.data still hits' '.hit == true'
+json_assert 'dg: B.data payload preserved' '.item.payload.v == 3'
+
+# Idempotency: re-running /delete_guarded for an already-cleaned
+# tenant returns deleted_scopes=0 (success, not error). Operators run
+# the four-call revocation batch unconditionally; a no-op on the
+# fourth call must not fail the batch.
+admin_call 'dg: re-delete A is idempotent' 200 /delete_guarded \
+    "{\"capability_id\":\"${DG_A_CAP}\"}"
+json_assert 'dg: deleted_scopes == 0 on second run' '.deleted_scopes == 0'
+
+# --- validation ---
+admin_call 'dg: missing capability_id rejected' 400 /delete_guarded '{}'
+case $LAST_BODY in
+    *required*) okmsg 'dg: missing-id error mentions required' ;;
+    *) bad "dg: expected 'required' error: $LAST_BODY" ;;
+esac
+
+admin_call 'dg: short capability_id rejected' 400 /delete_guarded \
+    '{"capability_id":"abc"}'
+case $LAST_BODY in
+    *'exactly 64'*) okmsg 'dg: short-id error mentions exactly 64' ;;
+    *) bad "dg: expected 'exactly 64' error: $LAST_BODY" ;;
+esac
+
+# 64 chars but uppercase. HMAC-SHA256 hex output is lowercase by
+# convention, and the validator pins that — uppercase id rejected.
+admin_call 'dg: uppercase capability_id rejected' 400 /delete_guarded \
+    '{"capability_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}'
+case $LAST_BODY in
+    *'lowercase hex'*) okmsg 'dg: uppercase-id error mentions lowercase hex' ;;
+    *) bad "dg: expected 'lowercase hex' error: $LAST_BODY" ;;
+esac
+
+# 64 chars but with one non-hex char (`g`) at position 63.
+admin_call 'dg: non-hex capability_id rejected' 400 /delete_guarded \
+    '{"capability_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaag"}'
+case $LAST_BODY in
+    *'lowercase hex'*) okmsg 'dg: non-hex-id error mentions lowercase hex' ;;
+    *) bad "dg: expected 'lowercase hex' error: $LAST_BODY" ;;
+esac
+
+# --- surface enforcement: admin-only ---
+
+# /delete_guarded MUST NOT exist on the public mux.
+call 'dg: not on public mux' 404 POST /delete_guarded \
+    "{\"capability_id\":\"${DG_B_CAP}\"}"
+
+# /delete_guarded MUST NOT be in /multi_call's whitelist (would let
+# any caller wipe any tenant's data without auth).
+call 'dg: not in /multi_call whitelist' 400 POST /multi_call \
+    "{\"calls\":[{\"path\":\"/delete_guarded\",\"body\":{\"capability_id\":\"${DG_B_CAP}\"}}]}"
+case $LAST_BODY in
+    *'not allowed'*) okmsg 'dg: /multi_call rejection mentions not allowed' ;;
+    *) bad "dg: expected 'not allowed' error: $LAST_BODY" ;;
+esac
+
+# /delete_guarded MUST NOT be in /guarded's whitelist (a tenant
+# nuking their own or anyone else's namespace is operator-only).
+call 'dg: not in /guarded whitelist' 400 POST /guarded \
+    "{\"token\":\"${DG_B_TOKEN}\",\"calls\":[{\"path\":\"/delete_guarded\",\"body\":{\"capability_id\":\"${DG_B_CAP}\"}}]}"
+case $LAST_BODY in
+    *'not allowed'*) okmsg 'dg: /guarded rejection mentions not allowed' ;;
+    *) bad "dg: expected 'not allowed' error: $LAST_BODY" ;;
+esac
+
 # --- /inbox -------------------------------------------------------------------
 # Shared write-only ingestion. Operator-configured scope allowlist
 # (SCOPECACHE_INBOX_SCOPES = "_inbox\naudit_log"). Tenants /append into
@@ -1134,6 +1267,39 @@ case $LAST_BODY in
     *'"items":[]'*|*'"items":null'*|*'"hit":false'*'"items"'*) okmsg 'ib: /guarded read of inbox empty' ;;
     *'event'*|*'signup'*|*'login'*) bad "ib: /guarded leaked inbox content: $LAST_BODY" ;;
     *) okmsg 'ib: /guarded read of inbox carries no inbox payload' ;;
+esac
+
+# --- /inbox payload cap -------------------------------------------------------
+# /inbox has its own per-call payload cap (default 64 KiB,
+# SCOPECACHE_MAX_INBOX_KB), tighter than the generic per-item cap.
+# Reasoning lives in scopecache-rfc.md §6.4. Tests:
+#   - 64 KiB (at default cap) succeeds
+#   - 65 KiB (one KiB over default cap) fails 400 with cap-naming error
+# The container in the e2e harness runs with the default 64 KiB cap;
+# raising the cap is an env-var change at deploy time, not testable
+# without a separate container.
+say '== inbox payload cap =='
+
+# JSON-encoded string payload of length 65536 = `"<65534 chars>"`.
+# Build with awk for portability — POSIX printf has no `%*s`-style
+# repeat, and shell-loop concatenation of 65k chars is too slow.
+ib_at_cap_chars=$(awk 'BEGIN{for(i=0;i<65534;i++)printf "a"}')
+ib_at_cap_payload="\"${ib_at_cap_chars}\""
+quiet_call 'ib: at-cap (64 KiB) accepted' 200 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":${ib_at_cap_payload}}"
+
+# 65 KiB payload (1 KiB over the 64 KiB default cap).
+ib_over_cap_chars=$(awk 'BEGIN{for(i=0;i<66558;i++)printf "a"}')
+ib_over_cap_payload="\"${ib_over_cap_chars}\""
+call 'ib: over-cap (65 KiB) rejected' 400 POST /inbox \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"scope\":\"_inbox\",\"payload\":${ib_over_cap_payload}}"
+case $LAST_BODY in
+    *'/inbox cap'*) okmsg 'ib: over-cap error names /inbox cap' ;;
+    *) bad "ib: expected '/inbox cap' in error: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *65536*) okmsg 'ib: over-cap error names cap value (65536)' ;;
+    *) bad "ib: expected 65536 in error: $LAST_BODY" ;;
 esac
 
 # --- mega deterministic state-machine test ------------------------------------

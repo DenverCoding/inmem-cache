@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -91,6 +92,27 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	// Scope must be in the operator's inbox-scope allowlist.
 	if !api.store.isInboxScope(req.Scope) {
 		badRequest(w, started, "scope is not configured as an inbox scope")
+		return
+	}
+
+	// /inbox-specific payload cap. Tighter than the generic per-item
+	// cap (validateWriteItem below) by design — /inbox is fire-and-
+	// forget tenant ingestion that the operator drains in batches via
+	// /admin /tail, so a single rogue tenant pushing /append-sized 1
+	// MiB items eats /admin /tail's response budget very fast. 400
+	// (not 507): this is a per-request shape rule, same status class
+	// as checkItemSize, not store-side admission control. Runs after
+	// the inbox-scope allowlist (so a wrong scope name produces the
+	// scope-misconfigured error rather than a confusing cap error)
+	// but before the auth-gate (so a misconfigured tenant learns the
+	// real issue is request size, not auth — same pattern as
+	// /guarded's pre-flight response-cap check). Default 64 KiB;
+	// override via SCOPECACHE_MAX_INBOX_KB.
+	if int64(len(req.Payload)) > api.store.maxInboxBytes {
+		badRequest(w, started, fmt.Sprintf(
+			"the 'payload' field (%d bytes) exceeds the /inbox cap of %d bytes",
+			len(req.Payload), api.store.maxInboxBytes,
+		))
 		return
 	}
 

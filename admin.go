@@ -32,6 +32,7 @@ func (api *API) buildAdminCallSpecs() map[string]subCallSpec {
 		"/delete":                  {http.MethodPost, api.handleDelete},
 		"/delete_up_to":            {http.MethodPost, api.handleDeleteUpTo},
 		"/delete_scope":            {http.MethodPost, api.handleDeleteScope},
+		"/delete_guarded":          {http.MethodPost, api.handleDeleteGuarded},
 		"/warm":                    {http.MethodPost, api.handleWarm},
 		"/rebuild":                 {http.MethodPost, api.handleRebuild},
 		"/wipe":                    {http.MethodPost, api.handleWipe},

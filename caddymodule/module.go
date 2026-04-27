@@ -51,6 +51,12 @@ type Handler struct {
 	// MaxMultiCallCount caps the number of sub-calls per /multi_call batch.
 	// 0 = use scopecache.MaxMultiCallCount.
 	MaxMultiCallCount int `json:"max_multi_call_count,omitempty"`
+	// MaxInboxKB caps the per-call payload size on /inbox in KiB.
+	// 0 = use scopecache.MaxInboxKiB (64 KiB). KiB-granular (not MiB
+	// like the other byte caps) because /inbox payloads are tenant-
+	// pushed events, not blob storage; the meaningful range is sub-MiB.
+	// Tighter than MaxItemMB by design — see scopecache.Config.MaxInboxBytes.
+	MaxInboxKB int `json:"max_inbox_kb,omitempty"`
 	// ServerSecret is the HMAC key for /guarded. Empty (or unset) disables
 	// /guarded entirely — the route is not registered, public callers
 	// receive 404. When non-empty, both scopecache and the application
@@ -105,6 +111,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		MaxResponseBytes:  int64(h.MaxResponseMB) << 20,
 		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
 		MaxMultiCallCount: h.MaxMultiCallCount,
+		MaxInboxBytes:     int64(h.MaxInboxKB) << 10,
 		ServerSecret:      h.ServerSecret,
 		InboxScopes:       h.InboxScopes,
 		EnableAdmin:       h.EnableAdmin,
@@ -138,6 +145,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    max_response_mb        25
 //	    max_multi_call_mb      16
 //	    max_multi_call_count   10
+//	    max_inbox_kb           64
 //	    server_secret          {$SCOPECACHE_SERVER_SECRET}
 //	    inbox_scope            _inbox
 //	    inbox_scope            audit_log
@@ -207,6 +215,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.MaxMultiCallMB = n
 			case "max_multi_call_count":
 				h.MaxMultiCallCount = n
+			case "max_inbox_kb":
+				h.MaxInboxKB = n
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}
@@ -233,6 +243,7 @@ func (h *Handler) validateConfig() error {
 		{"max_response_mb", h.MaxResponseMB},
 		{"max_multi_call_mb", h.MaxMultiCallMB},
 		{"max_multi_call_count", h.MaxMultiCallCount},
+		{"max_inbox_kb", h.MaxInboxKB},
 	} {
 		if e.value < 0 {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)

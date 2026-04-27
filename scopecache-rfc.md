@@ -117,6 +117,7 @@ separate, cache-owned, and surfaces only in `/stats` and
 - per-batch sub-call count (`/multi_call`): `10` by default, overridable via the `SCOPECACHE_MAX_MULTI_CALL_COUNT` environment variable. Bounds dispatcher work per HTTP request; batches over the cap return `400` for the whole batch (no partial dispatch).
 - HMAC server secret (`/guarded`, `/inbox`): supplied via the `SCOPECACHE_SERVER_SECRET` environment variable (no default). The string itself is opaque to the cache — it is the HMAC-SHA256 key used to derive each tenant's `capability_id` from their token (see §6.4). Empty or unset disables both `/guarded` and `/inbox` entirely (routes not registered; public callers receive `404`). The standalone binary reads the env var directly; the Caddy module reads the same value via the `server_secret` Caddyfile directive (or JSON config field), typically as a `{$SCOPECACHE_SERVER_SECRET}` substitution so the secret stays out of the Caddyfile itself.
 - Inbox-scope allowlist (`/inbox`): supplied via the `SCOPECACHE_INBOX_SCOPES` environment variable (no default), newline-separated scope names. Empty/unset disables `/inbox` (route not registered) — even if `SCOPECACHE_SERVER_SECRET` is set. The Caddy module uses repeatable `inbox_scope <name>` directives. Operator opts in to which scope names accept shared write-only ingestion; tenants choosing any other scope name get `400`.
+- Per-call payload cap (`/inbox`): `64 KiB` by default, overridable via the `SCOPECACHE_MAX_INBOX_KB` environment variable (integer KiB — KiB-granular, not MiB like the other byte knobs, because the meaningful range for tenant-pushed events is sub-MiB). Tighter than the generic per-item cap by design — `/inbox` payloads are tenant-pushed events the operator drains in batches, so a 1 MiB ceiling lets one rogue tenant fill `/admin /tail` response budgets very fast. Per-request shape rule: violations return `400` (same status class as the per-item cap), not `507`. Caddy module uses the `max_inbox_kb` directive.
 
 Read limits, per-scope item cap, and store-wide byte cap are separate concerns.
 
@@ -467,6 +468,21 @@ Behavior:
 - response carries `{ "ok", "deleted_scopes", "deleted_items", "freed_mb" }`: `freed_mb` is the store-wide byte budget released back to the cap (in MiB, 4 decimals, matching `/stats`)
 - holders of stale scope buffer pointers see a detached buffer: any write they complete after the wipe stays local to the orphan and cannot corrupt the post-wipe byte counter (same guarantee as `/delete_scope`)
 
+### `POST /delete_guarded`
+Input:
+- `capability_id` required — exactly 64 lowercase hex characters, matching the on-the-wire shape of an HMAC-SHA256 hex digest
+
+Behavior:
+- delete every scope under the prefix `_guarded:<capability_id>:` in one atomic call; release the bytes those scopes occupy (per-item bytes plus per-scope overhead)
+- the data-cleanup half of the token-revocation pattern (the other half is the operator's `/delete` calls against `_tokens` and the two `_counters_count_*` scopes — see §6.4 *Token lifecycle is application logic*)
+- **damage radius is bounded by construction.** The handler builds the prefix from the validated `capability_id`; there is no free-form `prefix` field. The only scopes that can ever be matched are ones a `/guarded` request previously created. Mistyping `_guarded:`, omitting the trailing `:`, or aiming a free-form sweep at `_tokens` / `_counters_*` / `_inbox` is impossible by construction
+- response carries `{ "ok", "deleted_scopes", "deleted_items", "freed_mb" }` — same shape as `/wipe`. `deleted_scopes = 0` is a valid success: a tenant who never wrote any data has nothing to clean up, and the operator's revocation batch should run unconditionally without first checking which scopes exist
+- holds the store-wide write lock for the duration of the sweep — same lock discipline as `/wipe`. Concurrent `/append` against unrelated tenants is serialized behind it; revocation is rare, traffic is hot, and the alternative (per-scope locking with an unlocked map walk) would race with concurrent `/guarded` traffic creating a fresh tenant scope mid-sweep
+- holders of stale scope buffer pointers see a detached buffer: any write they complete after the sweep stays local to the orphan and cannot corrupt the post-sweep byte counter (same guarantee as `/delete_scope` and `/wipe`)
+- **admin-only.** Reachable only as a sub-call through `/admin`; not on the public mux, not in `/multi_call`'s whitelist, not in `/guarded`'s whitelist (a tenant cleaning up their own namespace would lock themselves out, and a tenant cleaning up someone else's would defeat the auth-gate). The standalone Unix-socket binary defaults `EnableAdmin: true`, the Caddy module defaults `false` — same opt-in shape as the rest of `/admin`
+
+Why is there no general `/delete_scope_prefix`? Because the only use case the Phase 4 harness has surfaced is exactly this one — clean up a revoked tenant's data — and a free-form prefix invites the catastrophic mistypes above. If a non-`_guarded` namespace ever needs prefix-deletion, it gets its own purpose-built endpoint with its own safety story; the cache deliberately does not ship a footgun.
+
 ---
 
 ## 6.3 Composite endpoints
@@ -545,7 +561,7 @@ Whitelist (closed):
 - per-scope/per-item ops: `/append`, `/get`, `/head`, `/tail`,
   `/ts_range`, `/update`, `/upsert`, `/counter_add`, `/delete`,
   `/delete_up_to`, `/delete_scope`, `/render`
-- store-wide ops: `/warm`, `/rebuild`, `/wipe`
+- store-wide ops: `/warm`, `/rebuild`, `/wipe`, `/delete_guarded`
 - aggregate reads: `/stats`, `/delete_scope_candidates`
 
 Excluded: `/help` (text/plain), `/multi_call`, `/guarded`, `/admin`
@@ -652,6 +668,68 @@ Failure modes:
   `SCOPECACHE_MAX_MULTI_CALL_COUNT`, response over
   `SCOPECACHE_MAX_RESPONSE_MB` → same as `/multi_call` (§6.3).
 
+#### Token lifecycle is application logic
+
+User management — issuance, rotation, revocation, expiry — is the
+**integrating application's** responsibility, not the cache's. This is
+an explicit design choice, not an oversight:
+
+- **No TTL on `_tokens` items.** They live until the operator explicitly
+  deletes them. Scopecache exposes presence (`is capability_id in
+  _tokens?`), nothing more.
+- **No background sweeper.** Nothing inside scopecache walks `_tokens`
+  to remove "old" entries. The auth-gate is one map lookup at request
+  time; a token is valid iff its item exists.
+- **No reasons-for-revocation primitives.** Logout, password reset,
+  suspicious activity, account decommissioning, scheduled rotation —
+  these are application concerns and must stay there. The cache stays
+  a fast, flexible, caller-anonymous primitive without business
+  semantics bolted on.
+
+The trade-off: the application owns cleanup. When a token is revoked,
+*everything* keyed on its `capability_id` becomes orphaned in one go —
+the token item, the two counter items, and every data scope the tenant
+ever wrote under `_guarded:<capability_id>:*`. None of it is reachable
+anymore (the new HMAC input would yield a different `capability_id`),
+but it still occupies bytes against `MaxStoreBytes` until the operator
+removes it.
+
+The application holds the raw token (and therefore the `capability_id`)
+at exactly the moment it decides to revoke, so a single `/admin` batch
+cleans the whole footprint:
+
+```json
+POST /admin
+{"calls": [
+  {"path": "/delete",         "body": {"scope":         "_tokens",               "id": "<capability_id>"}},
+  {"path": "/delete",         "body": {"scope":         "_counters_count_calls", "id": "<capability_id>"}},
+  {"path": "/delete",         "body": {"scope":         "_counters_count_kb",    "id": "<capability_id>"}},
+  {"path": "/delete_guarded", "body": {"capability_id": "<capability_id>"}}
+]}
+```
+
+The fourth call (`/delete_guarded`, see §6.2) is the load-bearing one
+for storage hygiene: it drops every scope the tenant ever created
+under their own `_guarded:<capability_id>:*` namespace in one
+operation. Without it the token's data sits in the store forever,
+unreachable but still occupying bytes against `MaxStoreBytes`.
+
+The same pattern applies on **reissuance**: rotating a tenant's token
+produces a new `capability_id`, so the old token's data is unreachable
+to the new token by construction. If the rotation is meant as a hard
+boundary (e.g. after a security incident), run the four-delete batch
+above and the old footprint is gone. If the rotation is meant to be
+transparent to the tenant, the application must additionally migrate
+`_guarded:<old_id>:*` data to `_guarded:<new_id>:*` *before* the
+`/delete_guarded` — that migration is application logic for the same
+reason revocation timing is.
+
+This positions scopecache deliberately: a fast, flexible cache
+primitive with no opinion on *who* a caller is or *when* they should
+stop being one. Integrators encode their own lifecycle policy in
+their own code, where it belongs; the cache stays small, opinion-free,
+and predictable.
+
 `/guarded` is registered only when `SCOPECACHE_SERVER_SECRET` is set.
 Empty/unset → the route is not in the mux; `POST /guarded` returns
 `404`. This is the kill-switch: deployments that don't want a tenant
@@ -681,12 +759,30 @@ present): `id`, `seq`, `ts`. Anything else in the body is ignored.
 Per-request validation (whole-batch reject on any failure):
 
 1. `token` is required (`401` on empty/missing).
-2. Auth-gate: `_tokens.byID[capability_id]` must exist. Same lookup
-   as `/guarded`. Reject with `400 tenant_not_provisioned` otherwise.
-3. `scope` must be in the operator-configured allowlist
+2. `payload` is required and not `null` (matches `/append` shape rule).
+3. `id` / `seq` / `ts` MUST be absent from the body — the cache owns
+   identity and time on `/inbox`. `400` if any is present.
+4. `scope` must be in the operator-configured allowlist
    (`SCOPECACHE_INBOX_SCOPES` env / `inbox_scope` Caddyfile
-   directive). Otherwise `400`.
-4. `payload` is required and not `null` (matches `/append` shape rule).
+   directive). Otherwise `400 scope is not configured as an inbox scope`.
+5. **Payload size** must not exceed `SCOPECACHE_MAX_INBOX_KB` (default
+   64 KiB). Otherwise `400 the 'payload' field (X bytes) exceeds the
+   /inbox cap of Y bytes`. Tighter than the generic per-item cap by
+   design — `/inbox` is fire-and-forget tenant ingestion that the
+   operator drains in batches via `/admin /tail`, so a single rogue
+   tenant pushing `/append`-sized 1 MiB items fills `/admin /tail`'s
+   response budget very fast. 64 KiB comfortably fits rich event
+   payloads (signups with form data, audit events with context, nested
+   notifications) while rejecting accidental blob uploads. The check
+   runs *before* the auth-gate (mirroring `/guarded`'s pre-flight
+   response-cap check) so a misconfigured tenant learns the real issue
+   is request size, not auth — but *after* the inbox-scope allowlist
+   so a wrong scope name produces the scope-misconfigured error rather
+   than a confusing cap error. Same status class (`400`) as the
+   per-item cap: this is a per-request shape rule, not store-side
+   admission control.
+6. Auth-gate: `_tokens.byID[capability_id]` must exist. Same lookup
+   as `/guarded`. Reject with `400 tenant_not_provisioned` otherwise.
 
 Cache-assigned, not visible to client:
 
@@ -722,6 +818,8 @@ Failure modes:
   forbidden on /inbox`.
 - Scope not in allowlist → `400 scope is not configured as an inbox
   scope`.
+- Payload over `SCOPECACHE_MAX_INBOX_KB` (default 64 KiB) → `400
+  the 'payload' field (X bytes) exceeds the /inbox cap of Y bytes`.
 - Token's capability_id not in `_tokens` → `400 tenant_not_provisioned`.
 - Per-scope item cap exceeded (drainer needs to catch up) → `507`
   with the standard scope-full envelope.
@@ -784,16 +882,17 @@ prefix in their own scope-naming schemes to keep the boundary clean.
 
 A 2xx response from any write endpoint (`/append`, `/warm`, `/update`,
 `/upsert`, `/counter_add`, `/delete`, `/delete_up_to`, `/delete_scope`,
-`/wipe`, `/rebuild`) confirms the write was applied to the cache at the
-moment of commit. It is **not** a persistence guarantee:
+`/delete_guarded`, `/wipe`, `/rebuild`) confirms the write was applied
+to the cache at the moment of commit. It is **not** a persistence
+guarantee:
 
 - A concurrent `/rebuild` or `/wipe` replaces or clears the entire store
   and will erase writes that committed moments earlier. This is intentional:
   both endpoints express "the source of truth says this is the new state,"
   and the cache is explicitly subordinate to that source.
-- `/delete_scope` and `/delete_up_to` erase earlier writes within their
-  scope by design. Concurrent appends that happened to succeed just before
-  a delete can vanish.
+- `/delete_scope`, `/delete_up_to`, and `/delete_guarded` erase earlier
+  writes within their scope (or namespace) by design. Concurrent appends
+  that happened to succeed just before a delete can vanish.
 - The orphan-detach mechanism (`*ScopeDetachedError`) protects the store's
   internal accounting — the byte counter cannot be corrupted by a write
   that commits into a buffer unlinked by a concurrent swap — but it does

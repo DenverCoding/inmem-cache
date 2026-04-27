@@ -15,6 +15,17 @@ const (
 	MaxResponseMiB    = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head, /ts_range). Overridable via SCOPECACHE_MAX_RESPONSE_MB
 	MaxMultiCallMiB   = 16      // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
 	MaxMultiCallCount = 10      // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
+	// MaxInboxKiB is the per-call payload cap default for /inbox in KiB.
+	// Tighter than the generic per-item cap on purpose: /inbox is
+	// fire-and-forget tenant ingestion (no read-back, drained by the
+	// operator in batches), so a single rogue tenant pushing 1 MiB items
+	// fills the operator's /admin /tail response cap fast. 64 KiB
+	// comfortably fits rich event payloads (signups with form data,
+	// audit events with context, nested notifications) while rejecting
+	// accidental blob uploads. Overridable via SCOPECACHE_MAX_INBOX_KB
+	// (integer KiB — KiB-granular because the meaningful range is
+	// sub-MiB; all other byte-knobs are MiB).
+	MaxInboxKiB = 64
 	MaxScopeBytes     = 256
 	MaxIDBytes        = 256
 
@@ -57,6 +68,7 @@ const (
 //     with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
 //   - MaxMultiCallBytes: input body cap for /multi_call. In bytes. Default MaxMultiCallMiB << 20.
 //   - MaxMultiCallCount: max sub-calls per /multi_call batch. Default MaxMultiCallCount (10).
+//   - MaxInboxBytes:     per-call payload cap on /inbox. In bytes. Default MaxInboxKiB << 10 (64 KiB).
 //
 // Bytes (not MiB) are the core unit because admission control arithmetic
 // lives in bytes; adapters convert their MiB-facing configuration at the
@@ -68,6 +80,13 @@ type Config struct {
 	MaxResponseBytes  int64
 	MaxMultiCallBytes int64
 	MaxMultiCallCount int
+	// MaxInboxBytes caps the per-call payload size on /inbox, in bytes.
+	// Tighter than MaxItemBytes by design — /inbox tenants push events
+	// they cannot read back, drained by the operator in batches; without
+	// a separate cap a single rogue tenant pushing 1 MiB items fills
+	// /admin /tail response budgets very fast. Default int64(MaxInboxKiB) << 10
+	// (64 KiB). Adapter env: SCOPECACHE_MAX_INBOX_KB.
+	MaxInboxBytes int64
 	// ServerSecret is the HMAC key for /guarded. Empty string disables
 	// /guarded entirely — the route is not registered, public callers get
 	// 404. When non-empty, both scopecache (validating tokens) and the
@@ -123,6 +142,9 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.MaxMultiCallCount <= 0 {
 		c.MaxMultiCallCount = MaxMultiCallCount
+	}
+	if c.MaxInboxBytes <= 0 {
+		c.MaxInboxBytes = int64(MaxInboxKiB) << 10
 	}
 	return c
 }

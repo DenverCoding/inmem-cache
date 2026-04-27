@@ -382,3 +382,134 @@ func TestInbox_TenantCannotReadOwnInbox(t *testing.T) {
 		t.Errorf("payload changed in transit: %s", payload)
 	}
 }
+
+// --- /inbox payload cap ------------------------------------------------------
+
+// newInboxHandlerCap builds a handler with a custom MaxInboxBytes so
+// tests can probe the cap edge with small (deterministic) payloads.
+// All other capacity knobs match newInboxHandler.
+func newInboxHandlerCap(t *testing.T, maxInboxBytes int64, scopes ...string) (http.Handler, *API) {
+	t.Helper()
+	api := NewAPI(NewStore(Config{
+		ScopeMaxItems:     100,
+		MaxStoreBytes:     100 << 20,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  25 << 20,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+		MaxInboxBytes:     maxInboxBytes,
+		ServerSecret:      testServerSecret,
+		InboxScopes:       scopes,
+		EnableAdmin:       true,
+	}))
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+	return mux, api
+}
+
+// Default Config (zero MaxInboxBytes) must yield 64 KiB per /inbox
+// payload — the documented compile-time default. Pinning this on the
+// wire stops a future refactor from silently switching the default to
+// MaxItemBytes again, which is the regression this whole feature
+// exists to prevent.
+func TestInbox_DefaultCapIs64KiB(t *testing.T) {
+	h, _ := newInboxHandler(t, "_inbox") // no MaxInboxBytes → uses default
+	provisionTenant(t, h, "alice")
+
+	// 65 KiB payload (one byte over the default 64 KiB) must be
+	// rejected with a 400 that names both the actual size and the cap.
+	bigPayload := strings.Repeat("a", (64<<10)+1)
+	body := fmt.Sprintf(`{"token":"alice","scope":"_inbox","payload":"%s"}`, bigPayload)
+	code, out, raw := doRequest(t, h, "POST", "/inbox", body)
+	if code != 400 {
+		t.Fatalf("over-cap on default config: code=%d want 400, body=%.200s", code, raw)
+	}
+	errStr, _ := out["error"].(string)
+	if !strings.Contains(errStr, "exceeds the /inbox cap") {
+		t.Errorf("error message does not name /inbox cap: %s", errStr)
+	}
+	// Cap value 65536 must appear in the message — that's the
+	// operator's hint to either shrink the payload or raise
+	// SCOPECACHE_MAX_INBOX_KB.
+	if !strings.Contains(errStr, "65536") {
+		t.Errorf("error message does not name the cap value (65536): %s", errStr)
+	}
+}
+
+// At-cap (exactly maxInboxBytes) must succeed; one byte over must
+// fail. Boundary check on the inequality (`>` not `>=`).
+func TestInbox_CapBoundary(t *testing.T) {
+	const cap = 1024
+	h, _ := newInboxHandlerCap(t, cap, "_inbox")
+	provisionTenant(t, h, "alice")
+
+	// JSON-encoded string payload of length cap. The serialized form is
+	// `"<cap chars>"` — len = cap + 2 (the quotes). We need
+	// len(req.Payload) == cap, so we use a string of length cap-2.
+	atCap := `"` + strings.Repeat("a", cap-2) + `"`
+	if int64(len(atCap)) != cap {
+		t.Fatalf("test bug: at-cap payload is %d bytes, want %d", len(atCap), cap)
+	}
+	body := fmt.Sprintf(`{"token":"alice","scope":"_inbox","payload":%s}`, atCap)
+	code, _, raw := doRequest(t, h, "POST", "/inbox", body)
+	if code != 200 {
+		t.Errorf("at-cap should succeed: code=%d body=%.200s", code, raw)
+	}
+
+	// One byte over.
+	overCap := `"` + strings.Repeat("a", cap-1) + `"`
+	if int64(len(overCap)) != cap+1 {
+		t.Fatalf("test bug: over-cap payload is %d bytes, want %d", len(overCap), cap+1)
+	}
+	body = fmt.Sprintf(`{"token":"alice","scope":"_inbox","payload":%s}`, overCap)
+	code, _, raw = doRequest(t, h, "POST", "/inbox", body)
+	if code != 400 {
+		t.Errorf("over-cap by 1 byte should fail: code=%d body=%.200s", code, raw)
+	}
+}
+
+// The /inbox cap is independent of the per-item cap — even when a
+// tenant could legitimately /append a 1 MiB item, /inbox rejects
+// anything over the inbox cap. This pins the "tighter than per-item
+// by design" guarantee.
+func TestInbox_CapIsIndependentOfPerItemCap(t *testing.T) {
+	// Per-item cap 1 MiB (default), inbox cap 16 KiB.
+	h, _ := newInboxHandlerCap(t, 16<<10, "_inbox")
+	provisionTenant(t, h, "alice")
+
+	// 32 KiB payload — well under per-item cap, well over inbox cap.
+	bigPayload := strings.Repeat("x", 32<<10)
+	body := fmt.Sprintf(`{"token":"alice","scope":"_inbox","payload":"%s"}`, bigPayload)
+	code, out, raw := doRequest(t, h, "POST", "/inbox", body)
+	if code != 400 {
+		t.Fatalf("over inbox-cap (well under item cap): code=%d body=%.200s", code, raw)
+	}
+	if errStr, _ := out["error"].(string); !strings.Contains(errStr, "/inbox cap") {
+		t.Errorf("error should name /inbox cap, not per-item cap: %s", errStr)
+	}
+}
+
+// The cap check runs BEFORE the auth-gate, mirroring /guarded's
+// pre-flight response-cap check. Reasoning: a misconfigured tenant
+// that hits the inbox cap should learn about the cap, not get a
+// confusing tenant_not_provisioned hiding the real issue. This test
+// pins that ordering.
+func TestInbox_CapCheckRunsBeforeAuth(t *testing.T) {
+	h, _ := newInboxHandlerCap(t, 1024, "_inbox")
+	// Deliberately do NOT provision the tenant — auth will fail if
+	// reached.
+
+	bigPayload := strings.Repeat("a", 2048)
+	body := fmt.Sprintf(`{"token":"unprovisioned","scope":"_inbox","payload":"%s"}`, bigPayload)
+	code, out, raw := doRequest(t, h, "POST", "/inbox", body)
+	if code != 400 {
+		t.Fatalf("code=%d body=%.200s", code, raw)
+	}
+	errStr, _ := out["error"].(string)
+	if strings.Contains(errStr, "tenant_not_provisioned") {
+		t.Errorf("auth check ran before cap check (or instead of it): %s", errStr)
+	}
+	if !strings.Contains(errStr, "/inbox cap") {
+		t.Errorf("expected /inbox cap error, got: %s", errStr)
+	}
+}
