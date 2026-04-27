@@ -25,9 +25,9 @@ const (
 	// accidental blob uploads. Overridable via SCOPECACHE_MAX_INBOX_KB
 	// (integer KiB — KiB-granular because the meaningful range is
 	// sub-MiB; all other byte-knobs are MiB).
-	MaxInboxKiB = 64
-	MaxScopeBytes     = 256
-	MaxIDBytes        = 256
+	MaxInboxKiB   = 64
+	MaxScopeBytes = 256
+	MaxIDBytes    = 256
 
 	// SingleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
