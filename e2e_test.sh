@@ -835,6 +835,157 @@ call 'gd: rejects /delete_scope sub-call' 400 POST /guarded \
 call 'gd: rejects /render sub-call'       400 POST /guarded \
     "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/render\",\"query\":{\"scope\":\"events\",\"id\":\"e1\"}}]}"
 
+# Method-aware scope-placement (rewriteCallScope, v0.5.20): GET
+# sub-calls must carry scope in query — body.scope is ignored by
+# the inner handler. The /guarded dispatcher rejects up-front
+# with a clear, method-named error instead of letting the call
+# fall through and 400 with a vague "missing scope" downstream.
+call 'gd: GET with body.scope rejected before dispatch' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/get\",\"body\":{\"scope\":\"events\",\"id\":\"e1\"}}]}"
+case $LAST_BODY in
+    *'must be in query for GET'*) okmsg 'gd: GET body.scope rejected with clear method-aware error' ;;
+    *) bad "gd: expected GET body.scope method-aware error: $LAST_BODY" ;;
+esac
+
+# Method-aware scope-placement, POST counterpart: POST sub-calls
+# must carry scope in body — query.scope is ignored by the inner
+# handler. Plus a side-effect check via /admin /get on the
+# rewritten scope: a properly up-front-rejected POST must not have
+# committed the item, even though the body had a valid id+payload.
+call 'gd: POST with query.scope rejected before dispatch' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/append\",\"query\":{\"scope\":\"events\"},\"body\":{\"id\":\"bad-post-query-scope\",\"payload\":1}}]}"
+case $LAST_BODY in
+    *'must be in body for POST'*) okmsg 'gd: POST query.scope rejected with clear method-aware error' ;;
+    *) bad "gd: expected POST query.scope method-aware error: $LAST_BODY" ;;
+esac
+admin_call_query 'gd: POST query.scope reject created no item' 200 /get \
+    "{\"scope\":\"_guarded:${TENANT_A_CAP}:events\",\"id\":\"bad-post-query-scope\"}"
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: POST query.scope reject had no side effect' ;;
+    *) bad "gd: POST query.scope reject created data: $LAST_BODY" ;;
+esac
+
+# Whole-batch prevalidation: rewriteCallScope walks every call
+# before the dispatch loop, so a malformed later call must reject
+# the entire batch and leave the earlier valid /append unapplied.
+# Different error path than #1/#2: query.scope here is a JSON
+# object, not a string, so the failure point is the
+# json.Unmarshal-to-string inside rewriteCallScope.
+call 'gd: malformed later query rejects whole batch' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"prevalid-should-not-land\",\"payload\":{\"v\":1}}},{\"path\":\"/get\",\"query\":{\"scope\":{\"bad\":\"object\"},\"id\":\"e1\"}}]}"
+case $LAST_BODY in
+    *'in query is not a string'*) okmsg 'gd: malformed later query rejected before dispatch' ;;
+    *) bad "gd: expected malformed-query-scope error: $LAST_BODY" ;;
+esac
+admin_call_query 'gd: prevalidation prevented earlier append' 200 /get \
+    "{\"scope\":\"_guarded:${TENANT_A_CAP}:events\",\"id\":\"prevalid-should-not-land\"}"
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: no partial side effect before malformed later call' ;;
+    *) bad "gd: malformed later call allowed partial append: $LAST_BODY" ;;
+esac
+
+# Token revocation flow: deleting the _tokens item for a
+# capabilityID disables that token immediately on the next
+# /guarded request. Distinct from the random-token reject above —
+# random-token never had a _tokens entry; this test proves the
+# transition from valid → invalid for a token that *was* working.
+# Re-provision at the end so later tests in this section still see
+# tenant A as a valid token.
+admin_call 'gd: revoke tenant A token' 200 /delete \
+    "{\"scope\":\"_tokens\",\"id\":\"${TENANT_A_CAP}\"}"
+call 'gd: revoked tenant A token rejected' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"after-revoke\",\"payload\":1}}]}"
+case $LAST_BODY in
+    *'tenant_not_provisioned'*) okmsg 'gd: revoked token gets tenant_not_provisioned' ;;
+    *) bad "gd: expected tenant_not_provisioned after revoke: $LAST_BODY" ;;
+esac
+admin_call_query 'gd: revoked token created no item' 200 /get \
+    "{\"scope\":\"_guarded:${TENANT_A_CAP}:events\",\"id\":\"after-revoke\"}"
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: revoked token had no side effect' ;;
+    *) bad "gd: revoked token created data: $LAST_BODY" ;;
+esac
+admin_call 'gd: re-provision tenant A after revoke test' 200 /upsert \
+    "{\"scope\":\"_tokens\",\"id\":\"${TENANT_A_CAP}\",\"payload\":{\"tenant\":\"A\",\"reissued\":true}}"
+
+# Cross-tenant delete isolation. /guarded permits /delete and
+# /delete_up_to within the tenant's own _guarded:<capID>:* prefix;
+# this proves the scope-rewrite isolates deletes the same way it
+# isolates reads. Both tenants append the same logical id "deliso"
+# (which lives in physically different scopes after rewrite); A
+# deletes; A's row is gone, B's row survives unchanged.
+guarded_call 'gd: tenant A append delete-isolation item' 200 "$TENANT_A_TOKEN" /append \
+    '{"scope":"events","id":"deliso","payload":{"tenant":"A"}}'
+guarded_call 'gd: tenant B append delete-isolation item' 200 "$TENANT_B_TOKEN" /append \
+    '{"scope":"events","id":"deliso","payload":{"tenant":"B"}}'
+guarded_call 'gd: tenant A deletes own deliso' 200 "$TENANT_A_TOKEN" /delete \
+    '{"scope":"events","id":"deliso"}'
+guarded_call_query 'gd: tenant A deliso gone' 200 "$TENANT_A_TOKEN" /get \
+    '{"scope":"events","id":"deliso"}'
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: tenant A delete removed only A item' ;;
+    *) bad "gd: tenant A deliso still exists: $LAST_BODY" ;;
+esac
+guarded_call_query 'gd: tenant B deliso still present' 200 "$TENANT_B_TOKEN" /get \
+    '{"scope":"events","id":"deliso"}'
+case $LAST_BODY in
+    *'"tenant":"B"'*) okmsg 'gd: tenant B item survived tenant A delete' ;;
+    *) bad "gd: tenant B item missing after tenant A delete: $LAST_BODY" ;;
+esac
+
+# Counter self-healing. The two internal counter scopes
+# (_counters_count_calls, _counters_count_kb) are auto-provisioned
+# by ensureScope on the first /guarded call after they go missing.
+# Documented in guardedflow.md §M as the recovery path after a
+# /wipe; this test exercises the same path via /admin
+# /delete_scope so a regression in either ensureScope (commit
+# 165628b made it overhead-aware) or guardedIncrementCounters'
+# nil-tolerant skip would surface here. Only the calls counter is
+# checked because the kb counter only fires when the response
+# crosses 1 KiB, and a single /get response stays well below that.
+admin_call 'gd: delete calls counter scope' 200 /delete_scope \
+    '{"scope":"_counters_count_calls"}'
+admin_call 'gd: delete kb counter scope' 200 /delete_scope \
+    '{"scope":"_counters_count_kb"}'
+guarded_call_query 'gd: guarded still works after counter scope delete' 200 "$TENANT_A_TOKEN" /get \
+    '{"scope":"events","id":"e1"}'
+admin_call_query 'gd: calls counter scope recreated' 200 /get \
+    "{\"scope\":\"_counters_count_calls\",\"id\":\"${TENANT_A_CAP}\"}"
+case $LAST_BODY in
+    *'"hit":true'*) okmsg 'gd: calls counter recreated after delete_scope' ;;
+    *) bad "gd: calls counter not recreated: $LAST_BODY" ;;
+esac
+
+# /guarded count-overflow with side-effect check. Default
+# maxMultiCallCount is 10; 11 sub-calls must reject before
+# dispatch — the check sits in step 3 of handleGuarded, well
+# before rewriteCallScope (step 7) and the dispatch loop (step
+# 8). The side-effect probe verifies the first /append never
+# committed, proving the rejection is pre-dispatch and not
+# "first call applied, then reject". Mirrors the existing
+# /multi_call count-overflow test but on the /guarded path.
+gd_11="{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":["
+i=1
+while [ $i -le 11 ]; do
+    if [ $i -gt 1 ]; then
+        gd_11="${gd_11},"
+    fi
+    gd_11="${gd_11}{\"path\":\"/append\",\"body\":{\"scope\":\"events\",\"id\":\"too-many-$i\",\"payload\":$i}}"
+    i=$((i+1))
+done
+gd_11="${gd_11}]}"
+call 'gd: rejects over max call count' 400 POST /guarded "$gd_11"
+case $LAST_BODY in
+    *'maximum is 10'*) okmsg 'gd: over max call count names the cap' ;;
+    *) bad "gd: expected 'maximum is 10' in error: $LAST_BODY" ;;
+esac
+admin_call_query 'gd: over max count created no first item' 200 /get \
+    "{\"scope\":\"_guarded:${TENANT_A_CAP}:events\",\"id\":\"too-many-1\"}"
+case $LAST_BODY in
+    *'"hit":false'*) okmsg 'gd: over max call count had no side effect' ;;
+    *) bad "gd: over max call count created data: $LAST_BODY" ;;
+esac
+
 # Two-tenant isolation: tenant B reads events and sees nothing of A's data.
 guarded_call_query 'gd: tenant B isolated read' 200 "$TENANT_B_TOKEN" /get '{"scope":"events","id":"e1"}'
 case $LAST_BODY in
