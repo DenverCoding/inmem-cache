@@ -14,7 +14,7 @@ module github.com/VeloxCoding/scopecache/caddymodule
 go 1.25.0
 
 require (
-	github.com/VeloxCoding/scopecache v0.5.19
+	github.com/VeloxCoding/scopecache v0.5.20
 	github.com/caddyserver/caddy/v2 v2.11.2
 )
 
