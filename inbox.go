@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -158,16 +157,7 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	// the public reserved-prefix check, which is the right semantic:
 	// /inbox is operator-opted-in for these specific scope names.
 	if _, err := api.store.AppendOne(item); err != nil {
-		var sfe *ScopeFullError
-		if errors.As(err, &sfe) {
-			scopeFull(w, started, []ScopeCapacityOffender{
-				{Scope: req.Scope, Count: sfe.Count, Cap: sfe.Cap},
-			})
-			return
-		}
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		if writeStoreCapacityError(w, started, err, req.Scope) {
 			return
 		}
 		// ScopeDetachedError or any other error → 409.

@@ -47,6 +47,50 @@ func rejectReservedScope(r *http.Request, w http.ResponseWriter, started time.Ti
 	return false
 }
 
+// writeStoreCapacityError centralises the per-handler error-handling
+// for the three capacity-class errors the store can return on a write
+// path: *ScopeFullError (single-item over per-scope cap), the bulk
+// equivalent *ScopeCapacityError (carries an offender list), and
+// *StoreFullError (over the store-wide byte cap). All seven write
+// handlers (/append, /upsert, /counter_add, /inbox single-item +
+// /warm, /rebuild bulk + /update which only sees stfe) call this
+// before doing any handler-specific error dispatch.
+//
+// Returns true when one of the three was matched and the response
+// has been written — the caller should `return` immediately. Returns
+// false otherwise; the caller falls back to its own error handling
+// (typically `conflict(...)`, plus counter-specific errors for
+// /counter_add).
+//
+// `scopeForSFE` is the scope name plumbed into the single-element
+// offenders list on the *ScopeFullError path. It is **unused** for
+// callers that cannot produce sfe — /warm and /rebuild produce
+// *ScopeCapacityError (which carries its own offender list) and
+// /update produces only *StoreFullError. Those callers pass "".
+// The unused-param wart is preferable to splitting into two helpers
+// that would duplicate the stfe block (the most likely candidate
+// for future drift).
+func writeStoreCapacityError(w http.ResponseWriter, started time.Time, err error, scopeForSFE string) bool {
+	var sfe *ScopeFullError
+	if errors.As(err, &sfe) {
+		scopeFull(w, started, []ScopeCapacityOffender{
+			{Scope: scopeForSFE, Count: sfe.Count, Cap: sfe.Cap},
+		})
+		return true
+	}
+	var sce *ScopeCapacityError
+	if errors.As(err, &sce) {
+		scopeFull(w, started, sce.Offenders)
+		return true
+	}
+	var stfe *StoreFullError
+	if errors.As(err, &stfe) {
+		storeFull(w, started, stfe)
+		return true
+	}
+	return false
+}
+
 type API struct {
 	store *Store
 	// maxBulkBytes is the per-request body cap for /warm and /rebuild. It is
@@ -362,16 +406,7 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	origScope := item.Scope
 	item, err := api.store.AppendOne(item)
 	if err != nil {
-		var sfe *ScopeFullError
-		if errors.As(err, &sfe) {
-			scopeFull(w, started, []ScopeCapacityOffender{
-				{Scope: origScope, Count: sfe.Count, Cap: sfe.Cap},
-			})
-			return
-		}
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
 		conflict(w, started, err.Error())
@@ -408,14 +443,9 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	grouped := groupItemsByScope(req.Items)
 	replacedScopes, err := api.store.replaceScopes(grouped)
 	if err != nil {
-		var sce *ScopeCapacityError
-		if errors.As(err, &sce) {
-			scopeFull(w, started, sce.Offenders)
-			return
-		}
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		// /warm cannot produce *ScopeFullError (only single-item paths do);
+		// scopeForSFE is unused here.
+		if writeStoreCapacityError(w, started, err, "") {
 			return
 		}
 		conflict(w, started, err.Error())
@@ -463,14 +493,9 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	grouped := groupItemsByScope(req.Items)
 	rebuiltScopes, rebuiltItems, err := api.store.rebuildAll(grouped)
 	if err != nil {
-		var sce *ScopeCapacityError
-		if errors.As(err, &sce) {
-			scopeFull(w, started, sce.Offenders)
-			return
-		}
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		// /rebuild cannot produce *ScopeFullError (only single-item paths
+		// do); scopeForSFE is unused here.
+		if writeStoreCapacityError(w, started, err, "") {
 			return
 		}
 		conflict(w, started, err.Error())
@@ -514,16 +539,7 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	origScope := item.Scope
 	result, created, err := api.store.UpsertOne(item)
 	if err != nil {
-		var sfe *ScopeFullError
-		if errors.As(err, &sfe) {
-			scopeFull(w, started, []ScopeCapacityOffender{
-				{Scope: origScope, Count: sfe.Count, Cap: sfe.Cap},
-			})
-			return
-		}
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
 		conflict(w, started, err.Error())
@@ -568,16 +584,12 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 	origScope := req.Scope
 	value, created, err := api.store.CounterAddOne(req.Scope, req.ID, by)
 	if err != nil {
-		var sfe *ScopeFullError
-		if errors.As(err, &sfe) {
-			scopeFull(w, started, []ScopeCapacityOffender{
-				{Scope: origScope, Count: sfe.Count, Cap: sfe.Cap},
-			})
-			return
-		}
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		// Common capacity-class errors first (sfe + stfe). Counter-
+		// specific errors (cpe → 409, coe → 400) are handled inline
+		// below — they do not fit the helper because cpe maps to
+		// `conflict` and coe maps to `badRequest`, not to the
+		// scope/store-full responders.
+		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
 		var cpe *CounterPayloadError
@@ -641,9 +653,10 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		updated, err = buf.updateBySeq(item.Seq, item.Payload, item.Ts)
 	}
 	if err != nil {
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
+		// /update only ever sees *StoreFullError on the cap path
+		// (existing-item replace can grow byte size); scopeForSFE is
+		// unused.
+		if writeStoreCapacityError(w, started, err, "") {
 			return
 		}
 		conflict(w, started, err.Error())
