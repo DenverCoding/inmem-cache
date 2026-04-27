@@ -985,6 +985,248 @@ case $LAST_BODY in
     *) okmsg 'ib: /guarded read of inbox carries no inbox payload' ;;
 esac
 
+# --- mega deterministic state-machine test ------------------------------------
+# One large end-to-end invariant test. Drives a full sequence:
+#   wipe → /rebuild → 50 appends → updates → 50 ts-appends → updates →
+#   explicit deletes → extra appends → delete_up_to → ts-range read+delete →
+#   /multi_call read-back of the entire final state → /stats verification.
+#
+# Every step is deterministic in seq numbering, so the trailing
+# json_assert can compare against fully-populated expected arrays
+# instead of just count/presence. Catches regressions that:
+#   - rewind seq under update/delete cycles
+#   - drop one row and silently insert another
+#   - leave per-scope counters out of sync with item-count
+#   - fail to refresh ts-index on /update of an existing item
+#   - leak items across scopes
+#   - return mis-ordered slices from /head or /ts_range
+#
+# Uses the global quiet_call helper (defined near the top of the
+# file). Earlier draft of this block redefined quiet_call inline
+# without the pass=$((pass+1)) increment — leaving it in would
+# silently undercount this whole section and shadow the helper for
+# anything after it.
+say '== mega state-machine =='
+
+say '== mega: clean slate + rebuild =='
+admin_call 'mega: wipe before state-machine' 200 /wipe
+
+mega_rebuild_body='{"items":['
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_data","id":"seed1","payload":{"phase":"rebuild","n":1}},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_data","id":"seed2","payload":{"phase":"rebuild","n":2}},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_data","id":"seed3","payload":{"phase":"rebuild","n":3}},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_ts","id":"ts_seed1","payload":{"phase":"rebuild","n":1},"ts":1000},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_ts","id":"ts_seed2","payload":{"phase":"rebuild","n":2},"ts":2000},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_other","id":"o1","payload":{"kind":"other","n":1}},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_other","id":"o2","payload":{"kind":"other","n":2}}'
+mega_rebuild_body="${mega_rebuild_body}"']}'
+admin_call 'mega: rebuild seed data' 200 /rebuild "$mega_rebuild_body"
+
+# mega_data after rebuild: seed1=1, seed2=2, seed3=3.
+# Append d1..d50 → d_i = seq (3+i).
+say '== mega: append 50 normal items =='
+i=1
+while [ $i -le 50 ]; do
+    quiet_call "mega: append mega_data d$i" 200 POST /append \
+        "{\"scope\":\"mega_data\",\"id\":\"d$i\",\"payload\":{\"kind\":\"data\",\"v\":$i}}"
+    i=$((i+1))
+done
+
+# /update preserves seq: d10 stays seq=13, d20 stays seq=23.
+say '== mega: updates on normal items =='
+quiet_call 'mega: update d10' 200 POST /update \
+    '{"scope":"mega_data","id":"d10","payload":{"kind":"data","v":1000,"updated":true}}'
+quiet_call 'mega: update d20' 200 POST /update \
+    '{"scope":"mega_data","id":"d20","payload":{"kind":"data","v":2000,"updated":true}}'
+
+# mega_ts after rebuild: ts_seed1=1, ts_seed2=2.
+# Append t1..t50 → t_i = seq (2+i), ts = 10000 + i*100.
+say '== mega: append 50 ts items =='
+i=1
+while [ $i -le 50 ]; do
+    ts=$((10000 + i * 100))
+    quiet_call "mega: append mega_ts t$i" 200 POST /append \
+        "{\"scope\":\"mega_ts\",\"id\":\"t$i\",\"payload\":{\"kind\":\"ts\",\"v\":$i},\"ts\":$ts}"
+    i=$((i+1))
+done
+
+# t20 keeps seq=22; payload + ts both overwritten by /update.
+quiet_call 'mega: update t20 payload + ts' 200 POST /update \
+    '{"scope":"mega_ts","id":"t20","payload":{"kind":"ts","v":2000,"updated":true},"ts":77777}'
+
+say '== mega: explicit deletes =='
+quiet_call 'mega: delete mega_data d3' 200 POST /delete '{"scope":"mega_data","id":"d3"}'
+quiet_call 'mega: delete mega_data d49' 200 POST /delete '{"scope":"mega_data","id":"d49"}'
+quiet_call 'mega: delete mega_ts t5' 200 POST /delete '{"scope":"mega_ts","id":"t5"}'
+quiet_call 'mega: delete mega_ts t49' 200 POST /delete '{"scope":"mega_ts","id":"t49"}'
+
+# Extra appends. last_seq mega_data was 53, mega_ts was 52
+# (delete + update don't bump last_seq).
+say '== mega: extra appends after deletes =='
+quiet_call 'mega: append mega_data d51' 200 POST /append \
+    '{"scope":"mega_data","id":"d51","payload":{"kind":"data","v":51,"late":true}}'
+quiet_call 'mega: append mega_data d52' 200 POST /append \
+    '{"scope":"mega_data","id":"d52","payload":{"kind":"data","v":52,"late":true}}'
+quiet_call 'mega: append mega_data d53' 200 POST /append \
+    '{"scope":"mega_data","id":"d53","payload":{"kind":"data","v":53,"late":true}}'
+quiet_call 'mega: append mega_ts t51' 200 POST /append \
+    '{"scope":"mega_ts","id":"t51","payload":{"kind":"ts","v":51,"late":true},"ts":20000}'
+quiet_call 'mega: append mega_ts t52' 200 POST /append \
+    '{"scope":"mega_ts","id":"t52","payload":{"kind":"ts","v":52,"late":true},"ts":20100}'
+
+# delete_up_to:
+#   mega_data max_seq=5 → seed1, seed2, seed3, d1, d2 gone (d3 already gone).
+#   mega_ts max_seq=4 → ts_seed1, ts_seed2, t1, t2 gone.
+say '== mega: delete_up_to =='
+quiet_call 'mega: delete_up_to mega_data seq<=5' 200 POST /delete_up_to \
+    '{"scope":"mega_data","max_seq":5}'
+quiet_call 'mega: delete_up_to mega_ts seq<=4' 200 POST /delete_up_to \
+    '{"scope":"mega_ts","max_seq":4}'
+
+# /ts_range range delete: original t12..t16 had ts 11200..11600 and
+# survive every prior delete. Read first to assert the exact range
+# result, then delete by id (no delete-by-ts endpoint).
+say '== mega: delete by deterministic ts_range =='
+call 'mega: ts_range delete-window before delete' 200 GET \
+    '/ts_range?scope=mega_ts&since_ts=11200&until_ts=11600&limit=100'
+json_assert 'mega: ts_range delete-window exactly t12..t16' '
+    .count == 5 and
+    [.items[].id] == ["t12","t13","t14","t15","t16"] and
+    [.items[].seq] == [14,15,16,17,18] and
+    [.items[].ts] == [11200,11300,11400,11500,11600]
+'
+for id in t12 t13 t14 t15 t16; do
+    quiet_call "mega: delete ts-window $id" 200 POST /delete \
+        "{\"scope\":\"mega_ts\",\"id\":\"$id\"}"
+done
+
+# Expected final state, computed with jq so the assertion text
+# below is one line per scope rather than three pages of literals.
+mega_data_ids=$(jq -nc '[range(4;49) | "d"+tostring] + ["d50","d51","d52","d53"]')
+mega_data_seqs=$(jq -nc '[range(7;52)] + [53,54,55,56]')
+mega_ts_ids=$(jq -nc '
+    [range(3;53)
+     | select(. != 5 and . != 12 and . != 13 and . != 14 and . != 15 and . != 16 and . != 49)
+     | "t"+tostring]
+')
+mega_ts_seqs=$(jq -nc '
+    [range(3;53)
+     | select(. != 5 and . != 12 and . != 13 and . != 14 and . != 15 and . != 16 and . != 49)
+     | . + 2]
+')
+
+say '== mega: multi-get final state =='
+mega_multi='{"calls":['
+mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_data","limit":100}},'
+mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_ts","limit":100}},'
+mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_other","limit":10}},'
+mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":11200,"until_ts":11600,"limit":100}},'
+mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":77777,"until_ts":77777,"limit":10}}'
+mega_multi="${mega_multi}"']}'
+call 'mega: multi-get all final scopes' 200 POST /multi_call "$mega_multi"
+
+json_assert 'mega: multi-get outer envelope and statuses are correct' '
+    .ok == true and
+    .count == 5 and
+    ([.results[].status] == [200,200,200,200,200])
+'
+
+# Slot 0 — /head mega_data: full id+seq array equality, plus spot
+# checks on the three updated/late rows and absence of every
+# explicitly-removed id.
+if printf '%s' "$LAST_BODY" | jq -e \
+    --argjson ids "$mega_data_ids" \
+    --argjson seqs "$mega_data_seqs" '
+    .results[0].body.count == 49 and
+    .results[0].body.truncated == false and
+    ([.results[0].body.items[].id] == $ids) and
+    ([.results[0].body.items[].seq] == $seqs) and
+    (all(.results[0].body.items[]; .scope == "mega_data")) and
+    (any(.results[0].body.items[]; .id == "d10" and .seq == 13 and .payload.v == 1000 and .payload.updated == true)) and
+    (any(.results[0].body.items[]; .id == "d20" and .seq == 23 and .payload.v == 2000 and .payload.updated == true)) and
+    (any(.results[0].body.items[]; .id == "d51" and .seq == 54 and .payload.late == true)) and
+    ([.results[0].body.items[].id] | index("seed1") == null and index("seed2") == null and index("seed3") == null and index("d1") == null and index("d2") == null and index("d3") == null and index("d49") == null)
+' >/dev/null; then
+    okmsg 'mega: mega_data final ids, seqs, payloads and deletes are exact'
+else
+    bad "mega: mega_data final-state mismatch: $LAST_BODY"
+fi
+
+# Slot 1 — /head mega_ts: same shape, plus the t20 ts/payload
+# overwrite and the late t51/t52 entries.
+if printf '%s' "$LAST_BODY" | jq -e \
+    --argjson ids "$mega_ts_ids" \
+    --argjson seqs "$mega_ts_seqs" '
+    .results[1].body.count == 43 and
+    .results[1].body.truncated == false and
+    ([.results[1].body.items[].id] == $ids) and
+    ([.results[1].body.items[].seq] == $seqs) and
+    (all(.results[1].body.items[]; .scope == "mega_ts")) and
+    (any(.results[1].body.items[]; .id == "t20" and .seq == 22 and .ts == 77777 and .payload.v == 2000 and .payload.updated == true)) and
+    (any(.results[1].body.items[]; .id == "t51" and .seq == 53 and .ts == 20000 and .payload.late == true)) and
+    (any(.results[1].body.items[]; .id == "t52" and .seq == 54 and .ts == 20100 and .payload.late == true)) and
+    ([.results[1].body.items[].id] | index("ts_seed1") == null and index("ts_seed2") == null and index("t1") == null and index("t2") == null and index("t5") == null and index("t12") == null and index("t13") == null and index("t14") == null and index("t15") == null and index("t16") == null and index("t49") == null)
+' >/dev/null; then
+    okmsg 'mega: mega_ts final ids, seqs, ts, payloads and deletes are exact'
+else
+    bad "mega: mega_ts final-state mismatch: $LAST_BODY"
+fi
+
+# Slot 2 — /head mega_other: untouched throughout.
+if printf '%s' "$LAST_BODY" | jq -e '
+    .results[2].body.count == 2 and
+    .results[2].body.truncated == false and
+    ([.results[2].body.items[].id] == ["o1","o2"]) and
+    ([.results[2].body.items[].seq] == [1,2]) and
+    (all(.results[2].body.items[]; .scope == "mega_other")) and
+    ([.results[2].body.items[].payload.n] == [1,2])
+' >/dev/null; then
+    okmsg 'mega: mega_other untouched after whole state-machine'
+else
+    bad "mega: mega_other final-state mismatch: $LAST_BODY"
+fi
+
+# Slot 3 — /ts_range over the deleted window: must be empty.
+if printf '%s' "$LAST_BODY" | jq -e '
+    .results[3].body.count == 0 and
+    .results[3].body.items == [] and
+    .results[3].body.truncated == false
+' >/dev/null; then
+    okmsg 'mega: deleted ts_range [11200,11600] is now empty'
+else
+    bad "mega: deleted ts_range still contains data: $LAST_BODY"
+fi
+
+# Slot 4 — /ts_range at the t20-overwrite ts: proves /update
+# refreshed the ts index, not just the payload.
+if printf '%s' "$LAST_BODY" | jq -e '
+    .results[4].body.count == 1 and
+    .results[4].body.items[0].id == "t20" and
+    .results[4].body.items[0].seq == 22 and
+    .results[4].body.items[0].ts == 77777 and
+    .results[4].body.items[0].payload.updated == true
+' >/dev/null; then
+    okmsg 'mega: updated t20 is reachable at new ts=77777'
+else
+    bad "mega: updated t20 ts lookup mismatch: $LAST_BODY"
+fi
+
+# /stats final invariant: scope_count, total_items, and per-scope
+# item_count + last_seq must all line up with the arithmetic above.
+say '== mega: stats final state =='
+admin_call 'mega: stats final' 200 /stats
+json_assert 'mega: /stats scope_count, total_items, item_count and last_seq are exact' '
+    .ok == true and
+    .scope_count == 3 and
+    .total_items == 94 and
+    .scopes.mega_data.item_count == 49 and
+    .scopes.mega_data.last_seq == 56 and
+    .scopes.mega_ts.item_count == 43 and
+    .scopes.mega_ts.last_seq == 54 and
+    .scopes.mega_other.item_count == 2 and
+    .scopes.mega_other.last_seq == 2
+'
+
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='
 admin_call 'wipe'                       200 /wipe
