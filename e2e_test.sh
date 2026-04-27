@@ -17,7 +17,13 @@
 # Every assertion is transport-agnostic — passing on both modes proves the
 # standalone adapter and the Caddy adapter behave identically.
 #
-# The script fails fast on the first unexpected status code or body shape.
+# The script does NOT fail fast. Every assertion runs, every failure is
+# logged with its label and observed body, and the trailing summary
+# reports `pass: N / fail: M`. The process exits 1 when at least one
+# assertion failed, otherwise 0. This is deliberate: e2e regressions
+# often cluster (a route change cascades into multiple shape checks),
+# and a single run that surfaces the whole set is more useful than
+# fixing one error, rerunning, and finding the next.
 
 set -eu
 
