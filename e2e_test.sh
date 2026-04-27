@@ -214,9 +214,13 @@ guarded_call() {
     LAST_BODY=$_slotBody
 }
 
-# admin_call_query: like admin_call but for GET-style sub-calls (head,
-# tail, get, ts_range, render, stats) that take a query map instead of
-# a body. The query argument is a JSON object string.
+# admin_call_query: like admin_call but for GET-style sub-calls
+# (head, tail, get, ts_range, stats, delete_scope_candidates) that
+# take a query map instead of a body. The query argument is a JSON
+# object string. /render is intentionally NOT in /admin's whitelist
+# (raw payload bytes don't fit a JSON results array cleanly), so it
+# is unreachable through this helper — operators reach /render
+# directly on the public mux.
 admin_call_query() {
     _label=$1; _want=$2; _path=$3; _query=$4
     _envelope="{\"calls\":[{\"path\":\"$_path\",\"query\":$_query}]}"
