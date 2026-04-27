@@ -30,6 +30,15 @@ set -eu
 SOCK=${SOCK-/run/scopecache.sock}
 BASE=${BASE:-http://localhost}
 
+# Per-process scratch file for the most recent curl response body.
+# Originally a hardcoded /tmp/body, which two parallel runs of this
+# script would race on (and which leaves stale bytes behind on a
+# crashed run that the next invocation could read by mistake).
+# mktemp gives us an isolated path; the EXIT trap cleans up on any
+# exit, success or failure.
+RESP_BODY=$(mktemp)
+trap 'rm -f "$RESP_BODY"' EXIT INT TERM
+
 pass=0
 fail=0
 
@@ -51,16 +60,16 @@ req() {
     _method=$1; _path=$2; _body=${3:-}
     if [ -n "$_body" ]; then
         # shellcheck disable=SC2086
-        curl -s -o /tmp/body -w '%{http_code}' $_sockargs \
+        curl -s -o "$RESP_BODY" -w '%{http_code}' $_sockargs \
              -X "$_method" -H 'Content-Type: application/json' \
              -d "$_body" "$BASE$_path"
     else
         # shellcheck disable=SC2086
-        curl -s -o /tmp/body -w '%{http_code}' $_sockargs \
+        curl -s -o "$RESP_BODY" -w '%{http_code}' $_sockargs \
              -X "$_method" "$BASE$_path"
     fi
     printf '\n'
-    cat /tmp/body
+    cat "$RESP_BODY"
 }
 
 expect() {
