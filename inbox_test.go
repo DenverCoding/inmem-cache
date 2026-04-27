@@ -213,6 +213,26 @@ func TestInbox_NullPayload(t *testing.T) {
 	}
 }
 
+// /inbox shares payloadPresent() with the other write paths
+// (/append, /upsert, /update). That helper trims whitespace around
+// `null` before comparing — so `" null "` must reject just like
+// `null`. Without using payloadPresent, the inbox handler's earlier
+// hand-rolled check let `" null "` slip past the first guard and
+// only fail later inside validateWriteItem; same final 400, but
+// inconsistent error path that would drift under refactor.
+func TestInbox_PayloadNullWithWhitespace(t *testing.T) {
+	h, _ := newInboxHandler(t, "_inbox")
+	provisionTenant(t, h, "alice")
+	body := `{"token":"alice","scope":"_inbox","payload": null }`
+	code, _, raw := doRequest(t, h, "POST", "/inbox", body)
+	if code != 400 {
+		t.Fatalf("whitespace-padded null payload accepted: code=%d body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "'payload' field is required") {
+		t.Errorf("expected 'payload required' error, got: %s", raw)
+	}
+}
+
 // --- scope allowlist ----------------------------------------------------------
 
 func TestInbox_ScopeNotInAllowlist(t *testing.T) {

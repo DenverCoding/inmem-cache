@@ -66,7 +66,7 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, "the 'scope' field is required")
 		return
 	}
-	if len(req.Payload) == 0 || string(req.Payload) == "null" {
+	if !payloadPresent(req.Payload) {
 		badRequest(w, started, "the 'payload' field is required")
 		return
 	}
