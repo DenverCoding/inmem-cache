@@ -73,12 +73,16 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision builds the core Store + API and registers its routes on an
-// internal mux. Called once per module instance at Caddy start / config reload.
+// internal mux. Called once per module instance at Caddy start / config
+// reload. Zero-valued numeric directives fall back to the core's
+// compile-time defaults via Config.WithDefaults inside NewStore — this
+// adapter just translates the JSON / Caddyfile shape to a Config and
+// hands it over.
 func (h *Handler) Provision(_ caddy.Context) error {
 	if err := h.validateConfig(); err != nil {
 		return err
 	}
-	cfg := scopecache.Config{
+	store := scopecache.NewStore(scopecache.Config{
 		ScopeMaxItems:     h.ScopeMaxItems,
 		MaxStoreBytes:     int64(h.MaxStoreMB) << 20,
 		MaxItemBytes:      int64(h.MaxItemMB) << 20,
@@ -86,27 +90,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
 		MaxMultiCallCount: h.MaxMultiCallCount,
 		ServerSecret:      h.ServerSecret,
-	}
-	if cfg.ScopeMaxItems == 0 {
-		cfg.ScopeMaxItems = scopecache.ScopeMaxItems
-	}
-	if cfg.MaxStoreBytes == 0 {
-		cfg.MaxStoreBytes = int64(scopecache.MaxStoreMiB) << 20
-	}
-	if cfg.MaxItemBytes == 0 {
-		cfg.MaxItemBytes = int64(scopecache.MaxItemBytes)
-	}
-	if cfg.MaxResponseBytes == 0 {
-		cfg.MaxResponseBytes = int64(scopecache.MaxResponseMiB) << 20
-	}
-	if cfg.MaxMultiCallBytes == 0 {
-		cfg.MaxMultiCallBytes = int64(scopecache.MaxMultiCallMiB) << 20
-	}
-	if cfg.MaxMultiCallCount == 0 {
-		cfg.MaxMultiCallCount = scopecache.MaxMultiCallCount
-	}
-
-	store := scopecache.NewStore(cfg)
+	})
 	h.api = scopecache.NewAPI(store)
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
