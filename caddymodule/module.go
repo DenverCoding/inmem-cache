@@ -14,8 +14,10 @@
 package caddymodule
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/VeloxCoding/scopecache"
 	"github.com/caddyserver/caddy/v2"
@@ -73,6 +75,9 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision builds the core Store + API and registers its routes on an
 // internal mux. Called once per module instance at Caddy start / config reload.
 func (h *Handler) Provision(_ caddy.Context) error {
+	if err := h.validateConfig(); err != nil {
+		return err
+	}
 	cfg := scopecache.Config{
 		ScopeMaxItems:     h.ScopeMaxItems,
 		MaxStoreBytes:     int64(h.MaxStoreMB) << 20,
@@ -178,6 +183,35 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("unrecognized option: %s", key)
 			}
 		}
+	}
+	return nil
+}
+
+// validateConfig rejects values the standalone binary's env-var parsers
+// would have ignored with a warning (negative integers) and config
+// shapes that almost certainly indicate operator error (whitespace-only
+// server_secret, typically the result of `{$VAR}` substituting an env
+// var that was set but contained nothing useful). Empty server_secret
+// stays a documented kill-switch — only AFTER trim != "" but BEFORE
+// trim == "" gets rejected.
+func (h *Handler) validateConfig() error {
+	for _, e := range []struct {
+		key   string
+		value int
+	}{
+		{"scope_max_items", h.ScopeMaxItems},
+		{"max_store_mb", h.MaxStoreMB},
+		{"max_item_mb", h.MaxItemMB},
+		{"max_response_mb", h.MaxResponseMB},
+		{"max_multi_call_mb", h.MaxMultiCallMB},
+		{"max_multi_call_count", h.MaxMultiCallCount},
+	} {
+		if e.value < 0 {
+			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)
+		}
+	}
+	if h.ServerSecret != "" && strings.TrimSpace(h.ServerSecret) == "" {
+		return fmt.Errorf("server_secret is set but contains only whitespace; either set a real value or remove the directive (empty disables /guarded)")
 	}
 	return nil
 }
