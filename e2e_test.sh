@@ -1116,19 +1116,26 @@ mega_ts_seqs=$(jq -nc '
 ')
 
 say '== mega: multi-get final state =='
+# Slots 5 + 6 prove ts-bounds invariants (no item below 10300, no
+# item above 77777). The cache does NOT expose oldest_ts/newest_ts
+# on /stats — those are derived properties, not tracked aggregates
+# — so two empty /ts_range queries outside the expected window are
+# the canonical way to assert it.
 mega_multi='{"calls":['
 mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_data","limit":100}},'
 mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_ts","limit":100}},'
 mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_other","limit":10}},'
 mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":11200,"until_ts":11600,"limit":100}},'
-mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":77777,"until_ts":77777,"limit":10}}'
+mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":77777,"until_ts":77777,"limit":10}},'
+mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":0,"until_ts":10299,"limit":10}},'
+mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":77778,"until_ts":99999999,"limit":10}}'
 mega_multi="${mega_multi}"']}'
 call 'mega: multi-get all final scopes' 200 POST /multi_call "$mega_multi"
 
 json_assert 'mega: multi-get outer envelope and statuses are correct' '
     .ok == true and
-    .count == 5 and
-    ([.results[].status] == [200,200,200,200,200])
+    .count == 7 and
+    ([.results[].status] == [200,200,200,200,200,200,200])
 '
 
 # Slot 0 — /head mega_data: full id+seq array equality, plus spot
@@ -1209,6 +1216,30 @@ if printf '%s' "$LAST_BODY" | jq -e '
     okmsg 'mega: updated t20 is reachable at new ts=77777'
 else
     bad "mega: updated t20 ts lookup mismatch: $LAST_BODY"
+fi
+
+# Slot 5 — ts-bounds floor: nothing in mega_ts has ts < 10300.
+# (delete_up_to removed t1 and t2 with ts 10100/10200; t3 at ts
+# 10300 should be the oldest survivor.)
+if printf '%s' "$LAST_BODY" | jq -e '
+    .results[5].body.count == 0 and
+    .results[5].body.items == []
+' >/dev/null; then
+    okmsg 'mega: no items below ts=10300 (oldest survivor is t3)'
+else
+    bad "mega: items leaked below ts=10300: $LAST_BODY"
+fi
+
+# Slot 6 — ts-bounds ceiling: nothing in mega_ts has ts > 77777.
+# (t20's /update bumped its ts to 77777; t52's late append used
+# ts=20100; nothing else got a higher ts.)
+if printf '%s' "$LAST_BODY" | jq -e '
+    .results[6].body.count == 0 and
+    .results[6].body.items == []
+' >/dev/null; then
+    okmsg 'mega: no items above ts=77777 (newest is updated t20)'
+else
+    bad "mega: items leaked above ts=77777: $LAST_BODY"
 fi
 
 # /stats final invariant: scope_count, total_items, and per-scope
