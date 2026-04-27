@@ -220,6 +220,63 @@ func TestGet_IncludesCountAndApproxResponseMB(t *testing.T) {
 	}
 }
 
+// TestEstimateMultiItemResponseBytes_IsLowerBound guards the pre-flight
+// helper's correctness invariant: the returned estimate must be at or
+// below the actual JSON-marshal size of the envelope that handleHead /
+// handleTail / handleTsRange produces. Overestimating would reject
+// legitimate calls; the post-flight cappedResponseWriter would never
+// see them.
+//
+// We sample a few representative shapes — empty payload, small
+// payload, large payload, multi-item batches — and compare the
+// estimate against an actual marshal of the same envelope shape.
+func TestEstimateMultiItemResponseBytes_IsLowerBound(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []Item
+	}{
+		{"empty", []Item{}},
+		{"one minimal", []Item{
+			{Scope: "s", Seq: 1, Payload: json.RawMessage(`null`)},
+		}},
+		{"one with id and payload", []Item{
+			{Scope: "scope-name", ID: "item-id", Seq: 42, Payload: json.RawMessage(`{"v":1,"name":"hello"}`)},
+		}},
+		{"three small", []Item{
+			{Scope: "s", ID: "a", Seq: 1, Payload: json.RawMessage(`{"v":1}`)},
+			{Scope: "s", ID: "b", Seq: 2, Payload: json.RawMessage(`{"v":2}`)},
+			{Scope: "s", ID: "c", Seq: 3, Payload: json.RawMessage(`{"v":3}`)},
+		}},
+		{"large payload", []Item{
+			{Scope: "s", ID: "big", Seq: 1, Payload: json.RawMessage(`"` + strings.Repeat("a", 4096) + `"`)},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			estimate := estimateMultiItemResponseBytes(tc.items)
+			envelope := map[string]interface{}{
+				"ok":                 true,
+				"hit":                len(tc.items) > 0,
+				"count":              len(tc.items),
+				"truncated":          false,
+				"items":              tc.items,
+				"duration_us":        9999,
+				"approx_response_mb": 0.0001,
+			}
+			actual, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatalf("marshal failed: %v", err)
+			}
+			actualLen := int64(len(actual))
+			if estimate > actualLen {
+				t.Errorf("estimate=%d > actual=%d (overestimate would reject legitimate calls)\nbody=%s",
+					estimate, actualLen, actual)
+			}
+		})
+	}
+}
+
 // TestResponseCap_ApproxResponseMBJSONShape verifies the patched-in size
 // field is valid JSON and parses as a number (MB type's MarshalJSON outputs
 // a bare float, not a string). Defends writeJSONWithMeta's slice-splice

@@ -14,8 +14,11 @@ import (
 // (/warm, /rebuild, /wipe, /stats, /delete_scope_candidates,
 // /delete_scope) that public callers do not see at all.
 //
-// Excluded: /help (text/plain, capability-independent), /multi_call,
-// /guarded, /admin (self-reference loops). See guardedflow.md §K.
+// Excluded: /help (text/plain, capability-independent), /render (raw
+// bytes don't fit a JSON results array — would silently corrupt the
+// envelope; operators reach /render directly on the public mux),
+// /multi_call, /guarded, /admin (self-reference loops). See
+// guardedflow.md §K.
 func (api *API) buildAdminCallSpecs() map[string]subCallSpec {
 	return map[string]subCallSpec{
 		"/append":                  {http.MethodPost, api.handleAppend},
@@ -32,7 +35,6 @@ func (api *API) buildAdminCallSpecs() map[string]subCallSpec {
 		"/warm":                    {http.MethodPost, api.handleWarm},
 		"/rebuild":                 {http.MethodPost, api.handleRebuild},
 		"/wipe":                    {http.MethodPost, api.handleWipe},
-		"/render":                  {http.MethodGet, api.handleRender},
 		"/stats":                   {http.MethodGet, api.handleStats},
 		"/delete_scope_candidates": {http.MethodGet, api.handleDeleteScopeCandidates},
 	}

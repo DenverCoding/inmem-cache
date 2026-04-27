@@ -359,23 +359,8 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, err := api.store.getOrCreateScope(item.Scope)
-	if err != nil {
-		// getOrCreateScope reserves the per-scope buffer overhead
-		// against the store-byte cap; that reservation can fail with
-		// StoreFullError when the store is at capacity. Surface as
-		// the standard 507 envelope instead of generic 400.
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
-			return
-		}
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	origScope := item.Scope
-	item, err = buf.appendItem(item)
+	item, err := api.store.AppendOne(item)
 	if err != nil {
 		var sfe *ScopeFullError
 		if errors.As(err, &sfe) {
@@ -526,23 +511,8 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, err := api.store.getOrCreateScope(item.Scope)
-	if err != nil {
-		// getOrCreateScope reserves the per-scope buffer overhead
-		// against the store-byte cap; that reservation can fail with
-		// StoreFullError when the store is at capacity. Surface as
-		// the standard 507 envelope instead of generic 400.
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
-			return
-		}
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	origScope := item.Scope
-	result, created, err := buf.upsertByID(item)
+	result, created, err := api.store.UpsertOne(item)
 	if err != nil {
 		var sfe *ScopeFullError
 		if errors.As(err, &sfe) {
@@ -595,21 +565,8 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, err := api.store.getOrCreateScope(req.Scope)
-	if err != nil {
-		// Same StoreFullError surfacing as the other auto-create
-		// callsites; see handleAppend for the rationale.
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
-			return
-		}
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	origScope := req.Scope
-	value, created, err := buf.counterAdd(req.Scope, req.ID, by)
+	value, created, err := api.store.CounterAddOne(req.Scope, req.ID, by)
 	if err != nil {
 		var sfe *ScopeFullError
 		if errors.As(err, &sfe) {
@@ -820,6 +777,9 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
+	if rejectReservedScope(r, w, started, req.Scope) {
+		return
+	}
 
 	deletedItems, deleted := api.store.deleteScope(req.Scope)
 
@@ -914,6 +874,10 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 	// effectively a miss and should not skew eviction.
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
+		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
+			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
+			return
+		}
 	}
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
@@ -960,6 +924,10 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 	items, truncated := buf.tailOffset(q.Limit, offset)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
+		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
+			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
+			return
+		}
 	}
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
@@ -1024,6 +992,10 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 	items, truncated := buf.tsRange(sinceTs, untilTs, q.Limit)
 	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
+		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
+			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
+			return
+		}
 	}
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
@@ -1191,7 +1163,7 @@ func (api *API) handleDeleteScopeCandidates(w http.ResponseWriter, r *http.Reque
 	minAgeMicros := hours * int64(time.Hour/time.Microsecond)
 
 	for name, buf := range scopes {
-		st := buf.stats()
+		st := buf.stats(now)
 
 		if hours > 0 && now-st.CreatedTS < minAgeMicros {
 			continue

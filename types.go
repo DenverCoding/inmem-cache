@@ -7,16 +7,16 @@ import (
 )
 
 const (
-	DefaultLimit       = 1000   // read response size when client omits ?limit
-	MaxLimit           = 10000  // hard ceiling on ?limit; higher values are clamped, not rejected
-	ScopeMaxItems      = 100000 // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
-	MaxStoreMiB        = 100    // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
-	MaxItemBytes       = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
-	MaxResponseMiB     = 25     // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head, /ts_range). Overridable via SCOPECACHE_MAX_RESPONSE_MB
-	MaxMultiCallMiB    = 16     // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
-	MaxMultiCallCount  = 10     // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
-	MaxScopeBytes      = 256
-	MaxIDBytes         = 256
+	DefaultLimit      = 1000    // read response size when client omits ?limit
+	MaxLimit          = 10000   // hard ceiling on ?limit; higher values are clamped, not rejected
+	ScopeMaxItems     = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
+	MaxStoreMiB       = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
+	MaxItemBytes      = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
+	MaxResponseMiB    = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head, /ts_range). Overridable via SCOPECACHE_MAX_RESPONSE_MB
+	MaxMultiCallMiB   = 16      // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
+	MaxMultiCallCount = 10      // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
+	MaxScopeBytes     = 256
+	MaxIDBytes        = 256
 
 	// SingleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
@@ -54,7 +54,7 @@ const (
 //   - MaxStoreBytes:     aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
 //   - MaxItemBytes:      per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
 //   - MaxResponseBytes:  per-response cap on read endpoints whose body can grow
-//                        with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
+//     with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
 //   - MaxMultiCallBytes: input body cap for /multi_call. In bytes. Default MaxMultiCallMiB << 20.
 //   - MaxMultiCallCount: max sub-calls per /multi_call batch. Default MaxMultiCallCount (10).
 //
@@ -286,6 +286,54 @@ func approxItemSize(item Item) int64 {
 	n += 8
 	n += 8 // Ts pointer slot; the pointee (8 more bytes) when set is noise at this granularity
 	n += int64(len(item.Payload))
+	return n
+}
+
+// Multi-item read pre-flight constants. Used to short-circuit /head,
+// /tail, and /ts_range with a 507 BEFORE writeJSONWithMeta calls
+// json.Marshal on the full payload — the post-flight cappedResponseWriter
+// catches the same case but only after the body has been built in
+// memory. Without pre-flight, an operator who raises
+// SCOPECACHE_MAX_RESPONSE_MB to a large value (or a misbehaving client
+// hitting /tail?limit=10000 against 1 MiB items) lets the marshaller
+// allocate the full body before the cap fires.
+//
+// Both constants are STRICT lower bounds — overestimating per-item or
+// envelope cost would reject legitimate calls. The post-flight
+// cappedResponseWriter remains the authoritative cap; pre-flight is
+// a memory optimisation, not a correctness gate.
+const (
+	// multiItemEnvelopeMinBytes is the minimum byte cost of the outer
+	// JSON envelope ({ok, hit, count, truncated, items, duration_us,
+	// approx_response_mb}). 80 bytes is below the smallest possible
+	// envelope encoding for any of the three handlers, even when count
+	// is single-digit and the float fields are at minimum width.
+	multiItemEnvelopeMinBytes = 80
+	// multiItemPerItemMinBytes is the minimum on-wire cost of one
+	// item's JSON skeleton (keys, quotes, separators, seq digits).
+	// Even a stripped-down `{"scope":"","seq":1,"payload":null}` is
+	// 35 bytes; 25 is below that floor and below every realistic
+	// item produced by the cache.
+	multiItemPerItemMinBytes = 25
+)
+
+// estimateMultiItemResponseBytes returns a strict lower bound on the
+// JSON-marshalled response size for a /head, /tail, or /ts_range
+// payload with the given items. Used by the pre-flight check; see
+// multiItemEnvelopeMinBytes for the rationale.
+//
+// Counts only bytes that MUST appear on the wire: the envelope
+// minimum, a fixed per-item skeleton cost, and the scope/id/payload
+// values written verbatim (JSON-string escaping only ADDS bytes
+// during marshal, never removes — so raw len() is an underestimate
+// of the encoded form, which is what we need).
+func estimateMultiItemResponseBytes(items []Item) int64 {
+	n := int64(multiItemEnvelopeMinBytes) + int64(len(items))*multiItemPerItemMinBytes
+	for i := range items {
+		n += int64(len(items[i].Scope))
+		n += int64(len(items[i].ID))
+		n += int64(len(items[i].Payload))
+	}
 	return n
 }
 

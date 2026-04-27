@@ -185,7 +185,7 @@ func TestMultiCall_PathNotInWhitelist(t *testing.T) {
 func TestMultiCall_ExcludedPaths(t *testing.T) {
 	// Each of these must be rejected — store-wide ops, raw-byte /render, and
 	// /multi_call itself are deliberately excluded.
-	excluded := []string{"/warm", "/rebuild", "/wipe", "/render", "/help", "/multi_call"}
+	excluded := []string{"/warm", "/rebuild", "/wipe", "/delete_scope", "/render", "/help", "/multi_call"}
 	for _, p := range excluded {
 		t.Run(strings.TrimPrefix(p, "/"), func(t *testing.T) {
 			h, _ := newTestHandler(10)

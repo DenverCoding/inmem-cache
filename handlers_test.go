@@ -245,7 +245,7 @@ func TestAppend_InvalidJSON(t *testing.T) {
 // garbage) would silently decode the first and ignore the rest.
 func TestAppend_RejectsTrailingContent(t *testing.T) {
 	cases := map[string]string{
-		"two objects":     `{"scope":"x","payload":{"v":1}}{"scope":"y","payload":{"v":2}}`,
+		"two objects":      `{"scope":"x","payload":{"v":1}}{"scope":"y","payload":{"v":2}}`,
 		"trailing garbage": `{"scope":"x","payload":{"v":1}} garbage`,
 	}
 	for name, body := range cases {

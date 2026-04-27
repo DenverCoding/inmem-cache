@@ -36,31 +36,33 @@ const (
 //     namespace (would lock themselves out until operator re-provisions).
 //   - Excludes /stats and /delete_scope_candidates: store-wide views.
 //   - Excludes /wipe, /warm, /rebuild: admin-only operations.
-//
-// /render IS included; /guarded handles its raw-bytes response (single-
-// call returns raw, multi-call slot base64-encodes — see guardedflow.md
-// §G).
+//   - Excludes /render: raw bytes don't fit a JSON results array
+//     cleanly — the standalone endpoint's defining property is "no
+//     envelope, Content-Type from the fronting proxy", which is a
+//     category mismatch with batch-dispatcher slot semantics. Tenants
+//     reach /render via a Caddy middleware that rewrites the scope
+//     from a bearer token (see CLAUDE.md helpers — scopecache_bearer_prefix);
+//     /guarded body is not the right transport for raw-byte streams.
 func (api *API) buildGuardedCallSpecs() map[string]subCallSpec {
 	return map[string]subCallSpec{
-		"/append":      {http.MethodPost, api.handleAppend},
-		"/get":         {http.MethodGet, api.handleGet},
-		"/head":        {http.MethodGet, api.handleHead},
-		"/tail":        {http.MethodGet, api.handleTail},
-		"/ts_range":    {http.MethodGet, api.handleTsRange},
-		"/update":      {http.MethodPost, api.handleUpdate},
-		"/upsert":      {http.MethodPost, api.handleUpsert},
-		"/counter_add": {http.MethodPost, api.handleCounterAdd},
-		"/delete":      {http.MethodPost, api.handleDelete},
+		"/append":       {http.MethodPost, api.handleAppend},
+		"/get":          {http.MethodGet, api.handleGet},
+		"/head":         {http.MethodGet, api.handleHead},
+		"/tail":         {http.MethodGet, api.handleTail},
+		"/ts_range":     {http.MethodGet, api.handleTsRange},
+		"/update":       {http.MethodPost, api.handleUpdate},
+		"/upsert":       {http.MethodPost, api.handleUpsert},
+		"/counter_add":  {http.MethodPost, api.handleCounterAdd},
+		"/delete":       {http.MethodPost, api.handleDelete},
 		"/delete_up_to": {http.MethodPost, api.handleDeleteUpTo},
-		"/render":      {http.MethodGet, api.handleRender},
 	}
 }
 
 // guardedRequest is the top-level body for /guarded. Token is required;
 // Calls is the same shape as /multi_call. See guardedflow.md §C.
 type guardedRequest struct {
-	Token string             `json:"token"`
-	Calls *[]multiCallEntry  `json:"calls"`
+	Token string            `json:"token"`
+	Calls *[]multiCallEntry `json:"calls"`
 }
 
 // tenantIsProvisioned answers /guarded's auth-gate: is there an item

@@ -14,11 +14,9 @@ import (
 //   - /get, /append, /upsert: body.item.scope
 //   - /head, /tail, /ts_range: body.items[].scope
 //
-// Other endpoints (/update, /delete, /delete_up_to, /counter_add, /render)
+// Other endpoints (/update, /delete, /delete_up_to, /counter_add)
 // don't carry a scope field in their response, so the body passes
-// through unchanged. /render's raw-bytes response also passes through —
-// the trim path doesn't recognise it as JSON, so the parse-and-walk
-// returns the input bytes verbatim.
+// through unchanged.
 //
 // Implementation note: parses the body to a typed shape rather than
 // string-replacing on raw bytes — payloads stored at the rewritten
@@ -138,8 +136,8 @@ func stripScopeFieldArray(raw json.RawMessage, prefix string) (json.RawMessage, 
 }
 
 // looksLikeJSONObject is a fast check before attempting full unmarshal
-// — avoids building a map on /render responses (raw bytes) and other
-// non-object payloads that pass through unchanged.
+// — avoids building a map on non-object payloads that pass through
+// unchanged.
 func looksLikeJSONObject(b []byte) bool {
 	for _, c := range b {
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {

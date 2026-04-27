@@ -132,24 +132,10 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reach the scope buffer directly. Inbox scopes commonly start
-	// with `_` (operator's choice) — going through getOrCreateScope
-	// + appendItem bypasses the public reserved-prefix check, which
-	// is the right semantic: /inbox is operator-opted-in for these
-	// specific scope names.
-	buf, err := api.store.getOrCreateScope(req.Scope)
-	if err != nil {
-		// Per-scope overhead reservation can fail when the store is
-		// at capacity; surface the standard 507 envelope.
-		var stfe *StoreFullError
-		if errors.As(err, &stfe) {
-			storeFull(w, started, stfe)
-			return
-		}
-		badRequest(w, started, err.Error())
-		return
-	}
-
-	if _, err := buf.appendItem(item); err != nil {
+	// with `_` (operator's choice) — going through AppendOne bypasses
+	// the public reserved-prefix check, which is the right semantic:
+	// /inbox is operator-opted-in for these specific scope names.
+	if _, err := api.store.AppendOne(item); err != nil {
 		var sfe *ScopeFullError
 		if errors.As(err, &sfe) {
 			scopeFull(w, started, []ScopeCapacityOffender{

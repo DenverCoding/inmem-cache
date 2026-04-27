@@ -27,9 +27,11 @@ type subCallSpec struct {
 
 // buildMultiCallSpecs returns the closed whitelist of paths /multi_call
 // dispatches to, paired with their fixed HTTP method and handler. The
-// excluded set (/warm, /rebuild, /wipe, /render, /help and /multi_call
-// itself) is documented in CLAUDE.md → Phase 4 design signals →
-// /multi_call → Allowed paths.
+// excluded set (/warm, /rebuild, /wipe, /delete_scope, /render, /help
+// and /multi_call itself) is documented in CLAUDE.md → Phase 4 design
+// signals → /multi_call → Allowed paths. /delete_scope is admin-only —
+// it is removed from the public mux entirely (handlers.go) and is only
+// reachable via /admin, so it must not slip back in via /multi_call.
 func (api *API) buildMultiCallSpecs() map[string]subCallSpec {
 	return map[string]subCallSpec{
 		"/append":                  {http.MethodPost, api.handleAppend},
@@ -42,7 +44,6 @@ func (api *API) buildMultiCallSpecs() map[string]subCallSpec {
 		"/counter_add":             {http.MethodPost, api.handleCounterAdd},
 		"/delete":                  {http.MethodPost, api.handleDelete},
 		"/delete_up_to":            {http.MethodPost, api.handleDeleteUpTo},
-		"/delete_scope":            {http.MethodPost, api.handleDeleteScope},
 		"/stats":                   {http.MethodGet, api.handleStats},
 		"/delete_scope_candidates": {http.MethodGet, api.handleDeleteScopeCandidates},
 	}

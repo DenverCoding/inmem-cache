@@ -170,6 +170,16 @@ func TestAdmin_BlocksHelp(t *testing.T) {
 	}
 }
 
+func TestAdmin_BlocksRender(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	body := `{"calls":[{"path":"/render","query":{"scope":"x","id":"y"}}]}`
+	code, _, _ := doRequest(t, h, "POST", "/admin", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400 (/render not in admin whitelist)", code)
+	}
+}
+
 // --- admin sees raw _* scopes -------------------------------------------------
 
 // /admin can read and write to scopes starting with `_` — the reserved

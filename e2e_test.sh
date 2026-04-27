@@ -540,10 +540,12 @@ case $LAST_BODY in
     *) bad "mc whitelist error shape: $LAST_BODY" ;;
 esac
 
-# Each excluded endpoint individually: /warm, /rebuild, /wipe, /render,
-# /help, /multi_call self-reference — all 400.
+# Each excluded endpoint individually: /warm, /rebuild, /wipe,
+# /delete_scope (admin-only), /render, /help, /multi_call self-reference
+# — all 400.
 call 'mc: exclude /warm'                400 POST   /multi_call '{"calls":[{"path":"/warm","body":{"items":[]}}]}'
 call 'mc: exclude /rebuild'             400 POST   /multi_call '{"calls":[{"path":"/rebuild","body":{"items":[]}}]}'
+call 'mc: exclude /delete_scope'        400 POST   /multi_call '{"calls":[{"path":"/delete_scope","body":{"scope":"mc"}}]}'
 call 'mc: exclude /render'              400 POST   /multi_call '{"calls":[{"path":"/render","query":{"scope":"mc","id":"a"}}]}'
 call 'mc: exclude /help'                400 POST   /multi_call '{"calls":[{"path":"/help"}]}'
 call 'mc: exclude self /multi_call'     400 POST   /multi_call '{"calls":[{"path":"/multi_call","body":{"calls":[]}}]}'
@@ -618,11 +620,13 @@ case $LAST_BODY in
     *) bad "admin stats body missing _tokens: $LAST_BODY" ;;
 esac
 
-# /admin's whitelist excludes self-reference, /multi_call, /guarded, /help.
+# /admin's whitelist excludes self-reference, /multi_call, /guarded,
+# /help, and /render (raw bytes don't fit a JSON results array).
 call 'admin: rejects /admin in calls' 400 POST /admin '{"calls":[{"path":"/admin"}]}'
 call 'admin: rejects /multi_call'     400 POST /admin '{"calls":[{"path":"/multi_call","body":{"calls":[]}}]}'
 call 'admin: rejects /guarded'        400 POST /admin '{"calls":[{"path":"/guarded","body":{"token":"x","calls":[]}}]}'
 call 'admin: rejects /help'           400 POST /admin '{"calls":[{"path":"/help"}]}'
+call 'admin: rejects /render'         400 POST /admin '{"calls":[{"path":"/render","query":{"scope":"x","id":"y"}}]}'
 
 # Malformed admin envelope → 400.
 call 'admin: malformed body'          400 POST /admin '{not-json'
@@ -726,6 +730,11 @@ call 'gd: rejects /wipe sub-call'         400 POST /guarded \
 # Whitelist enforcement: /delete_scope inside /guarded is rejected.
 call 'gd: rejects /delete_scope sub-call' 400 POST /guarded \
     "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/delete_scope\",\"body\":{\"scope\":\"events\"}}]}"
+
+# Whitelist enforcement: /render inside /guarded is rejected — raw-byte
+# response is a category mismatch with the JSON envelope.
+call 'gd: rejects /render sub-call'       400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/render\",\"query\":{\"scope\":\"events\",\"id\":\"e1\"}}]}"
 
 # Two-tenant isolation: tenant B reads events and sees nothing of A's data.
 guarded_call_query 'gd: tenant B isolated read' 200 "$TENANT_B_TOKEN" /get '{"scope":"events","id":"e1"}'

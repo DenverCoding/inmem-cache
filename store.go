@@ -20,12 +20,12 @@ type ScopeBuffer struct {
 	// buffer via a stale pointer return *ScopeDetachedError so the caller
 	// learns the write did not take effect, rather than silently writing
 	// into an orphan buffer that is unreachable and about to be GC'd.
-	detached        bool
-	items           []Item
-	byID            map[string]Item
-	bySeq           map[uint64]Item
-	lastSeq         uint64
-	maxItems        int
+	detached bool
+	items    []Item
+	byID     map[string]Item
+	bySeq    map[uint64]Item
+	lastSeq  uint64
+	maxItems int
 	// bytes is the running sum of approxItemSize(item) over items. Only
 	// mutated under b.mu; the store-level total is kept in sync via
 	// Store.reserveBytes / commitReplacement.
@@ -55,10 +55,13 @@ func NewScopeBuffer(maxItems int) *ScopeBuffer {
 // approxSizeBytes is a richer estimate than the raw approxItemSize sum: it
 // also folds in Go map/slice overhead for b.byID, b.bySeq, and the heat
 // buckets. It drives the per-scope approx_scope_mb field in /stats and the
-// Candidate.ApproxScopeMB field in /delete_scope_candidates. It is NOT used for
-// cap enforcement — admission control uses Store.totalBytes (a pure
-// approxItemSize sum) so the 507 budget matches what reserveBytes accounts
-// for.
+// Candidate.ApproxScopeMB field in /delete_scope_candidates. It is NOT used
+// for cap enforcement — admission control uses Store.totalBytes
+// (approxItemSize sum + scopeBufferOverhead per scope) so the 507 budget
+// matches what reserveBytes accounts for. Per-item Go heap overhead
+// (slice/map entries) is intentionally outside the cap; see phase4
+// CLAUDE.md "max_store_mb underestimates real memory cost at high scope
+// counts" for the open pre-v1.0 design question.
 func (b *ScopeBuffer) approxSizeBytesLocked() int64 {
 	var total int64
 	total += 64
@@ -83,6 +86,25 @@ func (b *ScopeBuffer) approxSizeBytes() int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.approxSizeBytesLocked()
+}
+
+// computeLast7DReadCountLocked walks the heat buckets and returns the
+// count of reads whose Day is within the rolling 7-day window ending
+// at `now`. Used by stats() so a /stats or /delete_scope_candidates
+// call observes a correct count even when no fresh read has happened
+// to expire stale buckets via recordRead. Does NOT mutate state — safe
+// under RLock.
+func (b *ScopeBuffer) computeLast7DReadCountLocked(now int64) uint64 {
+	day := unixDay(now)
+	oldestValidDay := day - ReadHeatWindowDays + 1
+	var sum uint64
+	for i := range b.readHeatBuckets {
+		bucket := &b.readHeatBuckets[i]
+		if bucket.Day >= oldestValidDay {
+			sum += bucket.Count
+		}
+	}
+	return sum
 }
 
 func (b *ScopeBuffer) recordRead(now int64) {
@@ -824,7 +846,13 @@ type ScopeStats struct {
 	Last7DReadCount uint64
 }
 
-func (b *ScopeBuffer) stats() ScopeStats {
+// stats returns a snapshot of this scope's metrics. The caller passes
+// `now` so Last7DReadCount reflects the rolling window ending at the
+// caller's clock — last7DReadCount the runtime field is only updated
+// by recordRead, so a scope that hasn't been read in 7+ days would
+// otherwise still report a stale "warm" count to /stats and
+// /delete_scope_candidates.
+func (b *ScopeBuffer) stats(now int64) ScopeStats {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -835,7 +863,7 @@ func (b *ScopeBuffer) stats() ScopeStats {
 		CreatedTS:       b.createdTS,
 		LastAccessTS:    b.lastAccessTS,
 		ReadCountTotal:  b.readCountTotal,
-		Last7DReadCount: b.last7DReadCount,
+		Last7DReadCount: b.computeLast7DReadCountLocked(now),
 	}
 }
 
@@ -959,15 +987,26 @@ func (s *Store) newScopeBuffer() *ScopeBuffer {
 }
 
 func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
+	buf, _, err := s.getOrCreateScopeTrackingCreated(scope)
+	return buf, err
+}
+
+// getOrCreateScopeTrackingCreated is the variant used by the atomic
+// write paths (AppendOne, UpsertOne, CounterAddOne) that need to know
+// whether the buffer was freshly allocated by this call. Callers use
+// the `created` flag to roll the empty scope back when the subsequent
+// item-byte reservation fails — see cleanupIfEmptyAndUnused. All other
+// callers go through getOrCreateScope, which discards the flag.
+func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, bool, error) {
 	if scope == "" {
-		return nil, errors.New("the 'scope' field is required")
+		return nil, false, errors.New("the 'scope' field is required")
 	}
 
 	s.mu.RLock()
 	buf, ok := s.scopes[scope]
 	s.mu.RUnlock()
 	if ok {
-		return buf, nil
+		return buf, false, nil
 	}
 
 	s.mu.Lock()
@@ -975,7 +1014,7 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 
 	buf, ok = s.scopes[scope]
 	if ok {
-		return buf, nil
+		return buf, false, nil
 	}
 
 	// Reserve the per-scope overhead before allocating the buffer.
@@ -985,7 +1024,7 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 	// poorly-written client) could fill the store with empty scopes
 	// while the byte counter stayed at zero.
 	if ok, current, max := s.reserveBytes(scopeBufferOverhead); !ok {
-		return nil, &StoreFullError{
+		return nil, false, &StoreFullError{
 			StoreBytes: current,
 			AddedBytes: scopeBufferOverhead,
 			Cap:        max,
@@ -994,7 +1033,94 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 
 	buf = s.newScopeBuffer()
 	s.scopes[scope] = buf
-	return buf, nil
+	return buf, true, nil
+}
+
+// cleanupIfEmptyAndUnused rolls back a freshly-created scope when the
+// caller's subsequent item-byte reservation failed. Without this, every
+// failed write to a new scope would leak scopeBufferOverhead bytes onto
+// the store-byte cap, which a multi-tenant attacker could exploit to
+// fill the cap with empty scopes (DoS).
+//
+// Three guards prevent collateral damage:
+//   - cur == buf: another caller may have wiped+recreated the scope
+//     between our create and our cleanup; only delete if our buffer is
+//     still the one mapped at this name.
+//   - len(buf.items) == 0: a concurrent writer that grabbed our buf
+//     pointer through the fast path may have committed an item before
+//     we acquired buf.mu; if so, the scope is no longer "empty" and we
+//     must leave it alone.
+//   - detached + store=nil: matches deleteScope's pattern. Any
+//     concurrent in-flight writer that wakes up on this buf after we
+//     released the locks returns *ScopeDetachedError, same semantics
+//     as a /delete_scope race.
+func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *ScopeBuffer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, ok := s.scopes[scope]
+	if !ok || cur != buf {
+		return
+	}
+
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+
+	if len(buf.items) != 0 {
+		return
+	}
+
+	delete(s.scopes, scope)
+	s.totalBytes.Add(-scopeBufferOverhead)
+	buf.detached = true
+	buf.store = nil
+}
+
+// AppendOne is the atomic /append write-path. It creates the target
+// scope on demand, reserves item bytes, commits the item, and rolls
+// back the empty scope on item-reservation failure so a 507 cannot
+// leak per-scope overhead onto the store-byte cap. See
+// cleanupIfEmptyAndUnused for the rollback semantics.
+func (s *Store) AppendOne(item Item) (Item, error) {
+	buf, created, err := s.getOrCreateScopeTrackingCreated(item.Scope)
+	if err != nil {
+		return Item{}, err
+	}
+	result, appendErr := buf.appendItem(item)
+	if appendErr != nil && created {
+		s.cleanupIfEmptyAndUnused(item.Scope, buf)
+	}
+	return result, appendErr
+}
+
+// UpsertOne is the atomic /upsert write-path; same rollback contract
+// as AppendOne. Returns (item, created, err) where created reflects
+// the upsert outcome, not the scope-creation outcome.
+func (s *Store) UpsertOne(item Item) (Item, bool, error) {
+	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(item.Scope)
+	if err != nil {
+		return Item{}, false, err
+	}
+	result, itemCreated, upsertErr := buf.upsertByID(item)
+	if upsertErr != nil && scopeCreated {
+		s.cleanupIfEmptyAndUnused(item.Scope, buf)
+	}
+	return result, itemCreated, upsertErr
+}
+
+// CounterAddOne is the atomic /counter_add write-path; same rollback
+// contract as AppendOne. Returns (value, created, err) where created
+// reflects the counter outcome, not the scope-creation outcome.
+func (s *Store) CounterAddOne(scope, id string, by int64) (int64, bool, error) {
+	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
+	if err != nil {
+		return 0, false, err
+	}
+	value, counterCreated, addErr := buf.counterAdd(scope, id, by)
+	if addErr != nil && scopeCreated {
+		s.cleanupIfEmptyAndUnused(scope, buf)
+	}
+	return value, counterCreated, addErr
 }
 
 // ensureScope returns the named scope, creating an empty buffer if it
@@ -1124,11 +1250,12 @@ func (s *Store) stats() StoreStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	now := nowUnixMicro()
 	scopeStats := make(map[string]ScopeStats, len(s.scopes))
 	totalItems := 0
 
 	for scope, buf := range s.scopes {
-		st := buf.stats()
+		st := buf.stats(now)
 		scopeStats[scope] = st
 		totalItems += st.ItemCount
 	}

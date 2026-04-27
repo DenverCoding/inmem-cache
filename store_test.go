@@ -1203,6 +1203,158 @@ func TestStore_GetScope_Miss(t *testing.T) {
 	}
 }
 
+// AppendOne, UpsertOne, CounterAddOne must roll back the freshly-created
+// scope when the item-byte reservation fails. Without rollback, every
+// failed write to a new scope would leak scopeBufferOverhead onto the
+// store-byte cap — a multi-tenant attacker could fill the cap with
+// empty scopes and DoS legitimate writers (see ChatGPT bug review).
+
+// bigPayload returns a JSON string payload of approximately the given
+// total byte count. Used by the rollback tests to push past the
+// store-byte cap without hitting the per-item cap.
+func bigPayload(n int) json.RawMessage {
+	buf := make([]byte, n+2)
+	buf[0] = '"'
+	for i := 1; i < n+1; i++ {
+		buf[i] = 'a'
+	}
+	buf[n+1] = '"'
+	return json.RawMessage(buf)
+}
+
+func TestStore_AppendOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
+	// Cap = overhead + 50 bytes. AppendOne reserves overhead first,
+	// then the item-bytes reservation overflows — scope must be
+	// rolled back so the overhead is released.
+	capBytes := int64(scopeBufferOverhead) + 50
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+
+	bigItem := Item{Scope: "victim", ID: "x", Payload: bigPayload(200)}
+	_, err := s.AppendOne(bigItem)
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected StoreFullError, got %T: %v", err, err)
+	}
+
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Errorf("totalBytes=%d after rolled-back AppendOne; want 0", got)
+	}
+	if _, ok := s.getScope("victim"); ok {
+		t.Errorf("scope 'victim' still present in s.scopes after rollback")
+	}
+}
+
+func TestStore_UpsertOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
+	capBytes := int64(scopeBufferOverhead) + 50
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+
+	bigItem := Item{Scope: "victim", ID: "x", Payload: bigPayload(200)}
+	_, _, err := s.UpsertOne(bigItem)
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected StoreFullError, got %T: %v", err, err)
+	}
+
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Errorf("totalBytes=%d after rolled-back UpsertOne; want 0", got)
+	}
+	if _, ok := s.getScope("victim"); ok {
+		t.Errorf("scope 'victim' still present in s.scopes after rollback")
+	}
+}
+
+func TestStore_CounterAddOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
+	// Cap = overhead + 1 byte. Even the smallest counter payload
+	// (a one-digit integer) overflows on the item-bytes reservation
+	// after the per-scope overhead has been claimed.
+	capBytes := int64(scopeBufferOverhead) + 1
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+
+	_, _, err := s.CounterAddOne("victim", "c1", 42)
+	var stfe *StoreFullError
+	if !errors.As(err, &stfe) {
+		t.Fatalf("expected StoreFullError, got %T: %v", err, err)
+	}
+
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Errorf("totalBytes=%d after rolled-back CounterAddOne; want 0", got)
+	}
+	if _, ok := s.getScope("victim"); ok {
+		t.Errorf("scope 'victim' still present in s.scopes after rollback")
+	}
+}
+
+// AppendOne loop with new scope names + oversized items must not leak
+// per-scope overhead. Without the rollback this is the multi-tenant
+// DoS path: ~100k requests fill the default 100 MiB cap with empty
+// scopes, after which all legitimate writes 507.
+func TestStore_AppendOne_DoSPathStaysClean(t *testing.T) {
+	capBytes := int64(scopeBufferOverhead) + 50
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+
+	for i := 0; i < 1000; i++ {
+		item := Item{Scope: fmt.Sprintf("attempt_%d", i), ID: "x", Payload: bigPayload(200)}
+		_, err := s.AppendOne(item)
+		var stfe *StoreFullError
+		if !errors.As(err, &stfe) {
+			t.Fatalf("iter %d: expected StoreFullError, got %T: %v", i, err, err)
+		}
+	}
+
+	s.mu.RLock()
+	scopeCount := len(s.scopes)
+	s.mu.RUnlock()
+	if scopeCount != 0 {
+		t.Errorf("after 1000 failed AppendOne calls, %d empty scopes leaked", scopeCount)
+	}
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Errorf("totalBytes=%d after 1000 rolled-back AppendOne calls; want 0", got)
+	}
+}
+
+// AppendOne must NOT roll back the scope when a concurrent caller has
+// successfully committed an item to the same scope between our create
+// and our cleanup. The cleanup helper checks len(buf.items)==0 under
+// buf.mu, so a successful concurrent write keeps the scope alive.
+//
+// Race-detector-friendly: pairs of goroutines per scope — one tries an
+// oversized write, the other a small write. No empty scopes may leak.
+func TestStore_AppendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
+	const N = 50
+	// Cap room for N small items + their scope overheads, plus slack
+	// for the oversized writers' interleaving overhead-reservations.
+	capBytes := int64(N) * (int64(scopeBufferOverhead) + 256)
+	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(2)
+		scope := fmt.Sprintf("shared_%d", i)
+		go func(scope string) {
+			defer wg.Done()
+			big := Item{Scope: scope, ID: "big", Payload: bigPayload(int(capBytes))}
+			_, _ = s.AppendOne(big)
+		}(scope)
+		go func(scope string) {
+			defer wg.Done()
+			small := Item{Scope: scope, ID: "small", Payload: json.RawMessage(`"hi"`)}
+			_, _ = s.AppendOne(small)
+		}(scope)
+	}
+	wg.Wait()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for name, buf := range s.scopes {
+		buf.mu.Lock()
+		empty := len(buf.items) == 0
+		buf.mu.Unlock()
+		if empty {
+			t.Errorf("empty scope %q leaked through concurrent cleanup", name)
+		}
+	}
+}
+
 func TestStore_EnsureScope_CreatesEmpty(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	buf := s.ensureScope("_counters_count_calls")
@@ -1730,6 +1882,40 @@ func TestRecordRead_ReusesBucketSlotAcross7DayCycle(t *testing.T) {
 	// Day 1000's read is now outside the rolling window (>= 7 days old).
 	if buf.last7DReadCount != 1 {
 		t.Fatalf("last7DReadCount=%d want 1 (old slot should have been expired)", buf.last7DReadCount)
+	}
+}
+
+// stats() must report a fresh Last7DReadCount even when no recent
+// recordRead has expired stale buckets. Without computeLast7DReadCountLocked
+// a scope read 8 days ago and never since would still report its old
+// "warm" count via /stats and /delete_scope_candidates, biasing
+// eviction decisions against scopes that are actually cold.
+func TestStats_Last7DReadCount_ExpiresWithoutNewReads(t *testing.T) {
+	buf := NewScopeBuffer(10)
+
+	// Three reads on day 1000 — cached field reads 3.
+	buf.recordRead(microsOnDay(1000))
+	buf.recordRead(microsOnDay(1000))
+	buf.recordRead(microsOnDay(1000))
+
+	if buf.last7DReadCount != 3 {
+		t.Fatalf("pre-stats last7DReadCount=%d want 3", buf.last7DReadCount)
+	}
+
+	// Eight days later — no fresh recordRead, so the cached field
+	// still reads 3. stats() must compute live and report 0.
+	st := buf.stats(microsOnDay(1008))
+	if st.Last7DReadCount != 0 {
+		t.Errorf("stats(day 1008).Last7DReadCount=%d want 0; cached field=%d (stale)",
+			st.Last7DReadCount, buf.last7DReadCount)
+	}
+
+	// Boundary check: at day 1006 (6 days after the reads, still in
+	// the rolling 7-day window), stats() must still report 3.
+	st = buf.stats(microsOnDay(1006))
+	if st.Last7DReadCount != 3 {
+		t.Errorf("stats(day 1006).Last7DReadCount=%d want 3 (still in window)",
+			st.Last7DReadCount)
 	}
 }
 

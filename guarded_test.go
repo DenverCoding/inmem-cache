@@ -468,6 +468,17 @@ func TestGuarded_BlocksDeleteScope(t *testing.T) {
 	}
 }
 
+func TestGuarded_BlocksRender(t *testing.T) {
+	h, _ := newTestHandler(10)
+	provisionTenant(t, h, "tok-render")
+
+	body := `{"token":"tok-render","calls":[{"path":"/render","query":{"scope":"events","id":"e1"}}]}`
+	code, _, _ := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("code=%d want 400 (/render not in /guarded whitelist)", code)
+	}
+}
+
 // --- counter auto-create on first call ----------------------------------------
 
 func TestGuarded_CounterAutoCreate(t *testing.T) {
