@@ -328,12 +328,14 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 // observability counter, not auth. See guardedflow.md §M.
 func (api *API) guardedIncrementCounters(capabilityID string, calls, kb int64) {
 	if calls > 0 {
-		callsBuf := api.store.ensureScope(countersScopeCalls)
-		_, _, _ = callsBuf.counterAdd(countersScopeCalls, capabilityID, calls)
+		if callsBuf := api.store.ensureScope(countersScopeCalls); callsBuf != nil {
+			_, _, _ = callsBuf.counterAdd(countersScopeCalls, capabilityID, calls)
+		}
 	}
 
 	if kb > 0 {
-		kbBuf := api.store.ensureScope(countersScopeKB)
-		_, _, _ = kbBuf.counterAdd(countersScopeKB, capabilityID, kb)
+		if kbBuf := api.store.ensureScope(countersScopeKB); kbBuf != nil {
+			_, _, _ = kbBuf.counterAdd(countersScopeKB, capabilityID, kb)
+		}
 	}
 }

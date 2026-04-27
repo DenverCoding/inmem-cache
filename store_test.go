@@ -1369,6 +1369,50 @@ func TestStore_EnsureScope_CreatesEmpty(t *testing.T) {
 	}
 }
 
+// ensureScope must charge scopeBufferOverhead against totalBytes so a
+// later /admin /delete_scope releases exactly what was reserved.
+// Without this, deleteScope's unconditional `-(scopeBytes + overhead)`
+// would underflow totalBytes by 1024 bytes per cycle on these
+// internal counter scopes — bounded, but a real invariant break.
+func TestStore_EnsureScope_ReservesOverheadAndRoundTrips(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	before := s.totalBytes.Load()
+	buf := s.ensureScope("_counters_count_calls")
+	if buf == nil {
+		t.Fatal("ensureScope returned nil with ample cap")
+	}
+	if got := s.totalBytes.Load() - before; got != int64(scopeBufferOverhead) {
+		t.Fatalf("ensureScope reserved %d bytes; want %d (scopeBufferOverhead)", got, scopeBufferOverhead)
+	}
+
+	if _, ok := s.deleteScope("_counters_count_calls"); !ok {
+		t.Fatal("deleteScope reported miss on the freshly ensured scope")
+	}
+	if got := s.totalBytes.Load(); got != before {
+		t.Errorf("totalBytes drift after ensureScope+deleteScope round-trip: got=%d want=%d", got, before)
+	}
+}
+
+// On cap exhaustion ensureScope must return nil, not panic and not
+// double-charge — guardedIncrementCounters is best-effort and skips
+// silently on nil, so observability counters never block legitimate
+// /guarded calls.
+func TestStore_EnsureScope_NilOnCapExhausted(t *testing.T) {
+	// Cap = 100 bytes, well below scopeBufferOverhead (1024).
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
+
+	if buf := s.ensureScope("_counters_count_calls"); buf != nil {
+		t.Errorf("ensureScope returned %p with cap below overhead; want nil", buf)
+	}
+	if got := s.totalBytes.Load(); got != 0 {
+		t.Errorf("totalBytes=%d after failed ensureScope; want 0 (no leak)", got)
+	}
+	if _, ok := s.getScope("_counters_count_calls"); ok {
+		t.Errorf("ensureScope leaked the scope into s.scopes despite cap-fail")
+	}
+}
+
 func TestStore_EnsureScope_Idempotent(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	b1 := s.ensureScope("_counters_count_calls")

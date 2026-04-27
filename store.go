@@ -1133,6 +1133,16 @@ func (s *Store) CounterAddOne(scope, id string, by int64) (int64, bool, error) {
 // Unlike getOrCreateScope, this method does not validate the scope name
 // and is intended only for cache-internal infrastructure scopes whose
 // names are compile-time constants.
+//
+// Reserves scopeBufferOverhead just like getOrCreateScope on the
+// create path. This is required for accounting symmetry: deleteScope
+// unconditionally subtracts (scopeBytes + scopeBufferOverhead), so an
+// /admin /delete_scope on these counter scopes would otherwise drift
+// totalBytes scopeBufferOverhead bytes too low per cycle (potentially
+// negative) — the bytes-counter invariant is "totalBytes == sum of
+// reservations". Returns nil when the cap is exhausted; callers
+// (guardedIncrementCounters) treat counter writes as best-effort and
+// silently skip on nil, since counters are observability, not auth.
 func (s *Store) ensureScope(scope string) *ScopeBuffer {
 	s.mu.RLock()
 	buf, ok := s.scopes[scope]
@@ -1147,6 +1157,10 @@ func (s *Store) ensureScope(scope string) *ScopeBuffer {
 	buf, ok = s.scopes[scope]
 	if ok {
 		return buf
+	}
+
+	if ok, _, _ := s.reserveBytes(scopeBufferOverhead); !ok {
+		return nil
 	}
 
 	buf = s.newScopeBuffer()
