@@ -652,6 +652,27 @@ esac
 call 'mc: nested query value rejected'  400 POST   /multi_call \
     '{"calls":[{"path":"/get","query":{"scope":{"nested":true}}}]}'
 
+# --- reserved-scope boundary (public mux) -------------------------------------
+# Every scope-bearing public handler must reject scopes starting with
+# `_` (the reserved prefix). The block is enforced in-handler via
+# rejectReservedScope; this section pins that contract on the wire so
+# accidentally removing the helper from any one handler shows up as a
+# 200 (or no longer 400) on these checks. The companion expectation —
+# /admin CAN reach reserved scopes — is tested in the /admin section
+# below (admin: register tenant in _tokens, etc.).
+say '== reserved-scope boundary =='
+call 'public /get on _* blocked'      400 GET    '/get?scope=_tokens&id=x'
+call 'public /head on _* blocked'     400 GET    '/head?scope=_tokens'
+call 'public /tail on _* blocked'     400 GET    '/tail?scope=_tokens'
+call 'public /ts_range on _* blocked' 400 GET    '/ts_range?scope=_tokens&since_ts=0'
+call 'public /render on _* blocked'   400 GET    '/render?scope=_tokens&id=x'
+call 'public /append on _* blocked'   400 POST   /append       '{"scope":"_tokens","id":"x","payload":1}'
+call 'public /upsert on _* blocked'   400 POST   /upsert       '{"scope":"_tokens","id":"x","payload":1}'
+call 'public /update on _* blocked'   400 POST   /update       '{"scope":"_tokens","id":"x","payload":1}'
+call 'public /counter_add on _* blocked' 400 POST /counter_add '{"scope":"_tokens","id":"x","by":1}'
+call 'public /delete on _* blocked'   400 POST   /delete       '{"scope":"_tokens","id":"x"}'
+call 'public /delete_up_to on _* blocked' 400 POST /delete_up_to '{"scope":"_tokens","max_seq":1}'
+
 # --- /admin -------------------------------------------------------------------
 # Operator-elevated multi-call gateway. No body-level auth — gated by
 # socket access + Caddyfile (the e2e harness reaches the listener
