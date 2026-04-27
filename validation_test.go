@@ -216,6 +216,22 @@ func TestHasReservedPrefix(t *testing.T) {
 	}
 }
 
+// Anchors the scope/id length cap to 256 bytes. The cap was raised
+// from 128 to 256 in v0.5.11 to make room for namespace prefixes —
+// notably the `_guarded:<64 hex>:` rewrite, which leaves only
+// 128-65=63 bytes for the tenant's own portion under the old cap.
+// Tests that rely on MaxScopeBytes/MaxIDBytes constants continue to
+// pass for any cap; this one fails specifically if the literal value
+// gets reverted to something smaller.
+func TestValidateWriteItem_KeyCapsAreAtLeast256(t *testing.T) {
+	if MaxScopeBytes < 256 {
+		t.Errorf("MaxScopeBytes=%d, expected >= 256", MaxScopeBytes)
+	}
+	if MaxIDBytes < 256 {
+		t.Errorf("MaxIDBytes=%d, expected >= 256", MaxIDBytes)
+	}
+}
+
 // Exact cap lengths should be accepted; Unicode (non-control) should pass.
 func TestValidateWriteItem_AcceptsKeyEdges(t *testing.T) {
 	maxScope := make([]byte, MaxScopeBytes)

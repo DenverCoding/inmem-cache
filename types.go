@@ -15,8 +15,8 @@ const (
 	MaxResponseMiB     = 25     // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head, /ts_range). Overridable via SCOPECACHE_MAX_RESPONSE_MB
 	MaxMultiCallMiB    = 16     // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
 	MaxMultiCallCount  = 10     // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
-	MaxScopeBytes      = 128
-	MaxIDBytes         = 128
+	MaxScopeBytes      = 256
+	MaxIDBytes         = 256
 
 	// SingleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints

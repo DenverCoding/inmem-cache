@@ -164,6 +164,38 @@ func TestAppend_Success(t *testing.T) {
 	}
 }
 
+// Drives a 200-byte scope and 200-byte id end-to-end: over the pre-v0.5.11
+// cap of 128 but under the new 256 cap. Both must be accepted by the
+// validator and round-trip through /get unchanged. Anchors the "long
+// scope/id keys reach the public mux without being truncated or
+// rejected" property.
+func TestAppend_Acceps200ByteScopeAndID(t *testing.T) {
+	h, _ := newTestHandler(10)
+	longScope := strings.Repeat("s", 200)
+	longID := strings.Repeat("i", 200)
+
+	body := fmt.Sprintf(`{"scope":%q,"id":%q,"payload":{"v":1}}`, longScope, longID)
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+		t.Fatalf("append 200/200: code=%d body=%s", code, raw)
+	}
+
+	getURL := fmt.Sprintf("/get?scope=%s&id=%s", longScope, longID)
+	code, out, raw := doRequest(t, h, "GET", getURL, "")
+	if code != 200 {
+		t.Fatalf("get: code=%d body=%s", code, raw)
+	}
+	if !mustBool(t, out, "hit") {
+		t.Errorf("get returned hit=false: %s", raw)
+	}
+	item := out["item"].(map[string]interface{})
+	if item["scope"].(string) != longScope {
+		t.Errorf("scope round-trip mismatch")
+	}
+	if item["id"].(string) != longID {
+		t.Errorf("id round-trip mismatch")
+	}
+}
+
 func TestAppend_MissingPayload(t *testing.T) {
 	h, _ := newTestHandler(10)
 	code, out, _ := doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a"}`)
@@ -1305,8 +1337,9 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	}
 	postGetY := nowUnixMicro()
 
-	// 11. append with a 129-byte scope name (MaxScopeBytes is 128). Must 400
-	//     and must NOT register a new scope — verified via scope_count below.
+	// 11. append with an over-cap scope name (MaxScopeBytes+1 bytes). Must
+	//     400 and must NOT register a new scope — verified via scope_count
+	//     below.
 	tooLong := strings.Repeat("a", MaxScopeBytes+1)
 	if code, _, _ := doRequest(t, h, "POST", "/append",
 		fmt.Sprintf(`{"scope":"%s","payload":{"v":1}}`, tooLong)); code != 400 {
