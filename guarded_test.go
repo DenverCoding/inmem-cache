@@ -217,6 +217,69 @@ func TestGuarded_RejectLeavesNoSideEffect(t *testing.T) {
 	}
 }
 
+// Cross-tenant read attempt via body+query smuggling. A pre-fix
+// rewriteCallScope rewrote body.scope and returned early, leaving
+// query.scope un-rewritten. The dispatcher then built the GET URL
+// from the un-rewritten query.scope, and the inner handler — running
+// under admin context — happily read from another tenant's reserved
+// scope. The fix rejects any call that carries `scope` in both body
+// and query, whole-batch reject before the dispatch loop, no side
+// effects, no counter ticks.
+func TestGuarded_RejectsBodyAndQueryScopeSmuggle(t *testing.T) {
+	h, api := newTestHandler(100)
+
+	// Two tenants, each with their own provisioned scope. Tenant B's
+	// scope holds a "secret" item we want to confirm tenant A cannot
+	// read.
+	provisionTenantScope(t, h, "tok-A", "events")
+	provisionTenantScope(t, h, "tok-B", "events")
+	capB := computeCapForTest(testServerSecret, "tok-B")
+	bScope := "_guarded:" + capB + ":events"
+
+	adminAppend := `{"calls":[{"path":"/append","body":{"scope":"` + bScope + `","id":"secret","payload":{"sensitive":"do-not-leak"}}}]}`
+	if code, _, raw := doRequest(t, h, "POST", "/admin", adminAppend); code != 200 {
+		t.Fatalf("seeding tenant B secret: code=%d body=%s", code, raw)
+	}
+
+	// Counter scope must not exist yet — used to verify the rejected
+	// batch did not increment it.
+	if _, ok := api.store.getScope(countersScopeCalls); ok {
+		t.Fatal("counter scope already exists before any /guarded call")
+	}
+
+	// The attack: tenant A token, body.scope="events" (their own,
+	// passes existence check post-rewrite), query.scope=tenant B's raw
+	// reserved scope (would smuggle into the GET handler pre-fix).
+	body := `{"token":"tok-A","calls":[{"path":"/get","body":{"scope":"events","id":"x"},"query":{"scope":"` + bScope + `","id":"secret"}}]}`
+	code, _, raw := doRequest(t, h, "POST", "/guarded", body)
+	if code != 400 {
+		t.Fatalf("smuggle attempt: code=%d want 400, body=%s", code, raw)
+	}
+	if !strings.Contains(raw, "must be in body OR query") {
+		t.Errorf("expected 'must be in body OR query' error, got: %s", raw)
+	}
+
+	// Side-effect-free: counters must not have been provisioned (the
+	// rejection happens before the dispatch loop, so guardedIncrement-
+	// Counters never runs).
+	if _, ok := api.store.getScope(countersScopeCalls); ok {
+		t.Errorf("rejected batch leaked a counter increment (scope exists)")
+	}
+
+	// Sanity: tenant B's secret is still reachable via /admin (proving
+	// the seed worked) and was not touched by the attempt.
+	getSecret := `{"calls":[{"path":"/get","query":{"scope":"` + bScope + `","id":"secret"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", getSecret)
+	if code != 200 {
+		t.Fatalf("admin re-read of B secret: code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	resp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	if hit, _ := resp["hit"].(bool); !hit {
+		t.Errorf("tenant B secret no longer present after attack: %s", raw)
+	}
+}
+
 // --- whitelist enforcement ----------------------------------------------------
 
 func TestGuarded_WhitelistMiss(t *testing.T) {

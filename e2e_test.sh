@@ -694,6 +694,25 @@ case $LAST_BODY in
     *) bad "gd: rejected /append leaked a side effect: $LAST_BODY" ;;
 esac
 
+# Cross-tenant smuggle attempt: tenant A token + body.scope=own +
+# query.scope=tenant B's reserved scope. Pre-fix this read tenant B's
+# data because rewriteCallScope returned early after rewriting body
+# and the GET dispatcher built the URL from un-rewritten query.scope.
+# Now /guarded rejects when both body and query carry `scope`.
+admin_call 'gd: seed B secret for smuggle test' 200 /append \
+    "{\"scope\":\"_guarded:${TENANT_B_CAP}:events\",\"id\":\"smuggle-secret\",\"payload\":{\"do\":\"not-leak\"}}"
+
+call 'gd: smuggle body+query rejected' 400 POST /guarded \
+    "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/get\",\"body\":{\"scope\":\"events\",\"id\":\"x\"},\"query\":{\"scope\":\"_guarded:${TENANT_B_CAP}:events\",\"id\":\"smuggle-secret\"}}]}"
+case $LAST_BODY in
+    *'must be in body OR query'*) okmsg 'gd: smuggle rejected with both-carriers error' ;;
+    *) bad "gd: expected both-carriers error: $LAST_BODY" ;;
+esac
+case $LAST_BODY in
+    *'do-not-leak'*|*'sensitive'*) bad "gd: smuggle response leaked B's payload: $LAST_BODY" ;;
+    *) okmsg 'gd: smuggle response did not leak B data' ;;
+esac
+
 # Whitelist enforcement: /wipe inside /guarded is rejected.
 call 'gd: rejects /wipe sub-call'         400 POST /guarded \
     "{\"token\":\"${TENANT_A_TOKEN}\",\"calls\":[{\"path\":\"/wipe\"}]}"

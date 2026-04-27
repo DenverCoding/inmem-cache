@@ -71,33 +71,50 @@ func computeCapabilityID(serverSecret, token string) string {
 // call carries no scope at all (e.g. an /admin /stats call would, but
 // /guarded's whitelist excludes those — every /guarded sub-call has a
 // scope in either body or query).
+//
+// Refuses to rewrite a call that carries `scope` in BOTH body and
+// query: a GET sub-call's handler reads only the URL query, but the
+// existence check would have run on whichever scope this function
+// happened to rewrite first. A caller setting body.scope=allowed AND
+// query.scope=cross-tenant would otherwise pass the existence check
+// on the body value while the GET handler reads the un-rewritten
+// query value — a cross-tenant read. There is no legitimate reason to
+// set both, so reject the whole batch up-front.
 func rewriteCallScope(call *multiCallEntry, prefix string) (string, error) {
-	// Body shape: rewrite body.scope if present.
+	bodyHasScope := false
+	var bodyMap map[string]json.RawMessage
 	if len(call.Body) > 0 {
-		var bodyMap map[string]json.RawMessage
 		if err := json.Unmarshal(call.Body, &bodyMap); err != nil {
 			return "", fmt.Errorf("invalid JSON body: %s", err)
 		}
-		if scopeRaw, ok := bodyMap["scope"]; ok {
-			var s string
-			if err := json.Unmarshal(scopeRaw, &s); err != nil {
-				return "", fmt.Errorf("'scope' in body is not a string: %s", err)
-			}
-			rewritten := prefix + s
-			newScopeRaw, _ := json.Marshal(rewritten)
-			bodyMap["scope"] = newScopeRaw
-			newBody, err := json.Marshal(bodyMap)
-			if err != nil {
-				return "", err
-			}
-			call.Body = newBody
-			return rewritten, nil
+		_, bodyHasScope = bodyMap["scope"]
+	}
+	_, queryHasScope := call.Query["scope"]
+
+	if bodyHasScope && queryHasScope {
+		return "", fmt.Errorf("'scope' must be in body OR query, not both")
+	}
+
+	// Body shape: rewrite body.scope if present.
+	if bodyHasScope {
+		var s string
+		if err := json.Unmarshal(bodyMap["scope"], &s); err != nil {
+			return "", fmt.Errorf("'scope' in body is not a string: %s", err)
 		}
+		rewritten := prefix + s
+		newScopeRaw, _ := json.Marshal(rewritten)
+		bodyMap["scope"] = newScopeRaw
+		newBody, err := json.Marshal(bodyMap)
+		if err != nil {
+			return "", err
+		}
+		call.Body = newBody
+		return rewritten, nil
 	}
 	// Query shape: rewrite query["scope"] if present.
-	if scopeRaw, ok := call.Query["scope"]; ok {
+	if queryHasScope {
 		var s string
-		if err := json.Unmarshal(scopeRaw, &s); err != nil {
+		if err := json.Unmarshal(call.Query["scope"], &s); err != nil {
 			return "", fmt.Errorf("'scope' in query is not a string: %s", err)
 		}
 		rewritten := prefix + s
