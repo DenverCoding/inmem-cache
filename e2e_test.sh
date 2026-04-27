@@ -895,13 +895,13 @@ say '== final wipe =='
 admin_call 'wipe'                       200 /wipe
 # Body should report the scopes and items that existed just before wipe.
 if printf '%s' "$LAST_BODY" | grep -q '"deleted_scopes"'; then
-    okmsg 'wipe body has deleted_scopes'; pass=$((pass+1))
+    okmsg 'wipe body has deleted_scopes'
 else
     bad "wipe body missing deleted_scopes: $LAST_BODY"
 fi
 admin_call 'stats after wipe'           200 /stats
 if printf '%s' "$LAST_BODY" | grep -q '"scope_count":0'; then
-    okmsg 'stats shows empty store'; pass=$((pass+1))
+    okmsg 'stats shows empty store'
 else
     bad "stats post-wipe: $LAST_BODY"
 fi
