@@ -3,6 +3,8 @@ package scopecache
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"sync/atomic"
 	"testing"
 )
 
@@ -128,6 +130,78 @@ func BenchmarkStore_Append(b *testing.B) {
 			b.Fatalf("appendItem: %v", err)
 		}
 	}
+}
+
+// BenchmarkStore_AppendUniqueScope_Sequential measures /append cost when
+// every request creates a fresh scope — the anti-pattern documented in
+// CLAUDE.md "Scope modeling". Sequential variant; see _Parallel for the
+// contended-shard case. No HTTP layer, so the profile is pure cache work.
+//
+// Useful for cpuprofile + memprofile to find what dominates after the
+// scope-map mutex was sharded: candidates are atomic-CAS contention on
+// totalBytes, *ScopeBuffer alloc + map header alloc, and fmt formatting.
+func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
+	store := NewStore(Config{
+		ScopeMaxItems:     50_000, // matches phase4 Caddyfile setting
+		MaxStoreBytes:     128 << 30, // 128 GiB; b.N is open-ended so don't risk a 507 mid-bench
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  1 << 30,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+	})
+
+	payload := json.RawMessage(`{"data":"benchmark"}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		scope := "u:" + strconv.Itoa(i)
+		if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
+			b.Fatalf("AppendOne: %v", err)
+		}
+	}
+}
+
+// BenchmarkStore_AppendUniqueScope_Parallel is the parallel variant of
+// the above — every goroutine pulls a unique counter slot and creates
+// its own fresh scope. This is the workload that wrk hammered at c=50
+// in phase 4. After sharding, throughput plateaus at ~4k req/s on the
+// HTTP path; pprof-ing this benchmark reveals what's left to optimise
+// (see phase-4 finding "Sharded scopes map: pre-existing-scope writes
+// 2× faster, unique-scope writes barely").
+//
+// Run with:
+//
+//	go test -run=^$ -bench=AppendUniqueScope_Parallel \
+//	    -benchtime=3s -cpuprofile=cpu.prof -memprofile=mem.prof
+//	go tool pprof -top cpu.prof
+//	go tool pprof -top -alloc_space mem.prof
+func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
+	store := NewStore(Config{
+		ScopeMaxItems:     1_000_000,
+		MaxStoreBytes:     8 << 30,
+		MaxItemBytes:      1 << 20,
+		MaxResponseBytes:  1 << 30,
+		MaxMultiCallBytes: 16 << 20,
+		MaxMultiCallCount: 10,
+	})
+
+	payload := json.RawMessage(`{"data":"benchmark"}`)
+	var counter atomic.Uint64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := counter.Add(1)
+			scope := "u:" + strconv.FormatUint(n, 10)
+			if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
+				b.Fatalf("AppendOne: %v", err)
+			}
+		}
+	})
 }
 
 // benchTsScope builds a single scope populated with `n` items, each carrying

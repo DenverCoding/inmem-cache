@@ -58,8 +58,19 @@ type ScopeBuffer struct {
 }
 
 func NewScopeBuffer(maxItems int) *ScopeBuffer {
+	// items is grown on-demand by append (Go doubles capacity), not
+	// pre-sized to maxItems. Pre-sizing was an unsustainable allocation
+	// pattern under high scope-creation rates: at maxItems=50000 each
+	// new scope reserved ~3.6 MB upfront, and at 4k+ creates/sec that
+	// produced ~14 GB/s of slice allocation that the GC could not keep
+	// up with — `runtime.scanObject` accounted for >96% of CPU on a
+	// unique-scope /append benchmark. The cost trade is a handful of
+	// growth-doublings over the scope's lifetime (~12 for a scope that
+	// reaches 50k) instead of one large allocation that mostly stays
+	// unused. See phase-4 finding "Sharded scopes map: pre-existing-
+	// scope writes 2× faster, unique-scope writes barely" for the
+	// follow-up entry that traced this.
 	return &ScopeBuffer{
-		items:     make([]Item, 0, maxItems),
 		byID:      make(map[string]Item),
 		bySeq:     make(map[uint64]Item),
 		maxItems:  maxItems,
