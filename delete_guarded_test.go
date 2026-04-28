@@ -156,14 +156,16 @@ func TestDeleteGuarded_BytesAccountingStaysBalanced(t *testing.T) {
 
 	// Compute expected totalBytes by walking remaining scopes directly.
 	var expected int64
-	api.store.mu.RLock()
-	for _, buf := range api.store.scopes {
-		buf.mu.RLock()
-		expected += buf.bytes
-		buf.mu.RUnlock()
-		expected += scopeBufferOverhead
+	for shIdx := range api.store.shards {
+		api.store.shards[shIdx].mu.RLock()
+		for _, buf := range api.store.shards[shIdx].scopes {
+			buf.mu.RLock()
+			expected += buf.bytes
+			buf.mu.RUnlock()
+			expected += scopeBufferOverhead
+		}
+		api.store.shards[shIdx].mu.RUnlock()
 	}
-	api.store.mu.RUnlock()
 
 	got := api.store.totalBytes.Load()
 	if got != expected {

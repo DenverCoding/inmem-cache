@@ -3,12 +3,29 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"hash/maphash"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
+
+// numShards splits the scope map into independently-locked shards.
+// Power of 2 so the modulo collapses to a bitmask.
+//
+// Multi-shard operations (/wipe, /rebuild, /admin /delete_guarded,
+// /warm) MUST acquire shard locks in ascending shard-index order to
+// avoid deadlock with each other.
+const (
+	numShards = 32
+	shardMask = numShards - 1
+)
+
+type scopeShard struct {
+	mu     sync.RWMutex
+	scopes map[string]*ScopeBuffer
+}
 
 type ScopeBuffer struct {
 	mu sync.RWMutex
@@ -917,8 +934,17 @@ func (b *ScopeBuffer) stats(now int64) ScopeStats {
 }
 
 type Store struct {
-	mu              sync.RWMutex
-	scopes          map[string]*ScopeBuffer
+	// shards splits the scope map into numShards independently-locked
+	// buckets. Per-scope hot paths (getOrCreate, lookup, delete) take
+	// only one shard's lock; multi-shard ops (/wipe, /rebuild, /warm,
+	// /admin /delete_guarded) take a sorted subset in ascending index
+	// order. Replaces an earlier single store-wide RWMutex that
+	// serialised every scope creation through one queue — see phase-4
+	// finding "/append to a unique scope per request serializes on the
+	// store-wide write lock".
+	shards   [numShards]scopeShard
+	hashSeed maphash.Seed
+
 	defaultMaxItems int
 	maxStoreBytes   int64
 	maxItemBytes    int64
@@ -974,8 +1000,8 @@ func NewStore(c Config) *Store {
 			inboxSet[name] = true
 		}
 	}
-	return &Store{
-		scopes:            make(map[string]*ScopeBuffer),
+	s := &Store{
+		hashSeed:          maphash.MakeSeed(),
 		defaultMaxItems:   c.ScopeMaxItems,
 		maxStoreBytes:     c.MaxStoreBytes,
 		maxItemBytes:      c.MaxItemBytes,
@@ -987,6 +1013,45 @@ func NewStore(c Config) *Store {
 		maxInboxBytes:     c.MaxInboxBytes,
 		enableAdmin:       c.EnableAdmin,
 	}
+	for i := range s.shards {
+		s.shards[i].scopes = make(map[string]*ScopeBuffer)
+	}
+	return s
+}
+
+// shardIdxFor maps a scope name to a shard index in [0, numShards).
+// maphash uses a per-process random seed, so distribution is uniform
+// across shards and not predictable from the scope name — adversarial
+// scope-name picking cannot deliberately collide on one shard.
+func (s *Store) shardIdxFor(scope string) uint64 {
+	return maphash.String(s.hashSeed, scope) & shardMask
+}
+
+func (s *Store) shardFor(scope string) *scopeShard {
+	return &s.shards[s.shardIdxFor(scope)]
+}
+
+// shardsForScopes returns the unique set of shards covering the given
+// scope names, in ascending shard-index order. Used by /warm to lock
+// only the shards it touches (rather than all numShards) while still
+// preserving the "all relevant shards held simultaneously" invariant
+// that serialises against /wipe and /rebuild.
+func (s *Store) shardsForScopes(scopes []string) []*scopeShard {
+	var seen [numShards]bool
+	indices := make([]int, 0, numShards)
+	for _, scope := range scopes {
+		idx := int(s.shardIdxFor(scope))
+		if !seen[idx] {
+			seen[idx] = true
+			indices = append(indices, idx)
+		}
+	}
+	sort.Ints(indices)
+	out := make([]*scopeShard, len(indices))
+	for i, idx := range indices {
+		out[i] = &s.shards[idx]
+	}
+	return out
 }
 
 // isInboxScope reports whether `name` is in the operator-configured
@@ -1020,7 +1085,7 @@ func (s *Store) reserveBytes(delta int64) (bool, int64, int64) {
 // scopeBufferOverhead is the byte-cost the cache charges per allocated
 // scope, on top of the scope's items. Covers the *ScopeBuffer struct
 // itself (mutex, slice header, two map headers, heat-bucket
-// ringbuffer, scope-name string in s.scopes), plus slack for the
+// ringbuffer, scope-name string in its shard's map), plus slack for the
 // per-key map entry overhead. A conservative single-KiB number.
 //
 // Including it in totalBytes admission control means an attacker
@@ -1062,17 +1127,19 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, boo
 		return nil, false, errors.New("the 'scope' field is required")
 	}
 
-	s.mu.RLock()
-	buf, ok := s.scopes[scope]
-	s.mu.RUnlock()
+	sh := s.shardFor(scope)
+
+	sh.mu.RLock()
+	buf, ok := sh.scopes[scope]
+	sh.mu.RUnlock()
 	if ok {
 		return buf, false, nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	buf, ok = s.scopes[scope]
+	buf, ok = sh.scopes[scope]
 	if ok {
 		return buf, false, nil
 	}
@@ -1092,7 +1159,7 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, boo
 	}
 
 	buf = s.newScopeBuffer()
-	s.scopes[scope] = buf
+	sh.scopes[scope] = buf
 	return buf, true, nil
 }
 
@@ -1115,10 +1182,11 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, boo
 //     released the locks returns *ScopeDetachedError, same semantics
 //     as a /delete_scope race.
 func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *ScopeBuffer) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(scope)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	cur, ok := s.scopes[scope]
+	cur, ok := sh.scopes[scope]
 	if !ok || cur != buf {
 		return
 	}
@@ -1130,7 +1198,7 @@ func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *ScopeBuffer) {
 		return
 	}
 
-	delete(s.scopes, scope)
+	delete(sh.scopes, scope)
 	s.totalBytes.Add(-scopeBufferOverhead)
 	buf.detached = true
 	buf.store = nil
@@ -1204,17 +1272,19 @@ func (s *Store) CounterAddOne(scope, id string, by int64) (int64, bool, error) {
 // (guardedIncrementCounters) treat counter writes as best-effort and
 // silently skip on nil, since counters are observability, not auth.
 func (s *Store) ensureScope(scope string) *ScopeBuffer {
-	s.mu.RLock()
-	buf, ok := s.scopes[scope]
-	s.mu.RUnlock()
+	sh := s.shardFor(scope)
+
+	sh.mu.RLock()
+	buf, ok := sh.scopes[scope]
+	sh.mu.RUnlock()
 	if ok {
 		return buf
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	buf, ok = s.scopes[scope]
+	buf, ok = sh.scopes[scope]
 	if ok {
 		return buf
 	}
@@ -1224,15 +1294,16 @@ func (s *Store) ensureScope(scope string) *ScopeBuffer {
 	}
 
 	buf = s.newScopeBuffer()
-	s.scopes[scope] = buf
+	sh.scopes[scope] = buf
 	return buf
 }
 
 func (s *Store) getScope(scope string) (*ScopeBuffer, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	sh := s.shardFor(scope)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 
-	buf, ok := s.scopes[scope]
+	buf, ok := sh.scopes[scope]
 	return buf, ok
 }
 
@@ -1241,10 +1312,11 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 		return 0, false
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.shardFor(scope)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	buf, ok := s.scopes[scope]
+	buf, ok := sh.scopes[scope]
 	if !ok {
 		return 0, false
 	}
@@ -1260,7 +1332,7 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	buf.mu.Lock()
 	itemCount := len(buf.items)
 	scopeBytes := buf.bytes
-	delete(s.scopes, scope)
+	delete(sh.scopes, scope)
 	// Release item bytes AND the per-scope overhead reserved at create
 	// time. Combined into one Add so observers never see a transient
 	// state with one released and the other still charged.
@@ -1277,11 +1349,11 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 // Mirrors deleteScope's detach-then-account discipline so a concurrent
 // in-flight write reaching a stale buf pointer either commits before
 // detach (bytes counted in scopeBytes) or wakes up after and returns
-// *ScopeDetachedError. Holds the store-wide write lock for the whole
-// sweep — same lock discipline as wipe(); revocation is rare, traffic
-// is hot, and the alternative (per-scope locking with an unlocked map
-// walk) would race with concurrent /append creating a fresh tenant
-// scope mid-sweep.
+// *ScopeDetachedError. Locks every shard for the whole sweep — same
+// lock discipline as wipe(); revocation is rare, traffic is hot, and
+// the alternative (per-shard locking with separate sweeps) would let a
+// concurrent /append create a fresh tenant scope on a shard the sweep
+// has already passed, leaving the tenant partially deleted.
 //
 // The capabilityID is treated as an opaque string (the handler enforces
 // the 64-hex-char shape upstream); the store concatenates the literal
@@ -1289,8 +1361,14 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 	prefix := "_guarded:" + capabilityID + ":"
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	for i := range s.shards {
+		s.shards[i].mu.Lock()
+	}
+	defer func() {
+		for i := range s.shards {
+			s.shards[i].mu.Unlock()
+		}
+	}()
 
 	var (
 		deletedScopes int
@@ -1298,23 +1376,26 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 		freedBytes    int64
 	)
 
-	for scope, buf := range s.scopes {
-		if !strings.HasPrefix(scope, prefix) {
-			continue
+	for i := range s.shards {
+		sh := &s.shards[i]
+		for scope, buf := range sh.scopes {
+			if !strings.HasPrefix(scope, prefix) {
+				continue
+			}
+			buf.mu.Lock()
+			deletedItems += len(buf.items)
+			scopeBytes := buf.bytes
+			delete(sh.scopes, scope)
+			// Combined into one Add so observers never see a transient state
+			// with one released and the other still charged. Same shape as
+			// deleteScope: item bytes + per-scope overhead, in lockstep.
+			s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
+			freedBytes += scopeBytes + scopeBufferOverhead
+			buf.detached = true
+			buf.store = nil
+			buf.mu.Unlock()
+			deletedScopes++
 		}
-		buf.mu.Lock()
-		deletedItems += len(buf.items)
-		scopeBytes := buf.bytes
-		delete(s.scopes, scope)
-		// Combined into one Add so observers never see a transient state
-		// with one released and the other still charged. Same shape as
-		// deleteScope: item bytes + per-scope overhead, in lockstep.
-		s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
-		freedBytes += scopeBytes + scopeBufferOverhead
-		buf.detached = true
-		buf.store = nil
-		buf.mu.Unlock()
-		deletedScopes++
 	}
 
 	return deletedScopes, deletedItems, freedBytes
@@ -1334,22 +1415,34 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 // The caller — the /wipe handler — surfaces (scopeCount, totalItems, freedBytes)
 // in the response so a client can verify how much state the call released.
 func (s *Store) wipe() (int, int, int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	for i := range s.shards {
+		s.shards[i].mu.Lock()
+	}
+	defer func() {
+		for i := range s.shards {
+			s.shards[i].mu.Unlock()
+		}
+	}()
 
-	scopeCount := len(s.scopes)
+	scopeCount := 0
 	totalItems := 0
 
-	for _, buf := range s.scopes {
-		buf.mu.Lock()
-		totalItems += len(buf.items)
-		buf.detached = true
-		buf.store = nil
-		buf.mu.Unlock()
+	for i := range s.shards {
+		sh := &s.shards[i]
+		scopeCount += len(sh.scopes)
+		for _, buf := range sh.scopes {
+			buf.mu.Lock()
+			totalItems += len(buf.items)
+			buf.detached = true
+			buf.store = nil
+			buf.mu.Unlock()
+		}
 	}
 
 	freedBytes := s.totalBytes.Swap(0)
-	s.scopes = make(map[string]*ScopeBuffer)
+	for i := range s.shards {
+		s.shards[i].scopes = make(map[string]*ScopeBuffer)
+	}
 
 	return scopeCount, totalItems, freedBytes
 }
@@ -1366,21 +1459,31 @@ type StoreStats struct {
 }
 
 func (s *Store) stats() StoreStats {
-	// Single-pass snapshot under one store lock: scope_count and total_items
-	// reflect the same set of scopes. A prior version released the store lock
-	// between the per-scope walk and a separate pass, allowing the counts in
-	// one response to disagree.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	// Per-shard snapshot: each shard is RLock'd, walked, RUnlock'd in
+	// turn. scope_count and total_items still reflect the same set of
+	// scopes that were captured into Scopes (loop derives them from
+	// the same per-shard walk), so the response is internally
+	// consistent even though it is no longer a global instant — a
+	// concurrent /append on shard 5 may land after we release shard 5
+	// and before we take shard 6, but the response always agrees with
+	// itself. approx_store_mb is read once from the atomic counter so
+	// it can show the post-release total even when the per-scope
+	// walk shows the pre-release set; that mismatch existed pre-
+	// sharding too (totalBytes is read after the lock, by design) and
+	// /stats has always been an approximation.
 	now := nowUnixMicro()
-	scopeStats := make(map[string]ScopeStats, len(s.scopes))
+	scopeStats := make(map[string]ScopeStats)
 	totalItems := 0
 
-	for scope, buf := range s.scopes {
-		st := buf.stats(now)
-		scopeStats[scope] = st
-		totalItems += st.ItemCount
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for scope, buf := range sh.scopes {
+			st := buf.stats(now)
+			scopeStats[scope] = st
+			totalItems += st.ItemCount
+		}
+		sh.mu.RUnlock()
 	}
 
 	return StoreStats{
@@ -1430,9 +1533,10 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		return 0, &ScopeCapacityError{Offenders: offenders}
 	}
 
-	// Phase 1.5 + Phase 2 run under the store-level write lock to serialise
-	// against /delete_scope, /wipe, and /rebuild. Without that mutual
-	// exclusion the byte counter desyncs from Σ buf.bytes when one of those
+	// Phase 1.5 + Phase 2 run with every shard the batch touches held in
+	// write mode, in ascending shard-index order, to serialise against
+	// /delete_scope, /wipe, and /rebuild. Without that mutual exclusion
+	// the byte counter desyncs from Σ buf.bytes when one of those
 	// destructive ops fires between snapshot and commit:
 	//
 	//   - /wipe does totalBytes.Swap(0), erasing this batch's pre-reservation.
@@ -1443,24 +1547,41 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 	//     drift comp by accident, but only when the deleted scope's b.bytes
 	//     equals the snapshot — fragile, and we'd rather not depend on that.
 	//
+	// /wipe and /rebuild lock every shard, so any subset we hold blocks
+	// them. /delete_scope locks one shard, so it serialises against us
+	// only when it targets a scope on a shard we hold; that is exactly
+	// the case where the drift would matter (delete on a scope in our
+	// batch).
+	//
 	// Concurrent appends/updates/etc. on the SAME scopes /warm is replacing
-	// still proceed: they take buf.mu, not s.mu, and the drift comp inside
-	// commitReplacementPreReserved still reconciles per-scope races as
-	// before. What this lock blocks is the destructive store-map ops and
-	// new-scope creation (getOrCreateScope's slow path) — both intentional.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// still proceed via getOrCreateScope: they take buf.mu, not the shard
+	// lock, after a brief sh.mu.RLock for the lookup — and our shard write
+	// lock blocks even that RLock until the batch is committed.
+	scopeNames := make([]string, len(plans))
+	for i, p := range plans {
+		scopeNames[i] = p.scope
+	}
+	shards := s.shardsForScopes(scopeNames)
+	for _, sh := range shards {
+		sh.mu.Lock()
+	}
+	defer func() {
+		for _, sh := range shards {
+			sh.mu.Unlock()
+		}
+	}()
 
 	// Phase 1.5 — snapshot per-scope b.bytes (under each scope's RLock so
 	// concurrent in-scope writers are observed consistently), compute the
 	// net batch delta, and CAS-reserve it against the store counter.
 	// Per-scope overhead is reserved here for plans that create a NEW
-	// scope (one not yet in s.scopes); existing scopes already have
+	// scope (one not yet in its shard); existing scopes already have
 	// their overhead charged from when they were first allocated.
 	var totalDelta int64
 	for i := range plans {
+		sh := s.shardFor(plans[i].scope)
 		var old int64
-		if buf, ok := s.scopes[plans[i].scope]; ok {
+		if buf, ok := sh.scopes[plans[i].scope]; ok {
 			buf.mu.RLock()
 			old = buf.bytes
 			buf.mu.RUnlock()
@@ -1480,15 +1601,17 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		}
 	}
 
-	// Phase 2 — create-on-demand and commit. We hold s.mu.Lock() so we can
-	// touch s.scopes directly (calling getOrCreateScope here would deadlock
-	// on its internal RLock/Lock pair). Neither step can fail, so either
+	// Phase 2 — create-on-demand and commit. We hold every relevant shard
+	// in write mode so we can touch shard.scopes directly (calling
+	// getOrCreateScope here would deadlock on its internal RLock/Lock
+	// pair against our held write lock). Neither step can fail, so either
 	// every scope is replaced or (if an earlier phase aborted) none are.
 	for _, p := range plans {
-		buf, ok := s.scopes[p.scope]
+		sh := s.shardFor(p.scope)
+		buf, ok := sh.scopes[p.scope]
 		if !ok {
 			buf = s.newScopeBuffer()
-			s.scopes[p.scope] = buf
+			sh.scopes[p.scope] = buf
 		}
 		buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
 	}
@@ -1497,11 +1620,17 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 }
 
 func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
-	// Phase 1 — build every scope buffer off-map. If any scope fails
-	// validation the existing store is left fully intact. Capacity offenders
-	// are collected across the whole batch; any offender aborts the rebuild.
-	newScopes := make(map[string]*ScopeBuffer, len(grouped))
+	// Phase 1 — build every scope buffer off-map and distribute directly
+	// into the per-shard maps that Phase 2 will swap in. If any scope
+	// fails validation the existing store is left fully intact. Capacity
+	// offenders are collected across the whole batch; any offender aborts
+	// the rebuild.
+	var newShardMaps [numShards]map[string]*ScopeBuffer
+	for i := range newShardMaps {
+		newShardMaps[i] = make(map[string]*ScopeBuffer)
+	}
 	totalItems := 0
+	totalScopes := 0
 	var totalNewBytes int64
 	var offenders []ScopeCapacityOffender
 
@@ -1520,14 +1649,15 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		}
 		// buf is not yet shared; bypass commitReplacement (which would try
 		// to adjust the store counter) and initialize state directly. The
-		// store counter is reset in phase 2 once the new map is swapped.
+		// store counter is reset in phase 2 once the new maps are swapped.
 		buf := s.newScopeBuffer()
 		buf.items = r.items
 		buf.byID = r.byID
 		buf.bySeq = r.bySeq
 		buf.lastSeq = r.lastSeq
 		buf.bytes = sumItemBytes(r.items)
-		newScopes[scope] = buf
+		newShardMaps[s.shardIdxFor(scope)][scope] = buf
+		totalScopes++
 		totalItems += len(r.items)
 		totalNewBytes += buf.bytes
 		// Per-scope overhead — every scope in the new map gets one
@@ -1549,40 +1679,46 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		}
 	}
 
-	// Phase 2 — detach every existing buffer, then swap the store map and
-	// reset the byte counter under one lock. Detaching is essential:
-	// without it, a concurrent /append holding a stale buf pointer obtained
-	// via getOrCreateScope would run AFTER the swap and call reserveBytes
-	// against the freshly reset counter, permanently inflating totalBytes
-	// (its item lands in an unreachable orphan buffer). Mirrors wipe and
-	// /delete_scope; see ScopeBuffer.detached.
-	//
-	// The scope count is returned to the /rebuild handler, so it must
-	// reflect the state as handed over — not the state after a concurrent
-	// getOrCreateScope has already begun writing into s.scopes (which is
-	// the same map as newScopes after the swap). defer-Unlock plus a return
-	// expression keeps the read under the lock.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, buf := range s.scopes {
-		buf.mu.Lock()
-		buf.detached = true
-		buf.store = nil
-		buf.mu.Unlock()
+	// Phase 2 — lock every shard in ascending order, detach every existing
+	// buffer, swap the shard maps, reset the byte counter, release. Detach
+	// is essential: without it, a concurrent /append holding a stale buf
+	// pointer obtained via getOrCreateScope would run AFTER the swap and
+	// call reserveBytes against the freshly reset counter, permanently
+	// inflating totalBytes (its item lands in an unreachable orphan
+	// buffer). Mirrors wipe and /delete_scope; see ScopeBuffer.detached.
+	for i := range s.shards {
+		s.shards[i].mu.Lock()
 	}
-	s.scopes = newScopes
+	defer func() {
+		for i := range s.shards {
+			s.shards[i].mu.Unlock()
+		}
+	}()
+	for i := range s.shards {
+		for _, buf := range s.shards[i].scopes {
+			buf.mu.Lock()
+			buf.detached = true
+			buf.store = nil
+			buf.mu.Unlock()
+		}
+	}
+	for i := range s.shards {
+		s.shards[i].scopes = newShardMaps[i]
+	}
 	s.totalBytes.Store(totalNewBytes)
 
-	return len(newScopes), totalItems, nil
+	return totalScopes, totalItems, nil
 }
 
 func (s *Store) listScopes() map[string]*ScopeBuffer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	out := make(map[string]*ScopeBuffer, len(s.scopes))
-	for k, v := range s.scopes {
-		out[k] = v
+	out := make(map[string]*ScopeBuffer)
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for k, v := range sh.scopes {
+			out[k] = v
+		}
+		sh.mu.RUnlock()
 	}
 	return out
 }

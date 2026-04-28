@@ -213,48 +213,59 @@ func TestStress_MixedOps(t *testing.T) {
 func verifyInvariants(t *testing.T, s *Store) {
 	t.Helper()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	for shIdx := range s.shards {
+		s.shards[shIdx].mu.RLock()
+	}
+	defer func() {
+		for shIdx := range s.shards {
+			s.shards[shIdx].mu.RUnlock()
+		}
+	}()
 
 	var totalBytesSum int64
-	scopeCount := int64(len(s.scopes))
-	for name, buf := range s.scopes {
-		buf.mu.RLock()
+	var scopeCount int64
+	for shIdx := range s.shards {
+		scopeCount += int64(len(s.shards[shIdx].scopes))
+	}
+	for shIdx := range s.shards {
+		for name, buf := range s.shards[shIdx].scopes {
+			buf.mu.RLock()
 
-		var sum int64
-		for _, it := range buf.items {
-			sum += approxItemSize(it)
-		}
-		if sum != buf.bytes {
-			t.Errorf("scope %q: sum(approxItemSize)=%d != buf.bytes=%d", name, sum, buf.bytes)
-		}
-
-		if len(buf.bySeq) != len(buf.items) {
-			t.Errorf("scope %q: len(bySeq)=%d != len(items)=%d", name, len(buf.bySeq), len(buf.items))
-		}
-
-		for i := 1; i < len(buf.items); i++ {
-			if buf.items[i].Seq <= buf.items[i-1].Seq {
-				t.Errorf("scope %q: items not strictly seq-ordered at %d (seq %d <= %d)",
-					name, i, buf.items[i].Seq, buf.items[i-1].Seq)
-				break
+			var sum int64
+			for _, it := range buf.items {
+				sum += approxItemSize(it)
 			}
-		}
-
-		for id, item := range buf.byID {
-			bySeqItem, ok := buf.bySeq[item.Seq]
-			if !ok {
-				t.Errorf("scope %q: byID[%q].Seq=%d not in bySeq", name, id, item.Seq)
-				continue
+			if sum != buf.bytes {
+				t.Errorf("scope %q: sum(approxItemSize)=%d != buf.bytes=%d", name, sum, buf.bytes)
 			}
-			if bySeqItem.ID != id {
-				t.Errorf("scope %q: byID[%q] points at seq=%d but bySeq[%d].ID=%q",
-					name, id, item.Seq, item.Seq, bySeqItem.ID)
-			}
-		}
 
-		totalBytesSum += buf.bytes
-		buf.mu.RUnlock()
+			if len(buf.bySeq) != len(buf.items) {
+				t.Errorf("scope %q: len(bySeq)=%d != len(items)=%d", name, len(buf.bySeq), len(buf.items))
+			}
+
+			for i := 1; i < len(buf.items); i++ {
+				if buf.items[i].Seq <= buf.items[i-1].Seq {
+					t.Errorf("scope %q: items not strictly seq-ordered at %d (seq %d <= %d)",
+						name, i, buf.items[i].Seq, buf.items[i-1].Seq)
+					break
+				}
+			}
+
+			for id, item := range buf.byID {
+				bySeqItem, ok := buf.bySeq[item.Seq]
+				if !ok {
+					t.Errorf("scope %q: byID[%q].Seq=%d not in bySeq", name, id, item.Seq)
+					continue
+				}
+				if bySeqItem.ID != id {
+					t.Errorf("scope %q: byID[%q] points at seq=%d but bySeq[%d].ID=%q",
+						name, id, item.Seq, item.Seq, bySeqItem.ID)
+				}
+			}
+
+			totalBytesSum += buf.bytes
+			buf.mu.RUnlock()
+		}
 	}
 
 	expected := totalBytesSum + scopeCount*scopeBufferOverhead

@@ -986,15 +986,18 @@ func TestStore_ReplaceScopes_RaceVsRebuild(t *testing.T) {
 func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
 	t.Helper()
 
-	s.mu.RLock()
 	var sum int64
-	scopeCount := len(s.scopes)
-	for _, buf := range s.scopes {
-		buf.mu.RLock()
-		sum += buf.bytes
-		buf.mu.RUnlock()
+	var scopeCount int
+	for shIdx := range s.shards {
+		s.shards[shIdx].mu.RLock()
+		scopeCount += len(s.shards[shIdx].scopes)
+		for _, buf := range s.shards[shIdx].scopes {
+			buf.mu.RLock()
+			sum += buf.bytes
+			buf.mu.RUnlock()
+		}
+		s.shards[shIdx].mu.RUnlock()
 	}
-	s.mu.RUnlock()
 
 	// Since v0.5.14 totalBytes also includes scopeBufferOverhead per
 	// allocated scope (admission control sees the real per-scope memory
@@ -1301,9 +1304,12 @@ func TestStore_AppendOne_DoSPathStaysClean(t *testing.T) {
 		}
 	}
 
-	s.mu.RLock()
-	scopeCount := len(s.scopes)
-	s.mu.RUnlock()
+	var scopeCount int
+	for shIdx := range s.shards {
+		s.shards[shIdx].mu.RLock()
+		scopeCount += len(s.shards[shIdx].scopes)
+		s.shards[shIdx].mu.RUnlock()
+	}
 	if scopeCount != 0 {
 		t.Errorf("after 1000 failed AppendOne calls, %d empty scopes leaked", scopeCount)
 	}
@@ -1343,15 +1349,17 @@ func TestStore_AppendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 	}
 	wg.Wait()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for name, buf := range s.scopes {
-		buf.mu.Lock()
-		empty := len(buf.items) == 0
-		buf.mu.Unlock()
-		if empty {
-			t.Errorf("empty scope %q leaked through concurrent cleanup", name)
+	for shIdx := range s.shards {
+		s.shards[shIdx].mu.RLock()
+		for name, buf := range s.shards[shIdx].scopes {
+			buf.mu.Lock()
+			empty := len(buf.items) == 0
+			buf.mu.Unlock()
+			if empty {
+				t.Errorf("empty scope %q leaked through concurrent cleanup", name)
+			}
 		}
+		s.shards[shIdx].mu.RUnlock()
 	}
 }
 
