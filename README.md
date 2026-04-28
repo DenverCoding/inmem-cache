@@ -230,7 +230,7 @@ curl http://localhost:8081/help
 Build a Caddy binary with scopecache baked in:
 
 ```bash
-xcaddy build --with github.com/VeloxCoding/scopecache/caddymodule@v0.5.0
+xcaddy build --with github.com/VeloxCoding/scopecache/caddymodule@latest
 ```
 
 Combine with FrankenPHP in one binary:
@@ -238,7 +238,7 @@ Combine with FrankenPHP in one binary:
 ```bash
 xcaddy build \
     --with github.com/dunglas/frankenphp/caddy \
-    --with github.com/VeloxCoding/scopecache/caddymodule@v0.5.0
+    --with github.com/VeloxCoding/scopecache/caddymodule@latest
 ```
 
 Minimal Caddyfile:
