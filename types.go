@@ -116,6 +116,19 @@ type Config struct {
 	// must opt in). Operators who need /admin from a Caddyfile MUST
 	// set both this flag AND a route guard in front of /admin.
 	EnableAdmin bool
+	// DisableReadHeat turns off per-scope read-heat tracking
+	// (recordRead) on the hot read path (/get, /render, /head, /tail,
+	// /ts_range). Zero-value (false) preserves the default — heat is
+	// tracked, so /delete_scope_candidates can rank scopes by
+	// last_7d_read_count and /stats reports last_access_ts and
+	// read_count_total accurately. Setting to true skips the entire
+	// recordRead call, including the time.Now() that feeds it; the
+	// scope-level counters stay at zero and /delete_scope_candidates
+	// will return no useful ranking. Operators who don't use
+	// /delete_scope_candidates can set this for ~2× faster reads on
+	// the hottest paths. Negative framing is deliberate: we want the
+	// zero-value Config{} to keep the documented default behavior.
+	DisableReadHeat bool
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields

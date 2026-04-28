@@ -79,6 +79,15 @@ type Handler struct {
 	// permission-gated Unix socket, defaults this to true. See the
 	// EnableAdmin field on scopecache.Config for the rationale.
 	EnableAdmin bool `json:"enable_admin,omitempty"`
+	// DisableReadHeat turns off per-scope read-heat tracking on the
+	// hot read path (/get, /render, /head, /tail, /ts_range). Default
+	// false — heat is tracked, /delete_scope_candidates ranks
+	// correctly. Set to true to skip recordRead and the time.Now()
+	// that feeds it; saves ~2× on the hottest paths at the cost of
+	// always-zero last_access_ts / last_7d_read_count /
+	// read_count_total in /stats. See DisableReadHeat on
+	// scopecache.Config.
+	DisableReadHeat bool `json:"disable_read_heat,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -115,6 +124,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		ServerSecret:      h.ServerSecret,
 		InboxScopes:       h.InboxScopes,
 		EnableAdmin:       h.EnableAdmin,
+		DisableReadHeat:   h.DisableReadHeat,
 	})
 	h.api = scopecache.NewAPI(store)
 	h.mux = http.NewServeMux()
@@ -150,13 +160,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    inbox_scope            _inbox
 //	    inbox_scope            audit_log
 //	    enable_admin           yes
+//	    disable_read_heat      no
 //	}
 //
 // Numeric capacity knobs are integer; `server_secret` is a string that
 // can be either a literal value or — recommended — a `{$VAR}`
 // substitution of an env-var. `inbox_scope` is repeatable: each
 // occurrence appends one allowed scope name to the /inbox allowlist.
-// `enable_admin` is a boolean (yes/no, true/false, on/off, 1/0);
+// `enable_admin` and `disable_read_heat` are booleans (yes/no, true/false, on/off, 1/0);
 // default is "no" — an unrecognised /admin behind a public Caddyfile
 // is the most common deployment footgun, so the operator must opt in
 // and is expected to also add a route guard (e.g. an `@operator`
@@ -193,6 +204,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					h.EnableAdmin = false
 				default:
 					return d.Errf("enable_admin: %q is not a boolean (use yes/no, true/false, on/off, or 1/0)", value)
+				}
+				continue
+			case "disable_read_heat":
+				switch strings.ToLower(value) {
+				case "yes", "true", "on", "1":
+					h.DisableReadHeat = true
+				case "no", "false", "off", "0":
+					h.DisableReadHeat = false
+				default:
+					return d.Errf("disable_read_heat: %q is not a boolean (use yes/no, true/false, on/off, or 1/0)", value)
 				}
 				continue
 			}

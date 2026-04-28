@@ -1080,6 +1080,12 @@ type Store struct {
 	// returns 404. Operator opt-in to expose the operator-elevated
 	// dispatcher. See Config.EnableAdmin for the rationale.
 	enableAdmin bool
+	// disableReadHeat skips recordRead() on every hot read-path call
+	// (/get, /render, /head, /tail, /ts_range). Default zero-value
+	// (false) keeps heat tracking on; setting true saves the
+	// time.Now() call plus the atomic adds on the heat counters. See
+	// Config.DisableReadHeat.
+	disableReadHeat bool
 	// totalBytes tracks the running sum of approxItemSize across every item
 	// in every scope. Kept in an atomic so /append can reserve against it
 	// without touching the store-level mutex; writes that would push it past
@@ -1113,6 +1119,7 @@ func NewStore(c Config) *Store {
 		inboxScopes:       inboxSet,
 		maxInboxBytes:     c.MaxInboxBytes,
 		enableAdmin:       c.EnableAdmin,
+		disableReadHeat:   c.DisableReadHeat,
 	}
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*ScopeBuffer)

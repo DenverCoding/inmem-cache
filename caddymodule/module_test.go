@@ -146,3 +146,59 @@ func TestUnmarshalCaddyfile_EnableAdminDefaultFalse(t *testing.T) {
 		t.Errorf("EnableAdmin=true with no enable_admin directive; want false (safe default)")
 	}
 }
+
+// disable_read_heat is the same boolean shape as enable_admin: same
+// parsing, same yes/no/true/false/on/off/1/0 vocabulary, garbage
+// rejected. Default false (heat tracked, /delete_scope_candidates
+// works out of the box). Operators who don't use
+// /delete_scope_candidates can set yes for ~2× faster reads.
+func TestUnmarshalCaddyfile_DisableReadHeat(t *testing.T) {
+	cases := []struct {
+		input string
+		want  bool
+		errOK bool
+	}{
+		{"scopecache { disable_read_heat yes }", true, false},
+		{"scopecache { disable_read_heat true }", true, false},
+		{"scopecache { disable_read_heat on }", true, false},
+		{"scopecache { disable_read_heat 1 }", true, false},
+		{"scopecache { disable_read_heat no }", false, false},
+		{"scopecache { disable_read_heat false }", false, false},
+		{"scopecache { disable_read_heat off }", false, false},
+		{"scopecache { disable_read_heat 0 }", false, false},
+		{"scopecache { disable_read_heat maybe }", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			h := &Handler{}
+			d := caddyfile.NewTestDispenser(tc.input)
+			err := h.UnmarshalCaddyfile(d)
+			if tc.errOK {
+				if err == nil {
+					t.Errorf("expected error parsing %q; got nil", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error parsing %q: %v", tc.input, err)
+			}
+			if h.DisableReadHeat != tc.want {
+				t.Errorf("DisableReadHeat=%v want %v after parsing %q", h.DisableReadHeat, tc.want, tc.input)
+			}
+		})
+	}
+}
+
+// DisableReadHeat's zero-value default must be false — heat tracking
+// is on by default so /delete_scope_candidates ranks correctly out of
+// the box.
+func TestUnmarshalCaddyfile_DisableReadHeatDefaultFalse(t *testing.T) {
+	h := &Handler{}
+	d := caddyfile.NewTestDispenser("scopecache { scope_max_items 10 }")
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h.DisableReadHeat {
+		t.Errorf("DisableReadHeat=true with no disable_read_heat directive; want false (default-on heat tracking)")
+	}
+}

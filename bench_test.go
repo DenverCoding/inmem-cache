@@ -334,6 +334,33 @@ func BenchmarkStore_GetByID_Parallel_WithRecordRead(b *testing.B) {
 	})
 }
 
+// BenchmarkStore_GetByID_Parallel_HeatDisabled is the equivalent of
+// _WithRecordRead but with the path that handlers take when
+// Config.DisableReadHeat is true: skip recordRead entirely (and the
+// time.Now() that feeds it). Mimics what /get and /render do at runtime
+// in heat-off mode. Compare to _WithRecordRead to see the per-op
+// savings on the read-hot path when heat tracking is off.
+func BenchmarkStore_GetByID_Parallel_HeatDisabled(b *testing.B) {
+	store, scopes, ids := benchStore(b, 100, 1000, 512)
+	numScopes := len(scopes)
+	itemsPerScope := len(ids) / numScopes
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			scope := scopes[i%numScopes]
+			id := ids[i%itemsPerScope]
+			buf, _ := store.getScope(scope)
+			_, _ = buf.getByID(id)
+			// recordRead intentionally skipped — what disableReadHeat does.
+			i++
+		}
+	})
+}
+
 // BenchmarkStore_Tail_Parallel measures /tail-style reads (most-recent
 // items) at limit=10 — the typical small-window read pattern.
 // tailOffset takes RLock, slices b.items[start:end], copies into a

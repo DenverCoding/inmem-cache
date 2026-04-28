@@ -149,6 +149,23 @@ func maxMultiCallCountFromEnv() int {
 	return n
 }
 
+// disableReadHeatFromEnv reads SCOPECACHE_DISABLE_READ_HEAT. Default
+// is false — heat tracking is on, so /delete_scope_candidates ranks
+// scopes correctly. Set "1", "true", "yes", or "on" (case-insensitive)
+// to skip recordRead on the hot read path; saves the time.Now() call
+// plus the heat counters' atomic adds, at the cost of always-zero
+// last_access_ts / last_7d_read_count / read_count_total in /stats.
+// Useful for deployments that don't use /delete_scope_candidates.
+func disableReadHeatFromEnv() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SCOPECACHE_DISABLE_READ_HEAT")))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // enableAdminFromEnv reads SCOPECACHE_ENABLE_ADMIN. Default is true:
 // the standalone binary listens on a Unix socket, which the operator
 // gates with filesystem permissions (`chmod 0660 /run/scopecache.sock`,
@@ -248,6 +265,7 @@ func main() {
 		InboxScopes:       inboxScopesFromEnv(),
 		MaxInboxBytes:     maxInboxBytesFromEnv(),
 		EnableAdmin:       enableAdminFromEnv(),
+		DisableReadHeat:   disableReadHeatFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store)
@@ -267,7 +285,11 @@ func main() {
 		inboxStatus = "enabled, scopes=" + strings.Join(cfg.InboxScopes, ",")
 	}
 	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch, %d KiB per /inbox payload", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount, cfg.MaxInboxBytes>>10)
-	log.Printf("scopecache features: /admin %s; /guarded %s; /inbox %s", adminStatus, guardedStatus, inboxStatus)
+	heatStatus := "enabled"
+	if cfg.DisableReadHeat {
+		heatStatus = "DISABLED (SCOPECACHE_DISABLE_READ_HEAT=on; /delete_scope_candidates won't have ranking data)"
+	}
+	log.Printf("scopecache features: /admin %s; /guarded %s; /inbox %s; read-heat %s", adminStatus, guardedStatus, inboxStatus, heatStatus)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

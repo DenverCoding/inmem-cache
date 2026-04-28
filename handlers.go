@@ -866,7 +866,9 @@ func (api *API) writeItemsHit(
 	extra orderedFields,
 ) {
 	if len(items) > 0 {
-		buf.recordRead(nowUnixMicro())
+		if !api.store.disableReadHeat {
+			buf.recordRead(nowUnixMicro())
+		}
 		if estimated := estimateMultiItemResponseBytes(items); estimated > api.store.maxResponseBytes {
 			responseTooLarge(w, started, estimated, api.store.maxResponseBytes)
 			return
@@ -1079,7 +1081,9 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 	// Only a hit counts toward scope read-heat. A miss by explicit id/seq
 	// should not inflate last_7d_read_count, since the signal is surfaced
 	// on /delete_scope_candidates for client-side eviction decisions.
-	buf.recordRead(nowUnixMicro())
+	if !api.store.disableReadHeat {
+		buf.recordRead(nowUnixMicro())
+	}
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
@@ -1143,7 +1147,9 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A hit counts toward scope read-heat, same as /get.
-	buf.recordRead(nowUnixMicro())
+	if !api.store.disableReadHeat {
+		buf.recordRead(nowUnixMicro())
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
