@@ -461,27 +461,24 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 			}
 		}
 
-		for i := range b.items {
-			if b.items[i].ID != item.ID {
-				continue
-			}
-			b.items[i].Payload = item.Payload
-			// /upsert has replace-the-whole-item semantics, so ts follows the
-			// client's input exactly: send ts → stored, omit → cleared. That
-			// differs from /update (which treats absent ts as "preserve").
-			b.items[i].Ts = item.Ts
-
-			updated := b.items[i]
-			// b.byID hit above proves byID was already allocated; same for
-			// bySeq (every item that lives in byID also lives in bySeq).
-			b.bySeq[updated.Seq] = updated
-			b.byID[item.ID] = updated
-			b.bytes += delta
-			return updated, false, nil
+		i, ok := b.indexBySeqLocked(existing.Seq)
+		if !ok {
+			// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
+			return Item{}, false, nil
 		}
+		b.items[i].Payload = item.Payload
+		// /upsert has replace-the-whole-item semantics, so ts follows the
+		// client's input exactly: send ts → stored, omit → cleared. That
+		// differs from /update (which treats absent ts as "preserve").
+		b.items[i].Ts = item.Ts
 
-		// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
-		return Item{}, false, nil
+		updated := b.items[i]
+		// b.byID hit above proves byID was already allocated; same for
+		// bySeq (every item that lives in byID also lives in bySeq).
+		b.bySeq[updated.Seq] = updated
+		b.byID[item.ID] = updated
+		b.bytes += delta
+		return updated, false, nil
 	}
 
 	if len(b.items) >= b.maxItems {
@@ -551,18 +548,15 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 			return 0, false, err
 		}
 
-		for i := range b.items {
-			if b.items[i].ID != id {
-				continue
-			}
-			// /counter_add never updates ts (only the integer payload),
-			// so pass nil for ts — the helper preserves the existing ts.
-			b.replaceItemAtIndexLocked(i, newPayload, nil, delta)
-			return newValue, false, nil
+		i, ok := b.indexBySeqLocked(existing.Seq)
+		if !ok {
+			// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
+			return 0, false, nil
 		}
-
-		// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
-		return 0, false, nil
+		// /counter_add never updates ts (only the integer payload),
+		// so pass nil for ts — the helper preserves the existing ts.
+		b.replaceItemAtIndexLocked(i, newPayload, nil, delta)
+		return newValue, false, nil
 	}
 
 	if len(b.items) >= b.maxItems {
@@ -725,6 +719,24 @@ func (b *ScopeBuffer) deleteIndexLocked(i int) {
 	}
 }
 
+// indexBySeqLocked returns the position of the item with the given seq
+// inside b.items. Returns (0, false) when no such item exists. items is
+// always ordered ascending by seq (appendItem assigns monotonic seqs and
+// nothing inserts in the middle), so this is O(log n) — the canonical
+// way to translate a byID/bySeq map hit into a slice index for in-place
+// mutation. Caller must hold b.mu (read or write — both are fine,
+// callers have a write lock in practice because every user is about to
+// mutate b.items[i]).
+func (b *ScopeBuffer) indexBySeqLocked(seq uint64) (int, bool) {
+	i := sort.Search(len(b.items), func(i int) bool {
+		return b.items[i].Seq >= seq
+	})
+	if i == len(b.items) || b.items[i].Seq != seq {
+		return 0, false
+	}
+	return i, true
+}
+
 // updateByID mutates the item at (scope, id). Payload is always overwritten.
 // Ts follows "absent → preserve, present → overwrite" semantics: a nil ts
 // leaves the stored ts alone, a non-nil ts replaces it. This asymmetry with
@@ -751,16 +763,13 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) 
 		return 0, err
 	}
 
-	for i := range b.items {
-		if b.items[i].ID != id {
-			continue
-		}
-		b.replaceItemAtIndexLocked(i, payload, ts, delta)
-		return 1, nil
+	i, ok := b.indexBySeqLocked(existing.Seq)
+	if !ok {
+		// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
+		return 0, nil
 	}
-
-	// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
-	return 0, nil
+	b.replaceItemAtIndexLocked(i, payload, ts, delta)
+	return 1, nil
 }
 
 func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64) (int, error) {
@@ -781,14 +790,11 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 		return 0, err
 	}
 
-	i := sort.Search(len(b.items), func(i int) bool {
-		return b.items[i].Seq >= seq
-	})
-	if i == len(b.items) || b.items[i].Seq != seq {
+	i, ok := b.indexBySeqLocked(seq)
+	if !ok {
 		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
 		return 0, nil
 	}
-
 	b.replaceItemAtIndexLocked(i, payload, ts, delta)
 	return 1, nil
 }
@@ -806,17 +812,11 @@ func (b *ScopeBuffer) deleteByID(id string) (int, error) {
 		return 0, nil
 	}
 
-	// items is ordered ascending by seq (monotonic append, no mid-slice
-	// inserts), so binary search finds the index in O(log n) rather than
-	// scanning the slice by id.
-	i := sort.Search(len(b.items), func(i int) bool {
-		return b.items[i].Seq >= existing.Seq
-	})
-	if i == len(b.items) || b.items[i].Seq != existing.Seq {
+	i, ok := b.indexBySeqLocked(existing.Seq)
+	if !ok {
 		// Unreachable under b.mu: b.byID confirmed the item exists and items/bySeq are kept in sync.
 		return 0, nil
 	}
-
 	b.deleteIndexLocked(i)
 	return 1, nil
 }
@@ -833,15 +833,11 @@ func (b *ScopeBuffer) deleteBySeq(seq uint64) (int, error) {
 		return 0, nil
 	}
 
-	// items is ordered ascending by seq (monotonic append, no mid-slice
-	// inserts), so binary search finds the index in O(log n).
-	i := sort.Search(len(b.items), func(i int) bool {
-		return b.items[i].Seq >= seq
-	})
-	if i == len(b.items) || b.items[i].Seq != seq {
+	i, ok := b.indexBySeqLocked(seq)
+	if !ok {
+		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
 		return 0, nil
 	}
-
 	b.deleteIndexLocked(i)
 	return 1, nil
 }

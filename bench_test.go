@@ -204,6 +204,48 @@ func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
 	})
 }
 
+// BenchmarkStore_CounterAdd_LargeScope measures /counter_add on an
+// existing item inside a scope that already has many other items. The
+// pre-rewrite path linear-scanned b.items by ID after a byID map hit;
+// after the indexBySeqLocked rewrite this is a binary search on Seq
+// (O(log n)). On a 10k-item scope the asymptotic difference is
+// ~5000-vs-13 comparisons per call. Counter and update workloads that
+// hot-loop on a handful of scopes with many items see this directly.
+func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
+	store := NewStore(Config{
+		ScopeMaxItems:    100_000,
+		MaxStoreBytes:    1 << 30,
+		MaxItemBytes:     1 << 20,
+		MaxResponseBytes: 1 << 30,
+	})
+	const scope = "counters"
+	buf, err := store.getOrCreateScope(scope)
+	if err != nil {
+		b.Fatalf("getOrCreateScope: %v", err)
+	}
+	// Seed 10 000 counter items so the slice scan path has enough length
+	// to dominate over the map lookup. The target id is at the *end* of
+	// the slice — worst case for the old linear scan, identical cost
+	// for the new binary search.
+	const n = 10_000
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("counter_%05d", i)
+		if _, _, err := buf.counterAdd(scope, id, 1); err != nil {
+			b.Fatalf("seed counterAdd: %v", err)
+		}
+	}
+	targetID := fmt.Sprintf("counter_%05d", n-1)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, _, err := buf.counterAdd(scope, targetID, 1); err != nil {
+			b.Fatalf("counterAdd: %v", err)
+		}
+	}
+}
+
 // benchTsScope builds a single scope populated with `n` items, each carrying
 // a monotonically increasing `ts` equal to its seq. Returns the scope buffer
 // so /ts_range benchmarks can call tsRange directly without the HTTP layer.
