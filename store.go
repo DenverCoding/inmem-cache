@@ -1244,31 +1244,40 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, boo
 		return buf, false, nil
 	}
 
+	// Allocate the buffer BEFORE taking the shard write lock — the
+	// expensive part (struct init, map slot reservation, GC pressure
+	// at high create rates) happens while other goroutines can still
+	// progress on this shard. The byte reservation stays INSIDE the
+	// lock so /wipe's totalBytes.Swap(0) and /rebuild's
+	// totalBytes.Store() (both held under all shard locks) cannot
+	// race with our reservation: while we hold this shard's lock,
+	// neither op can run, and our reservation is observed atomically
+	// alongside the map insert.
+	//
+	// Race-loss path (a concurrent goroutine inserted the same scope
+	// while we were allocating) discards the unused buffer for GC and
+	// makes no reservation. In the unique-scope-per-write workload
+	// that drove this rewrite, race-loss is essentially never (every
+	// scope name is distinct); in same-scope writes the caller hits
+	// the RLock fast-path above and never reaches this branch.
+	preBuf := s.newScopeBuffer()
+
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
-
-	buf, ok = sh.scopes[scope]
-	if ok {
-		return buf, false, nil
+	if existing, ok := sh.scopes[scope]; ok {
+		sh.mu.Unlock()
+		return existing, false, nil
 	}
-
-	// Reserve the per-scope overhead before allocating the buffer.
-	// Mirrors how /append reserves item bytes: if the cap can't fit
-	// the new scope, return StoreFullError so the caller surfaces
-	// the standard 507 envelope. Without this an attacker (or a
-	// poorly-written client) could fill the store with empty scopes
-	// while the byte counter stayed at zero.
 	if ok, current, max := s.reserveBytes(scopeBufferOverhead); !ok {
+		sh.mu.Unlock()
 		return nil, false, &StoreFullError{
 			StoreBytes: current,
 			AddedBytes: scopeBufferOverhead,
 			Cap:        max,
 		}
 	}
-
-	buf = s.newScopeBuffer()
-	sh.scopes[scope] = buf
-	return buf, true, nil
+	sh.scopes[scope] = preBuf
+	sh.mu.Unlock()
+	return preBuf, true, nil
 }
 
 // cleanupIfEmptyAndUnused rolls back a freshly-created scope when the
