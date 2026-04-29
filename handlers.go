@@ -217,14 +217,17 @@ func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedField
 // ~30 bytes total. Cost over writeJSONWithDuration is a single
 // json.Marshal of the MB value plus a few slice appends: well under 100 µs
 // even for multi-MiB responses.
-func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
+// marshalWithApproxSize is the shared splice helper used by
+// writeJSONWithMeta and writeJSONWithMetaCap. It marshals payload,
+// then appends a self-referential approx_response_mb field that
+// reports the body's own byte length back to the client. Returns
+// the spliced bytes plus the duration_us-augmented payload (the
+// caller may need it for a fallback path on marshal failure).
+func marshalWithApproxSize(payload orderedFields, started time.Time) ([]byte, orderedFields, error) {
 	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		// orderedFields encoding cannot fail in practice (we control every
-		// value type); fall through to the simpler writer if it ever does.
-		writeJSONWithDuration(w, code, payload[:len(payload)-1], started)
-		return
+		return nil, payload, err
 	}
 
 	// bodyBytes ends in '}'. Strip it, append `,"approx_response_mb":N.NNNN}`.
@@ -250,6 +253,46 @@ func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, s
 	out = append(out, fieldKey...)
 	out = append(out, valueBytes...)
 	out = append(out, '}', '\n')
+
+	return out, payload, nil
+}
+
+// writeJSONWithMeta is writeJSONWithDuration plus an approx_response_mb
+// field. Used on read-item endpoints whose response size is bounded by
+// the operation (e.g. /get is single-item). For limit-scaled endpoints
+// (/head, /tail, /ts_range) use writeJSONWithMetaCap instead, which
+// rejects oversized bodies up-front.
+func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
+	out, augmented, err := marshalWithApproxSize(payload, started)
+	if err != nil {
+		// orderedFields encoding cannot fail in practice (we control every
+		// value type); fall through to the simpler writer if it ever does.
+		writeJSONWithDuration(w, code, augmented[:len(augmented)-1], started)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_, _ = w.Write(out)
+}
+
+// writeJSONWithMetaCap is writeJSONWithMeta with a per-response byte
+// cap baked in. Used on /head, /tail, /ts_range — endpoints whose
+// response can grow with limit × per-item-cap. Marshals the body
+// once, checks against maxBytes, and either emits the response or
+// replaces it with a 507 envelope. Replaces the older capResponse
+// middleware that buffered the handler's whole output a second time.
+func writeJSONWithMetaCap(w http.ResponseWriter, code int, payload orderedFields, started time.Time, maxBytes int64) {
+	out, augmented, err := marshalWithApproxSize(payload, started)
+	if err != nil {
+		writeJSONWithDuration(w, code, augmented[:len(augmented)-1], started)
+		return
+	}
+
+	if int64(len(out)) > maxBytes {
+		responseTooLarge(w, started, int64(len(out)), maxBytes)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
@@ -886,15 +929,24 @@ func (api *API) writeItemsHit(
 		kv{"truncated", truncated},
 		kv{"items", items},
 	)
-	writeJSONWithMeta(w, http.StatusOK, fields, started)
+	// Single-marshal cap check via writeJSONWithMetaCap. Replaces an
+	// outer capResponse middleware that buffered the whole handler
+	// output a second time — for multi-MiB responses the saving is the
+	// full body size in heap. The pre-flight estimateMultiItemResponseBytes
+	// above still runs first to short-circuit pathological queries
+	// (limit=10000 against 1 MiB items) before the marshal.
+	writeJSONWithMetaCap(w, http.StatusOK, fields, started, api.store.maxResponseBytes)
 }
 
 // writeItemsMiss writes the canonical "scope does not exist" response
 // for a list-returning read endpoint. Same field order as
 // writeItemsHit's success path; truncated is always false; items is
 // the sentinel empty slice (NOT nil — `[]Item{}` marshals as `[]`,
-// nil would marshal as `null` and break clients that iterate).
-func writeItemsMiss(
+// nil would marshal as `null` and break clients that iterate). Goes
+// through the same cap-aware writer as the hit path so an absurdly
+// small per-response cap rejects misses too — preserves the symmetry
+// the cap-test suite relies on.
+func (api *API) writeItemsMiss(
 	w http.ResponseWriter,
 	started time.Time,
 	extra orderedFields,
@@ -910,7 +962,7 @@ func writeItemsMiss(
 		kv{"truncated", false},
 		kv{"items", []Item{}},
 	)
-	writeJSONWithMeta(w, http.StatusOK, fields, started)
+	writeJSONWithMetaCap(w, http.StatusOK, fields, started, api.store.maxResponseBytes)
 }
 
 func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
@@ -949,7 +1001,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeItemsMiss(w, started, nil)
+		api.writeItemsMiss(w, started, nil)
 		return
 	}
 
@@ -982,7 +1034,7 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeItemsMiss(w, started, offsetField)
+		api.writeItemsMiss(w, started, offsetField)
 		return
 	}
 
@@ -1029,7 +1081,7 @@ func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
 
 	buf, ok := api.store.getScope(q.Scope)
 	if !ok {
-		writeItemsMiss(w, started, nil)
+		api.writeItemsMiss(w, started, nil)
 		return
 	}
 
@@ -1344,9 +1396,15 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
-	mux.HandleFunc("/head", api.capResponse(api.handleHead))
-	mux.HandleFunc("/tail", api.capResponse(api.handleTail))
-	mux.HandleFunc("/ts_range", api.capResponse(api.handleTsRange))
+	// /head, /tail, /ts_range enforce the per-response cap inside their
+	// shared writer (writeJSONWithMetaCap, called from writeItemsHit) —
+	// no outer middleware needed. Earlier versions wrapped these with
+	// a capResponse middleware that buffered the full handler output a
+	// second time; folding the cap check into the marshal removed that
+	// duplicate buffering.
+	mux.HandleFunc("/head", api.handleHead)
+	mux.HandleFunc("/tail", api.handleTail)
+	mux.HandleFunc("/ts_range", api.handleTsRange)
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
 	mux.HandleFunc("/help", api.handleHelp)

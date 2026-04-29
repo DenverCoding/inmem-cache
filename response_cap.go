@@ -109,19 +109,9 @@ func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int
 	}, started)
 }
 
-// capResponse wraps a handler so the response runs through
-// cappedResponseWriter. The wrapper buffers the handler's writes,
-// inspects the total size after the handler returns, and either flushes
-// the captured response or replaces it with a 507.
-//
-// Applied only to read endpoints whose body can grow with limit ×
-// per-item-cap (/head, /tail, /ts_range). Endpoints that produce small,
-// known-bounded responses are not wrapped — the buffer cost would buy
-// nothing.
-func (api *API) capResponse(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		crw := newCappedResponseWriter(w, api.store.maxResponseBytes, time.Now())
-		h(crw, r)
-		crw.flush()
-	}
-}
+// cappedResponseWriter is retained for /multi_call's per-sub-call cap
+// path (multi_call.go wraps each sub-call's recorder so an oversized
+// sub-call body becomes a per-slot truncation marker without aborting
+// the whole batch). The public mux's /head, /tail, /ts_range no longer
+// use this wrapper — they enforce the cap inside writeJSONWithMetaCap
+// at marshal time, which avoids the second body-buffering pass.
