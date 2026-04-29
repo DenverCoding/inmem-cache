@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -200,6 +201,58 @@ func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
 			if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
 				b.Fatalf("AppendOne: %v", err)
 			}
+		}
+	})
+}
+
+// BenchmarkStore_RenderStringPayload_Parallel times the in-process
+// /render hot path on a JSON-string payload (no HTTP, no socket).
+// Pre-fix the handler ran bytes.TrimLeft + json.Unmarshal +
+// []byte cast on every hit; post-fix it uses item.renderBytes
+// precomputed at write time. The HTTP-fronted measurement absorbs
+// most of this difference into the request-handling floor — this
+// bench is the cleaner read of the per-call cache-side savings.
+func BenchmarkStore_RenderStringPayload_Parallel(b *testing.B) {
+	store := NewStore(Config{
+		ScopeMaxItems:    100_000,
+		MaxStoreBytes:    1 << 30,
+		MaxItemBytes:     1 << 20,
+		MaxResponseBytes: 1 << 30,
+	})
+	const scope = "html"
+	buf, err := store.getOrCreateScope(scope)
+	if err != nil {
+		b.Fatalf("getOrCreateScope: %v", err)
+	}
+	rawHTML := strings.Repeat("x", 500)
+	payload, _ := json.Marshal("<html>" + rawHTML + "</html>")
+	const n = 1000
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		id := "page-" + strconv.Itoa(i)
+		ids[i] = id
+		if _, err := buf.appendItem(Item{Scope: scope, ID: id, Payload: payload}); err != nil {
+			b.Fatalf("appendItem: %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			item, _ := buf.getByID(ids[i%n])
+			var out []byte
+			if item.renderBytes != nil {
+				out = item.renderBytes
+			} else {
+				out = item.Payload
+			}
+			if len(out) == 0 {
+				b.Fatalf("empty render output")
+			}
+			i++
 		}
 	})
 }

@@ -1154,16 +1154,11 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
 
-	trimmed := bytes.TrimLeft(item.Payload, " \t\r\n")
-	if len(trimmed) > 0 && trimmed[0] == '"' {
-		var s string
-		if err := json.Unmarshal(item.Payload, &s); err == nil {
-			_, _ = w.Write([]byte(s))
-			return
-		}
-		// Fall through to raw bytes on unmarshal failure. Stored payloads
-		// are validated on write, so this is a defensive safety net rather
-		// than an expected path.
+	// renderBytes is non-nil iff the payload is a JSON string, populated
+	// at write-time. Skip the per-hit json.Unmarshal + []byte cast.
+	if item.renderBytes != nil {
+		_, _ = w.Write(item.renderBytes)
+		return
 	}
 	_, _ = w.Write(item.Payload)
 }

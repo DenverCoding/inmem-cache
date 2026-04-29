@@ -1,6 +1,7 @@
 package scopecache
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"hash/maphash"
@@ -285,6 +286,7 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 		lastSeq++
 		item := src
 		item.Seq = lastSeq
+		item.renderBytes = precomputeRenderBytes(item.Payload)
 
 		built = append(built, item)
 		bySeq[item.Seq] = item
@@ -305,6 +307,23 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 	}, nil
 }
 
+// precomputeRenderBytes returns the JSON-string-decoded form of payload
+// when payload's first non-whitespace byte is `"`, or nil otherwise.
+// Called at write-time so /render hits skip the per-call json.Unmarshal
+// + []byte cast. Returns nil on a malformed JSON string (defensive — the
+// validator already rejects malformed JSON on writes).
+func precomputeRenderBytes(payload json.RawMessage) []byte {
+	trimmed := bytes.TrimLeft(payload, " \t\r\n")
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(payload, &s); err != nil {
+		return nil
+	}
+	return []byte(s)
+}
+
 func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -322,6 +341,11 @@ func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 			return Item{}, errors.New("an item with this 'id' already exists in the scope")
 		}
 	}
+
+	// Precompute the render-bytes shortcut before sizing — approxItemSize
+	// counts renderBytes against the cap, so the reservation must reflect
+	// the post-precompute Item.
+	item.renderBytes = precomputeRenderBytes(item.Payload)
 
 	// Reserve store-level bytes before mutating scope state: a failed
 	// reservation leaves the scope untouched, same as a failed dup-id check.
@@ -453,7 +477,12 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	}
 
 	if existing, exists := b.byID[item.ID]; exists {
-		delta := int64(len(item.Payload)) - int64(len(existing.Payload))
+		// Delta covers both Payload and renderBytes: approxItemSize
+		// counts both, and the cap check must too. renderBytes is
+		// non-nil only for JSON-string payloads.
+		newRender := precomputeRenderBytes(item.Payload)
+		delta := int64(len(item.Payload)+len(newRender)) -
+			int64(len(existing.Payload)+len(existing.renderBytes))
 		if b.store != nil && delta != 0 {
 			ok, current, max := b.store.reserveBytes(delta)
 			if !ok {
@@ -471,6 +500,7 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// client's input exactly: send ts → stored, omit → cleared. That
 		// differs from /update (which treats absent ts as "preserve").
 		b.items[i].Ts = item.Ts
+		b.items[i].renderBytes = newRender
 
 		updated := b.items[i]
 		// b.byID hit above proves byID was already allocated; same for
@@ -484,6 +514,9 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	if len(b.items) >= b.maxItems {
 		return Item{}, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
+
+	// Precompute renderBytes before sizing (approxItemSize counts it).
+	item.renderBytes = precomputeRenderBytes(item.Payload)
 
 	size := approxItemSize(item)
 	if b.store != nil {
@@ -555,7 +588,10 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 		}
 		// /counter_add never updates ts (only the integer payload),
 		// so pass nil for ts — the helper preserves the existing ts.
-		b.replaceItemAtIndexLocked(i, newPayload, nil, delta)
+		// renderBytes is always nil for counter payloads (bare
+		// integers, not JSON strings), so no renderBytes adjustment
+		// is needed and the payload-delta is the full delta.
+		b.replaceItemAtIndexLocked(i, newPayload, nil, nil, delta)
 		return newValue, false, nil
 	}
 
@@ -568,6 +604,11 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 		ID:      id,
 		Payload: json.RawMessage(strconv.FormatInt(by, 10)),
 	}
+	// Counter payloads are bare integers, never JSON strings — so
+	// precomputeRenderBytes returns nil here and approxItemSize is
+	// unchanged. The call stays for consistency with other write paths
+	// in case a future refactor makes counter payloads JSON-encoded.
+	item.renderBytes = precomputeRenderBytes(item.Payload)
 	size := approxItemSize(item)
 	if b.store != nil {
 		ok, total, max := b.store.reserveBytes(size)
@@ -647,24 +688,31 @@ func (b *ScopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, er
 	return delta, nil
 }
 
-// replaceItemAtIndexLocked overwrites the payload at items[i] (always)
-// and the ts (only if non-nil), then syncs both secondary indexes
-// (bySeq unconditionally, byID only when the item has a non-empty id),
-// and finally updates b.bytes by the supplied delta.
+// replaceItemAtIndexLocked overwrites payload (and ts when non-nil)
+// at items[i], installs the caller-precomputed renderBytes, syncs
+// the secondary indexes, and applies the caller's delta to b.bytes.
 //
-// PRECONDITION: caller holds b.mu and i is a valid index into b.items.
-// Bounds-check is the caller's responsibility — the helper does not
-// validate i because callers reach it via O(log n) binary-search or
-// guaranteed-hit lookups, and re-checking would defeat that.
+// PRECONDITION: caller holds b.mu and i is a valid index into
+// b.items. Bounds-check is the caller's responsibility — the helper
+// does not validate i because callers reach it via O(log n)
+// binary-search or guaranteed-hit lookups, and re-checking would
+// defeat that.
 //
 // The byID sync is conditional because /append accepts items without
 // an id (id="" is legal), so not every item has a byID entry to keep
 // in sync. bySeq is unconditional because every item has a seq.
-func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts *int64, delta int64) {
+//
+// The caller passes renderBytes (rather than computing it inside the
+// helper) because approxItemSize counts renderBytes too — so the
+// caller must precompute it to derive `delta`, then pass both. This
+// keeps the cap accounting honest on string-payload updates whose
+// decoded form changes length.
+func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts *int64, renderBytes []byte, delta int64) {
 	b.items[i].Payload = payload
 	if ts != nil {
 		b.items[i].Ts = ts
 	}
+	b.items[i].renderBytes = renderBytes
 	updated := b.items[i]
 	// replaceItemAtIndexLocked is only reachable when the item already
 	// existed in this buffer, so bySeq and (when ID != "") byID have
@@ -755,10 +803,18 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) 
 		return 0, nil
 	}
 
-	// Only the payload changes on /update; scope/id/ts are unchanged in size,
-	// so the byte delta reduces to len(new_payload) - len(old_payload). A
-	// shrink can't fail the cap check, but a grow must reserve first.
-	delta, err := b.reservePayloadDeltaLocked(len(existing.Payload), len(payload))
+	// Only the payload changes on /update; scope/id/ts are unchanged in
+	// size, so the byte delta reduces to (new_payload + new_renderBytes)
+	// - (old_payload + old_renderBytes). renderBytes is non-nil only for
+	// JSON-string payloads (precomputed at write so /render skips a
+	// per-hit Unmarshal); approxItemSize counts it, so the cap check
+	// must too. A shrink can't fail the cap check, but a grow must
+	// reserve first.
+	newRender := precomputeRenderBytes(payload)
+	delta, err := b.reservePayloadDeltaLocked(
+		len(existing.Payload)+len(existing.renderBytes),
+		len(payload)+len(newRender),
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -768,7 +824,7 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) 
 		// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
 		return 0, nil
 	}
-	b.replaceItemAtIndexLocked(i, payload, ts, delta)
+	b.replaceItemAtIndexLocked(i, payload, ts, newRender, delta)
 	return 1, nil
 }
 
@@ -785,7 +841,12 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 		return 0, nil
 	}
 
-	delta, err := b.reservePayloadDeltaLocked(len(existing.Payload), len(payload))
+	// See updateByID for the renderBytes-aware delta rationale.
+	newRender := precomputeRenderBytes(payload)
+	delta, err := b.reservePayloadDeltaLocked(
+		len(existing.Payload)+len(existing.renderBytes),
+		len(payload)+len(newRender),
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -795,7 +856,7 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
 		return 0, nil
 	}
-	b.replaceItemAtIndexLocked(i, payload, ts, delta)
+	b.replaceItemAtIndexLocked(i, payload, ts, newRender, delta)
 	return 1, nil
 }
 

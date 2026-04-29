@@ -157,6 +157,95 @@ func BenchmarkHTTP_RenderByID(b *testing.B) {
 	}
 }
 
+// BenchmarkHTTP_RenderByID_StringPayload_Parallel hits /render on items
+// whose payload is a JSON string ("<html>...") — the path that triggers
+// the per-hit json.Unmarshal + []byte cast in handleRender. The non-
+// string variant (benchHTTPServer's default payload is a JSON object)
+// skips that branch entirely. Diff against
+// BenchmarkHTTP_RenderByID_Parallel to measure how much the unmarshal
+// adds; if it's >5-10% there's a case for pre-decoding at write-time.
+func BenchmarkHTTP_RenderByID_StringPayload_Parallel(b *testing.B) {
+	// Seed a single scope where every payload is a JSON-encoded string,
+	// roughly 512 bytes after encoding (matches benchStore's payload size).
+	store := NewStore(Config{
+		ScopeMaxItems:    100_000,
+		MaxStoreBytes:    1 << 30,
+		MaxItemBytes:     1 << 20,
+		MaxResponseBytes: 1 << 30,
+	})
+	const scope = "html"
+	buf, err := store.getOrCreateScope(scope)
+	if err != nil {
+		b.Fatalf("getOrCreateScope: %v", err)
+	}
+	rawHTML := bytes.Repeat([]byte("x"), 500)
+	payload, _ := json.Marshal("<html>" + string(rawHTML) + "</html>")
+	const n = 1000
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		id := "page-" + itoa(i)
+		ids[i] = id
+		if _, err := buf.appendItem(Item{Scope: scope, ID: id, Payload: payload}); err != nil {
+			b.Fatalf("appendItem: %v", err)
+		}
+	}
+
+	api := NewAPI(store)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+	dir, err := os.MkdirTemp("", "scopecache-bench-")
+	if err != nil {
+		b.Fatalf("mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	sockPath := filepath.Join(dir, "sc.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(ln) }()
+	defer server.Close()
+	defer ln.Close()
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", sockPath)
+			},
+			MaxIdleConns:        1024,
+			MaxIdleConnsPerHost: 1024,
+		},
+	}
+	defer client.CloseIdleConnections()
+	// Warmup
+	doGET(b, client, "http://sock/render?scope="+scope+"&id="+ids[0])
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			doGET(b, client, "http://sock/render?scope="+scope+"&id="+ids[i%n])
+			i++
+		}
+	})
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(buf[pos:])
+}
+
 // BenchmarkHTTP_RenderByID_Parallel is the parallel counterpart — the
 // fastest realistic read path scopecache exposes.
 func BenchmarkHTTP_RenderByID_Parallel(b *testing.B) {
