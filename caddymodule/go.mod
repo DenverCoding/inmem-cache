@@ -1,14 +1,16 @@
-// Submodule for the Caddy adapter. Keeping it here instead of in the repo
-// root means the core package (module path github.com/VeloxCoding/scopecache)
-// stays stdlib-only: anyone who depends on the core gets no caddy, no
-// quic-go, no prometheus — just the standard library. The caddy-wrapper
-// consumers pull this submodule explicitly via xcaddy.
+// Submodule for the Caddy adapter. Keeping it here instead of in the
+// repo root means the core package (module path
+// github.com/VeloxCoding/scopecache) stays stdlib-only: anyone who
+// depends on the core gets no caddy, no quic-go, no prometheus —
+// just the standard library. Caddy-wrapper consumers pull this
+// submodule explicitly via xcaddy.
 //
-// The `replace => ../` is for local development only. Published releases
-// work the normal way: consumers do `xcaddy --with github.com/VeloxCoding/
-// scopecache/caddymodule@vX.Y.Z` and Go resolves the pinned scopecache
-// require from the parent repo's tags. The replace is inactive for any
-// build whose main module is not this one.
+// Local development on both modules in this repo lives in the
+// repo-root go.work file; that's how edits to ../store.go etc. are
+// visible to caddymodule builds without committing a `replace`
+// directive into this file. Downstream consumers (xcaddy --with) do
+// not see go.work — they get the require'd version from the module
+// proxy.
 module github.com/VeloxCoding/scopecache/caddymodule
 
 go 1.25.0
@@ -140,5 +142,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	howett.net/plist v1.0.0 // indirect
 )
-
-replace github.com/VeloxCoding/scopecache => ../

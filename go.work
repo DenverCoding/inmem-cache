@@ -1,0 +1,26 @@
+// Workspace file: lets local development work on the core module
+// (./) and the Caddy adapter submodule (./caddymodule) together as
+// one unit, without committing a `replace` directive into either
+// go.mod. With this file present, `go build`, `go test` and `xcaddy
+// --with pkg=$REPO_ROOT/caddymodule` all see in-tree edits to the
+// core module immediately — no tag bump or `go mod download`
+// roundtrip needed.
+//
+// Downstream consumers (anyone running `xcaddy --with
+// github.com/VeloxCoding/scopecache/caddymodule@vX.Y.Z`) do NOT use
+// this file: workspaces are a main-module-only concept, identical
+// to how `replace` directives are ignored when a module is pulled
+// in as a dependency. They get the require'd version of the core
+// module from the module proxy, exactly as if this file did not
+// exist.
+//
+// Set GOWORK=off to disable the workspace for one command — useful
+// when running `go mod tidy` in caddymodule to make sure go.sum
+// reflects the published version, not the local override.
+
+go 1.25.0
+
+use (
+	.
+	./caddymodule
+)
