@@ -453,6 +453,65 @@ func TestMultiCall_OuterEnvelopeTrimSuccess(t *testing.T) {
 	}
 }
 
+// TestMultiCall_OuterResponseStaysUnderCap is a regression check for the
+// per-slot trim-marker reservation. The dispatcher walks slots in order
+// and, when a slot's body would fit "alone" but its inclusion does not
+// leave enough room for the truncation markers that subsequent trimmed
+// slots will need, must trim this slot too rather than overshoot the cap.
+//
+// Pathological setup chosen so the bug manifests as wire-byte overshoot,
+// not just bodyBudget overshoot — /multi_call has no outer
+// cappedResponseWriter (handlers.go RegisterRoutes), so anything written
+// past respCap reaches the client. Concretely: respCap=4096, N=10 slots
+// each producing a /tail body ≈ 3510 bytes. A single body fits under
+// bodyBudget (3520), but used+marker after each subsequent trim adds 38
+// bytes per slot — without per-remaining-slot reservation the body+marker
+// total would push the wire past respCap.
+func TestMultiCall_OuterResponseStaysUnderCap(t *testing.T) {
+	const respCap int64 = 4096
+	const N = 10
+
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  respCap,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: N,
+		},
+	)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// String payload of 3318 bytes → /tail body ≈ 3500, comfortably
+	// under bodyBudget = respCap − envelopeOverhead − N*slotOverhead =
+	// 3520. /tail framing around the payload is ~182 bytes (item
+	// envelope + meta), measured empirically and stable to a few bytes
+	// across runs (ts/duration only vary the body by digits).
+	filler := strings.Repeat("x", 3318)
+	appendBody := fmt.Sprintf(`{"scope":"s","id":"i","payload":%q}`, filler)
+	if code, _, raw := doRequest(t, mux, "POST", "/append", appendBody); code != 200 {
+		t.Fatalf("seed: code=%d body=%s", code, raw)
+	}
+
+	calls := make([]string, N)
+	for i := range calls {
+		calls[i] = `{"path": "/tail", "query": {"scope": "s", "limit": 1}}`
+	}
+	mcBody := `{"calls": [` + strings.Join(calls, ",") + `]}`
+
+	code, _, raw := doRequest(t, mux, "POST", "/multi_call", mcBody)
+	if code != 200 {
+		t.Fatalf("outer code=%d want 200, body=%s", code, raw)
+	}
+
+	wireBytes := int64(len(raw))
+	if wireBytes > respCap {
+		t.Errorf("wire bytes=%d > respCap=%d (overshoot=%d) — outer envelope cap not respected; "+
+			"per-slot trim-marker reservation is missing or wrong",
+			wireBytes, respCap, wireBytes-respCap)
+	}
+}
+
 // --- side-effect non-rollback -------------------------------------------------
 
 // TestMultiCall_SideEffectsNotRolledBack writes one item, then issues an

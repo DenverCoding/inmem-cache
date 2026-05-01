@@ -81,8 +81,27 @@ func payloadPresent(p json.RawMessage) bool {
 	return !bytes.Equal(bytes.TrimSpace(p), []byte("null"))
 }
 
+// checkItemSize must measure what the write path will actually store, not
+// the raw decoded request. JSON-string payloads carry a precomputed
+// renderBytes shortcut (decoded form, populated at write time so /render
+// skips a per-hit Unmarshal); approxItemSize counts those bytes too. The
+// validator runs before the buffer-write path has filled renderBytes, so
+// for string payloads we precompute it here and add its length. Without
+// this, a 1 MiB JSON-string payload passes the per-item cap on raw bytes
+// but is stored at ~2× the cap once renderBytes is materialised — the
+// store-wide cap still catches aggregate, but the per-item cap silently
+// admits items that violate the documented invariant (rfc §3).
+//
+// The duplicate precompute (here + buffer write path) is bounded by the
+// per-item cap (default 1 MiB) and only fires for string payloads, so
+// the cost is acceptable; the buffer paths are not changed because they
+// own the canonical renderBytes assignment under b.mu.
 func checkItemSize(item Item, maxItemBytes int64) error {
-	if size := approxItemSize(item); size > maxItemBytes {
+	size := approxItemSize(item)
+	if item.renderBytes == nil {
+		size += int64(len(precomputeRenderBytes(item.Payload)))
+	}
+	if size > maxItemBytes {
 		return errors.New("the item's approximate size (" + strconv.FormatInt(size, 10) +
 			" bytes) exceeds the maximum of " + strconv.FormatInt(maxItemBytes, 10) + " bytes")
 	}

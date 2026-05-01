@@ -332,7 +332,7 @@ func (api *API) dispatchPreparedCalls(prepared []preparedCall, opts batchDispatc
 	results := make([]multiCallResult, 0, len(prepared))
 	var bodyBytesUsed int64
 
-	for _, p := range prepared {
+	for i, p := range prepared {
 		var subReq *http.Request
 		if p.spec.method == http.MethodGet {
 			subReq = httptest.NewRequest(p.spec.method, p.subURL, nil)
@@ -369,13 +369,27 @@ func (api *API) dispatchPreparedCalls(prepared []preparedCall, opts batchDispatc
 			bodyBytes = stripGuardedPrefix(bodyBytes, opts.StripPrefix)
 		}
 
-		// Outer-envelope cap: would including this slot push the
-		// running body total past the conservative budget? If so, trim
-		// asymmetrically — 2xx keeps its status with a success
-		// truncation marker, non-2xx keeps its status with an error
-		// truncation marker. The 507 sub-calls produced just above
-		// take the error branch.
-		if bodyBytesUsed+int64(len(bodyBytes)) > bodyBudget {
+		// Outer-envelope cap: reserve marker-sized headroom for every
+		// slot still to come. Without this, an early slot can fit
+		// "alone" while the trim markers needed by the remaining slots
+		// (38 bytes each — multiCallSuccessTrim / multiCallErrorTrim)
+		// push bodyBytesUsed past bodyBudget, and since /multi_call has
+		// no outer cappedResponseWriter (handlers.go RegisterRoutes
+		// comment) the overshoot reaches the wire. preflightResponseCap
+		// guarantees bodyBudget ≥ N*multiCallMaxTrimMarkerSize, so
+		// maxThisSlot is always ≥ multiCallMaxTrimMarkerSize for any
+		// remaining slot — meaning the marker we substitute below is
+		// always ≤ maxThisSlot and the total stays under the cap.
+		//
+		// Asymmetric trim: 2xx keeps its status with the success
+		// truncation marker, non-2xx with the error marker. The 507
+		// sub-calls produced just above take the error branch.
+		remainingSlots := int64(len(prepared) - 1 - i)
+		maxThisSlot := bodyBudget - bodyBytesUsed - remainingSlots*multiCallMaxTrimMarkerSize
+		if maxThisSlot < 0 {
+			maxThisSlot = 0
+		}
+		if int64(len(bodyBytes)) > maxThisSlot {
 			if status >= 200 && status < 300 {
 				bodyBytes = []byte(multiCallSuccessTrim)
 			} else {

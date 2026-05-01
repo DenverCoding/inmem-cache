@@ -206,6 +206,79 @@ func TestStress_MixedOps(t *testing.T) {
 		updates.Load(), deletes.Load(), trims.Load(), dscopes.Load(), rebuilds.Load())
 }
 
+// TestStress_RecordRead_NoLast7DDriftAcrossRollover hammers the lock-
+// free heat-tracking path through a 7-day window rollover and verifies
+// that b.last7DReadCount (the runtime atomic counter) ends up agreeing
+// with computeLast7DReadCount (the bucket walk used by /stats) and
+// equals exactly the new-day read total — i.e. the stale residue
+// from 7 days ago was correctly subtracted, no more and no less.
+//
+// The race this guards against: Phase 1 in recordRead drains a stale
+// bucket in two steps (Count.Swap → subtract from last7DReadCount,
+// then CAS Day stale→0). If those steps were ordered the other way
+// (CAS Day first, then Count.Swap second), a concurrent Phase 2 that
+// observed Day==0 between them would CAS(0, today) and Count.Store(0),
+// wiping the stale Count without subtracting from last7DReadCount —
+// drifting the runtime counter upward by the stale-day read total.
+//
+// The bug was rare in absolute terms (the window is just two atomic
+// operations wide), so this test is not guaranteed to fail on every
+// run of a regressed implementation; it does fail reliably on a
+// reverted-to-buggy implementation when the scheduler preempts inside
+// the window. With the fix, drift is structurally impossible and the
+// test passes deterministically.
+func TestStress_RecordRead_NoLast7DDriftAcrossRollover(t *testing.T) {
+	const (
+		staleCount = 5000
+		readers    = 64
+		perReader  = 5000
+	)
+	iterations := perReader
+	if testing.Short() {
+		iterations = 500
+	}
+
+	// Day 1000 and day 1007 share bucket index (1000 % 7 == 1007 % 7 == 6),
+	// so the today-bucket on day 1007 starts populated with stale day-1000
+	// reads, forcing every concurrent caller to race through Phase 1's
+	// drain on the same slot.
+	buf := NewScopeBuffer(10)
+	for i := 0; i < staleCount; i++ {
+		buf.recordRead(microsOnDay(1000))
+	}
+	if got := buf.last7DReadCount.Load(); got != staleCount {
+		t.Fatalf("pre-stress last7DReadCount=%d want %d", got, staleCount)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				buf.recordRead(microsOnDay(1007))
+			}
+		}()
+	}
+	wg.Wait()
+
+	expected := uint64(readers * iterations)
+	if got := buf.last7DReadCount.Load(); got != expected {
+		t.Errorf("runtime last7DReadCount=%d want %d (drift=%d — stale residue not subtracted)",
+			got, expected, int64(got)-int64(expected))
+	}
+	if got := buf.computeLast7DReadCount(microsOnDay(1007)); got != expected {
+		t.Errorf("bucket-walk computeLast7DReadCount=%d want %d", got, expected)
+	}
+	// Final cross-check: the runtime counter and the bucket walk must
+	// agree at rest. Drift between the two is the canonical signature
+	// of the race, regardless of whether either matches `expected`.
+	if buf.last7DReadCount.Load() != buf.computeLast7DReadCount(microsOnDay(1007)) {
+		t.Errorf("runtime field=%d != bucket walk=%d (drift between the two accountings)",
+			buf.last7DReadCount.Load(), buf.computeLast7DReadCount(microsOnDay(1007)))
+	}
+}
+
 // verifyInvariants walks every scope under lock and checks coherence between
 // the atomic counter, buf.bytes, the items slice, and the two indices. Any
 // failure here indicates the concurrency story is broken somewhere above.

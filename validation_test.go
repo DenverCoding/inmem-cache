@@ -159,6 +159,58 @@ func TestValidateWriteItem_AcceptsExactCapPayload(t *testing.T) {
 	}
 }
 
+// JSON-string payloads materialise a precomputed renderBytes shortcut at
+// write time (decoded form, used by /render to skip a per-hit Unmarshal);
+// approxItemSize counts those bytes against the per-item cap. The validator
+// runs before the buffer-write path has filled renderBytes, so it must
+// inflate the size for string payloads itself — otherwise an N-byte JSON
+// string passes the cap on raw bytes but is stored at ~2N + overhead,
+// silently exceeding the documented per-item invariant (rfc §3).
+//
+// Constructed payload: `"AAAA…"` whose raw size is just over half the
+// per-item cap. Post-precompute size = raw payload + decoded renderBytes
+// (raw − 2) + ~48 overhead, which clears the cap.
+func TestValidateWriteItem_StringPayloadCountsRenderBytes(t *testing.T) {
+	n := MaxItemBytes/2 + 100
+	buf := make([]byte, n)
+	buf[0] = '"'
+	for i := 1; i < n-1; i++ {
+		buf[i] = 'A'
+	}
+	buf[n-1] = '"'
+
+	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
+	if err := validateWriteItem(item, "/append", MaxItemBytes); err == nil {
+		t.Fatal("expected rejection: JSON-string payload + renderBytes exceeds per-item cap")
+	}
+}
+
+// Non-string payloads carry no renderBytes (precomputeRenderBytes returns
+// nil unless the first non-whitespace byte is `"`). The validator must NOT
+// inflate their size — a JSON array of the same raw byte count as the
+// rejected string payload above must still pass the cap.
+func TestValidateWriteItem_NonStringPayloadSkipsRenderBytesInflation(t *testing.T) {
+	n := MaxItemBytes/2 + 100
+	buf := make([]byte, n)
+	buf[0] = '['
+	for i := 1; i < n-1; i++ {
+		if i%2 == 1 {
+			buf[i] = '1'
+		} else {
+			buf[i] = ','
+		}
+	}
+	if buf[n-2] == ',' {
+		buf[n-2] = '1'
+	}
+	buf[n-1] = ']'
+
+	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
+	if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
+		t.Errorf("non-string payload of raw size %d unexpectedly rejected: %v", n, err)
+	}
+}
+
 func TestValidateWriteItem_ScopeAndIDShapeRules(t *testing.T) {
 	longScope := string(make([]byte, MaxScopeBytes+1))
 	for i := range longScope {
