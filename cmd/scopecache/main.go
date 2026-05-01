@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -234,8 +235,24 @@ func listenUnixSocket(path string) (net.Listener, error) {
 
 	// Unix socket files persist after a crash or non-graceful shutdown; a new
 	// listen() on the same path would fail with "address already in use", so we
-	// remove any stale file first. ErrNotExist is the normal first-boot case.
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// remove any stale file first. Only socket files are removed: if the path
+	// resolves to anything else (regular file, directory, symlink to non-socket)
+	// we refuse to start instead of obliterating it. The standalone binary
+	// commonly runs as root to write into /run/, so a misconfigured
+	// SCOPECACHE_SOCKET_PATH would otherwise be a foot-gun against arbitrary
+	// system files. ErrNotExist is the normal first-boot case.
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf(
+				"refusing to remove non-socket file at %q: "+
+					"set SCOPECACHE_SOCKET_PATH to an unused path "+
+					"(expected a stale Unix socket from a prior run, found %s)",
+				path, info.Mode().Type())
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 
