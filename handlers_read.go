@@ -22,19 +22,15 @@ import (
 // check before marshal-and-write.
 
 // writeItemsHit assembles and writes the success response for a
-// list-returning read endpoint (/head, /tail). Two load-bearing
-// invariants live in this helper:
+// list-returning read endpoint (/head, /tail). The Store-layer read
+// methods (Store.head, Store.tail) own the read-heat stamping; this
+// helper is purely about HTTP response shape and the per-response
+// byte cap.
 //
-//  1. recordRead is called only when items is non-empty. An empty
-//     result window (e.g. /tail of an existing scope where no items
-//     match the offset) is effectively a miss and must NOT inflate
-//     the scope's last_7d_read_count — that signal drives operator
-//     decisions on /delete_scope_candidates and would silently
-//     corrupt if the `len > 0` guard was forgotten.
-//  2. estimateMultiItemResponseBytes runs BEFORE writeJSONWithMeta.
-//     Once the response body has been written there is no way to
-//     switch to a 507 without leaving a half-flushed body on the
-//     wire — the cap check is a one-shot opportunity per request.
+// estimateMultiItemResponseBytes MUST run before writeJSONWithMeta:
+// once the response body has been written there is no way to switch
+// to a 507 without leaving a half-flushed body on the wire — the cap
+// check is a one-shot opportunity per request.
 //
 // `extra` slots between `count` and `truncated` so /tail can carry
 // its `offset` field at the right wire position; /head passes nil.
@@ -43,15 +39,11 @@ import (
 func (api *API) writeItemsHit(
 	w http.ResponseWriter,
 	started time.Time,
-	buf *ScopeBuffer,
 	items []Item,
 	truncated bool,
 	extra orderedFields,
 ) {
 	if len(items) > 0 {
-		if !api.disableReadHeat {
-			buf.recordRead(nowUnixMicro())
-		}
 		if estimated := estimateMultiItemResponseBytes(items); estimated > api.maxResponseBytes {
 			responseTooLarge(w, started, estimated, api.maxResponseBytes)
 			return
@@ -139,14 +131,12 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	buf, ok := api.store.getScope(q.Scope)
-	if !ok {
+	items, truncated, found := api.store.head(q.Scope, afterSeq, q.Limit, !api.disableReadHeat)
+	if !found {
 		api.writeItemsMiss(w, started, nil)
 		return
 	}
-
-	items, truncated := buf.sinceSeq(afterSeq, q.Limit)
-	api.writeItemsHit(w, started, buf, items, truncated, nil)
+	api.writeItemsHit(w, started, items, truncated, nil)
 }
 
 func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
@@ -172,14 +162,12 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 	// — the helpers slot `extra` at exactly that position.
 	offsetField := orderedFields{kv{"offset", offset}}
 
-	buf, ok := api.store.getScope(q.Scope)
-	if !ok {
+	items, truncated, found := api.store.tail(q.Scope, q.Limit, offset, !api.disableReadHeat)
+	if !found {
 		api.writeItemsMiss(w, started, offsetField)
 		return
 	}
-
-	items, truncated := buf.tailOffset(q.Limit, offset)
-	api.writeItemsHit(w, started, buf, items, truncated, offsetField)
+	api.writeItemsHit(w, started, items, truncated, offsetField)
 }
 
 func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -205,29 +193,18 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 		}, started)
 	}
 
-	buf, ok := api.store.getScope(target.Scope)
-	if !ok {
-		miss()
-		return
-	}
-
-	var item Item
-	var found bool
+	var (
+		item  Item
+		found bool
+	)
 	if target.ByID {
-		item, found = buf.getByID(target.ID)
+		item, found = api.store.get(target.Scope, target.ID, 0, !api.disableReadHeat)
 	} else {
-		item, found = buf.getBySeq(target.Seq)
+		item, found = api.store.get(target.Scope, "", target.Seq, !api.disableReadHeat)
 	}
 	if !found {
 		miss()
 		return
-	}
-
-	// Only a hit counts toward scope read-heat. A miss by explicit id/seq
-	// should not inflate last_7d_read_count, since the signal is surfaced
-	// on /delete_scope_candidates for client-side eviction decisions.
-	if !api.disableReadHeat {
-		buf.recordRead(nowUnixMicro())
 	}
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
@@ -273,37 +250,21 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}
 
-	buf, ok := api.store.getScope(target.Scope)
-	if !ok {
-		writeMiss()
-		return
-	}
-
-	var item Item
-	var found bool
+	var (
+		body  []byte
+		found bool
+	)
 	if target.ByID {
-		item, found = buf.getByID(target.ID)
+		body, found = api.store.render(target.Scope, target.ID, 0, !api.disableReadHeat)
 	} else {
-		item, found = buf.getBySeq(target.Seq)
+		body, found = api.store.render(target.Scope, "", target.Seq, !api.disableReadHeat)
 	}
 	if !found {
 		writeMiss()
 		return
 	}
 
-	// A hit counts toward scope read-heat, same as /get.
-	if !api.disableReadHeat {
-		buf.recordRead(nowUnixMicro())
-	}
-
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
-
-	// renderBytes is non-nil iff the payload is a JSON string, populated
-	// at write-time. Skip the per-hit json.Unmarshal + []byte cast.
-	if item.renderBytes != nil {
-		_, _ = w.Write(item.renderBytes)
-		return
-	}
-	_, _ = w.Write(item.Payload)
+	_, _ = w.Write(body)
 }

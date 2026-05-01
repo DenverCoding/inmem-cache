@@ -396,6 +396,90 @@ func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 	return buf.deleteUpToSeq(maxSeq)
 }
 
+// head returns up to `limit` oldest items in the scope with seq >
+// afterSeq. Returns (items, truncated, scopeFound). recordHeat=true
+// stamps the scope's read-heat (only on non-empty result, mirroring
+// the prior handler behaviour). A missing scope reports (nil, false,
+// false); a found-but-empty window reports (empty, false, true) —
+// handlers translate that into hit:false / count:0.
+func (s *Store) head(scope string, afterSeq uint64, limit int, recordHeat bool) ([]Item, bool, bool) {
+	buf, ok := s.getScope(scope)
+	if !ok {
+		return nil, false, false
+	}
+	items, truncated := buf.sinceSeq(afterSeq, limit)
+	if recordHeat && len(items) > 0 {
+		buf.recordRead(nowUnixMicro())
+	}
+	return items, truncated, true
+}
+
+// tail returns up to `limit` newest items in the scope, skipping the
+// first `offset`. Same return shape and recordHeat semantics as head.
+func (s *Store) tail(scope string, limit, offset int, recordHeat bool) ([]Item, bool, bool) {
+	buf, ok := s.getScope(scope)
+	if !ok {
+		return nil, false, false
+	}
+	items, truncated := buf.tailOffset(limit, offset)
+	if recordHeat && len(items) > 0 {
+		buf.recordRead(nowUnixMicro())
+	}
+	return items, truncated, true
+}
+
+// get returns one item by scope+id or scope+seq. (item, found) — the
+// found flag is true only when both the scope and the item exist.
+// recordHeat fires on hit only.
+func (s *Store) get(scope, id string, seq uint64, recordHeat bool) (Item, bool) {
+	buf, ok := s.getScope(scope)
+	if !ok {
+		return Item{}, false
+	}
+	var item Item
+	var found bool
+	if id != "" {
+		item, found = buf.getByID(id)
+	} else {
+		item, found = buf.getBySeq(seq)
+	}
+	if !found {
+		return Item{}, false
+	}
+	if recordHeat {
+		buf.recordRead(nowUnixMicro())
+	}
+	return item, true
+}
+
+// render returns the bytes /render writes on the wire, peeling the
+// renderBytes shortcut for JSON-string payloads at the Store boundary
+// so the handler does not need to know the renderBytes field exists.
+// (bytes, found) — same hit semantics as get; recordHeat fires on hit.
+func (s *Store) render(scope, id string, seq uint64, recordHeat bool) ([]byte, bool) {
+	buf, ok := s.getScope(scope)
+	if !ok {
+		return nil, false
+	}
+	var item Item
+	var found bool
+	if id != "" {
+		item, found = buf.getByID(id)
+	} else {
+		item, found = buf.getBySeq(seq)
+	}
+	if !found {
+		return nil, false
+	}
+	if recordHeat {
+		buf.recordRead(nowUnixMicro())
+	}
+	if item.renderBytes != nil {
+		return item.renderBytes, true
+	}
+	return item.Payload, true
+}
+
 // ensureScope returns the named scope, creating an empty buffer if it
 // does not yet exist. Used by API-layer features that lazily provision
 // cache-owned infrastructure scopes (e.g. observability counters)

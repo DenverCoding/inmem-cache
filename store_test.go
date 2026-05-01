@@ -279,6 +279,73 @@ func TestStore_deleteUpTo_MissingScope(t *testing.T) {
 	}
 }
 
+// head, tail, get, render report a missing scope by setting their
+// found-flag to false. handleHead/Tail use it to pick writeItemsMiss
+// vs writeItemsHit; handleGet/Render use it to write the miss
+// response. A future change that returned (nil, true, false) for
+// missing scopes would silently break /head and /tail by routing
+// misses through writeItemsHit (different wire shape).
+
+func TestStore_head_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	items, truncated, found := s.head("nope", 0, 10, false)
+	if found {
+		t.Error("found=true; want false")
+	}
+	if len(items) != 0 {
+		t.Errorf("items=%v; want empty", items)
+	}
+	if truncated {
+		t.Error("truncated=true; want false")
+	}
+}
+
+func TestStore_tail_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	items, truncated, found := s.tail("nope", 10, 0, false)
+	if found {
+		t.Error("found=true; want false")
+	}
+	if len(items) != 0 {
+		t.Errorf("items=%v; want empty", items)
+	}
+	if truncated {
+		t.Error("truncated=true; want false")
+	}
+}
+
+func TestStore_get_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	if _, found := s.get("nope", "x", 0, false); found {
+		t.Error("found=true; want false")
+	}
+}
+
+func TestStore_render_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	if _, found := s.render("nope", "x", 0, false); found {
+		t.Error("found=true; want false")
+	}
+}
+
+// render peels the renderBytes shortcut for JSON-string payloads — a
+// store-level invariant that handleRender used to enforce inline.
+// Pin it on the Store boundary now that the handler is dumb.
+func TestStore_render_PeelsJSONString(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	_, err := s.appendOne(Item{Scope: "s", ID: "html", Payload: json.RawMessage(`"<h1>hi</h1>"`)})
+	if err != nil {
+		t.Fatalf("appendOne: %v", err)
+	}
+	body, found := s.render("s", "html", 0, false)
+	if !found {
+		t.Fatal("found=false; want true")
+	}
+	if got := string(body); got != "<h1>hi</h1>" {
+		t.Errorf("body=%q; want %q (renderBytes shortcut should peel JSON-string layer)", got, "<h1>hi</h1>")
+	}
+}
+
 // appendOne, upsertOne, counterAddOne must roll back the freshly-created
 // scope when the item-byte reservation fails. Without rollback, every
 // failed write to a new scope would leak scopeBufferOverhead onto the
