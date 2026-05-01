@@ -291,78 +291,13 @@ func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
 	}
 }
 
-// benchTsScope builds a single scope populated with `n` items, each carrying
-// a monotonically increasing `ts` equal to its seq. Returns the scope buffer
-// so /ts_range benchmarks can call tsRange directly without the HTTP layer.
-func benchTsScope(b *testing.B, n int) *ScopeBuffer {
-	b.Helper()
-
-	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20})
-	buf, err := store.getOrCreateScope("bench_ts")
-	if err != nil {
-		b.Fatalf("getOrCreateScope: %v", err)
-	}
-
-	payload := json.RawMessage(`{"v":1}`)
-	for i := 0; i < n; i++ {
-		ts := int64(i + 1)
-		if _, err := buf.appendItem(Item{Scope: "bench_ts", Ts: &ts, Payload: payload}); err != nil {
-			b.Fatalf("appendItem: %v", err)
-		}
-	}
-	return buf
-}
-
-// BenchmarkStore_TsRange_Realistic measures /ts_range on a realistic 2,000-item
-// scope where every item matches the window. The scan collects 1,000 items and
-// early-exits on the 1,001st match — the "normal" case for a client paging
-// through a modestly-sized time window. Cost is dominated by ~1,001 loop
-// iterations plus one 1,000-cap slice allocation.
-func BenchmarkStore_TsRange_Realistic(b *testing.B) {
-	buf := benchTsScope(b, 2000)
-	since := int64(0)
-	until := int64(1 << 62)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		items, truncated := buf.tsRange(&since, &until, 1000)
-		if len(items) != 1000 || !truncated {
-			b.Fatalf("unexpected: len=%d truncated=%v", len(items), truncated)
-		}
-	}
-}
-
-// BenchmarkStore_TsRange_FullScope_Worst measures the upper bound: a maxed-out
-// 100,000-item scope where the matching window sits at the tail end. The scan
-// walks every non-matching item (98,999 of them) before entering the matching
-// tail, collects 1,000 items, sees the 1,001st, and returns truncated=true.
-// Total items touched: the full 100,000. This is the pathological /ts_range
-// cost at the default per-scope cap.
-func BenchmarkStore_TsRange_FullScope_Worst(b *testing.B) {
-	buf := benchTsScope(b, 100_000)
-	since := int64(99_000)
-	until := int64(1 << 62)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		items, truncated := buf.tsRange(&since, &until, 1000)
-		if len(items) != 1000 || !truncated {
-			b.Fatalf("unexpected: len=%d truncated=%v", len(items), truncated)
-		}
-	}
-}
-
 // --- Parallel read-path benchmarks ----------------------------------
 //
 // These were added to profile the read path under real concurrency
 // (32 cores in the bench host). The bare lookup methods (getByID,
-// getBySeq, tailOffset, sinceSeq, tsRange) only take buf.mu.RLock(),
+// getBySeq, tailOffset, sinceSeq) only take buf.mu.RLock(),
 // so they should scale linearly with cores. The HTTP-equivalent paths
-// (/get, /render, /head, /tail, /ts_range) additionally call
+// (/get, /render, /head, /tail) additionally call
 // buf.recordRead() after a successful lookup, which takes
 // buf.mu.Lock() — a write lock on the same mutex the readers were
 // just on. The "_WithRecordRead" suffix on benches below tells you
@@ -488,26 +423,6 @@ func BenchmarkStore_Head_Parallel(b *testing.B) {
 			buf, _ := store.getScope(scope)
 			_, _ = buf.sinceSeq(0, 10)
 			i++
-		}
-	})
-}
-
-// BenchmarkStore_TsRange_Parallel measures /ts_range under concurrency.
-// Cost is O(n) scan over b.items under RLock; with limit=10 on a
-// 1000-item scope where every item matches, the scan early-exits at
-// the 11th match. Multiple readers hold RLock concurrently, so this
-// should scale with cores up to RLock cache-line contention.
-func BenchmarkStore_TsRange_Parallel(b *testing.B) {
-	buf := benchTsScope(b, 1000)
-	since := int64(0)
-	until := int64(1 << 62)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			_, _ = buf.tsRange(&since, &until, 10)
 		}
 	})
 }

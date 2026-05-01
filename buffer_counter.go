@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"strconv"
+	"time"
 )
 
 // /counter_add is the cache's one and only payload-aware mutation:
@@ -58,12 +59,14 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 			// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
 			return 0, false, nil
 		}
-		// /counter_add never updates ts (only the integer payload),
-		// so pass nil for ts — the helper preserves the existing ts.
-		// renderBytes is always nil for counter payloads (bare
-		// integers, not JSON strings), so no renderBytes adjustment
-		// is needed and the payload-delta is the full delta.
-		b.replaceItemAtIndexLocked(i, newPayload, nil, nil, delta)
+		// Refresh ts on increment: the current value (counter = newValue)
+		// arrived at this moment. For "last user activity" use cases this
+		// is the field operators want; preserving the create-time ts on
+		// every increment would lie about when the current state was
+		// written. renderBytes is always nil for counter payloads (bare
+		// integers, not JSON strings), so no renderBytes adjustment is
+		// needed and the payload-delta is the full delta.
+		b.replaceItemAtIndexLocked(i, newPayload, time.Now().UnixMicro(), nil, delta)
 		return newValue, false, nil
 	}
 
@@ -74,6 +77,7 @@ func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 	item := Item{
 		Scope:   scope,
 		ID:      id,
+		Ts:      time.Now().UnixMicro(),
 		Payload: json.RawMessage(strconv.FormatInt(by, 10)),
 	}
 	// Counter payloads are bare integers, never JSON strings — so

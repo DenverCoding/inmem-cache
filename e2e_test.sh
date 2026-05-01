@@ -215,7 +215,7 @@ guarded_call() {
 }
 
 # admin_call_query: like admin_call but for GET-style sub-calls
-# (head, tail, get, ts_range, stats, delete_scope_candidates) that
+# (head, tail, get, stats, delete_scope_candidates) that
 # take a query map instead of a body. The query argument is a JSON
 # object string. /render is intentionally NOT in /admin's whitelist
 # (raw payload bytes don't fit a JSON results array cleanly), so it
@@ -444,118 +444,68 @@ json_assert 'exact10: count + ids + seqs + payloads all align' '
     [.items[].payload] == [1,2,3,4,5,6,7,8,9,10]
 '
 
-# --- ts_range filtering ------------------------------------------------------
-# The top-level `ts` is client-supplied (signed int64). Items without `ts`
-# must be excluded from every /ts_range response; bounds are inclusive;
-# output is seq-ordered (NOT ts-ordered) because ts is mutable and non-unique.
-say '== ts_range =='
+# --- cache-owned ts -----------------------------------------------------------
+# `ts` is a microsecond unix timestamp set by the cache on every write
+# that touches an item: /append, /upsert (create + replace), /update,
+# /counter_add (create + increment), /warm, /rebuild, /inbox. Clients
+# MUST NOT supply ts on any write — every write rejects a non-zero
+# client `ts` with 400. The field is observability only (not searchable,
+# not indexed, not used for ordering); /ts_range no longer exists.
+say '== cache-owned ts =='
 
-# Seed a fresh scope. a..e carry ts 1000..5000; f has no ts and must never
-# appear in any ts_range result.
-call 'ts seed a (ts=1000)'              200 POST   /append '{"scope":"tsr","id":"a","payload":1,"ts":1000}'
-call 'ts seed b (ts=2000)'              200 POST   /append '{"scope":"tsr","id":"b","payload":2,"ts":2000}'
-call 'ts seed c (ts=3000)'              200 POST   /append '{"scope":"tsr","id":"c","payload":3,"ts":3000}'
-call 'ts seed d (ts=4000)'              200 POST   /append '{"scope":"tsr","id":"d","payload":4,"ts":4000}'
-call 'ts seed e (ts=5000)'              200 POST   /append '{"scope":"tsr","id":"e","payload":5,"ts":5000}'
-call 'ts seed f (no ts)'                200 POST   /append '{"scope":"tsr","id":"f","payload":6}'
-
-# Window [2000, 4000] inclusive: b, c, d in seq order; a, e, f excluded.
-call 'ts_range [2000,4000]'             200 GET    '/ts_range?scope=tsr&since_ts=2000&until_ts=4000'
+# Every write auto-stamps ts. Read it back and confirm it's non-zero.
+call 'ts auto-stamped on /append'       200 POST   /append '{"scope":"tsv","id":"a","payload":1}'
 case $LAST_BODY in
-    *'"id":"b"'*'"id":"c"'*'"id":"d"'*) okmsg 'ts_range [2000,4000]: b,c,d in seq order' ;;
-    *) bad "ts_range window: $LAST_BODY" ;;
-esac
-case $LAST_BODY in
-    *'"id":"a"'*|*'"id":"e"'*|*'"id":"f"'*) bad "ts_range leaked out-of-window ids: $LAST_BODY" ;;
-    *) okmsg 'ts_range: a,e,f absent' ;;
-esac
-case $LAST_BODY in
-    *'"count":3'*'"truncated":false'*) okmsg 'ts_range count=3, truncated=false' ;;
-    *) bad "ts_range count/truncated: $LAST_BODY" ;;
+    *'"ts":0'*) bad "ts not auto-stamped on /append (got ts:0): $LAST_BODY" ;;
+    *'"ts":'[1-9]*) okmsg 'ts auto-stamped on /append (non-zero)' ;;
+    *) bad "ts missing from /append response: $LAST_BODY" ;;
 esac
 
-# Only since_ts: everything from 3000 up (c, d, e). f (no ts) must stay out.
-call 'ts_range since_ts=3000'           200 GET    '/ts_range?scope=tsr&since_ts=3000'
+# Client-supplied ts is rejected by the validator (400) on every write.
+call 'ts forbidden on /append'          400 POST   /append '{"scope":"tsv","id":"x","payload":1,"ts":1000}'
+call 'ts forbidden on /upsert'          400 POST   /upsert '{"scope":"tsv","id":"a","payload":1,"ts":1000}'
+call 'ts forbidden on /update'          400 POST   /update '{"scope":"tsv","id":"a","payload":1,"ts":1000}'
+
+# Refresh-on-write: /upsert replace must produce a strictly-newer ts.
+call 'baseline ts (read after first append)' 200 GET '/get?scope=tsv&id=a'
 case $LAST_BODY in
-    *'"id":"c"'*'"id":"d"'*'"id":"e"'*) okmsg 'ts_range since_ts=3000: c,d,e present' ;;
-    *) bad "ts_range since_ts only: $LAST_BODY" ;;
+    *'"ts":'*) okmsg 'baseline ts present in /get response' ;;
+    *) bad "ts missing on /get: $LAST_BODY" ;;
 esac
+sleep 1
+call 'upsert replace refreshes ts'      200 POST   /upsert '{"scope":"tsv","id":"a","payload":2}'
 case $LAST_BODY in
-    *'"id":"f"'*) bad "ts_range since_ts leaked no-ts item f: $LAST_BODY" ;;
-    *) okmsg 'ts_range since_ts: no-ts item (f) excluded' ;;
+    *'"created":false'*) okmsg 'upsert hit replace path' ;;
+    *) bad "upsert did not replace: $LAST_BODY" ;;
 esac
 
-# Only until_ts: everything up to and including 2000 (a, b).
-call 'ts_range until_ts=2000'           200 GET    '/ts_range?scope=tsr&until_ts=2000'
-# Envelope orders count before items, so check count first, then id order.
+# /counter_add stamps on create AND on increment — refresh-on-increment
+# gives counters a free "last activity" timestamp.
+call 'counter_add create stamps ts'     200 POST   /counter_add '{"scope":"tsv","id":"c","by":5}'
+call 'verify counter ts present'        200 GET    '/get?scope=tsv&id=c'
 case $LAST_BODY in
-    *'"count":2'*'"id":"a"'*'"id":"b"'*) okmsg 'ts_range until_ts=2000: a,b (count=2)' ;;
-    *) bad "ts_range until_ts only: $LAST_BODY" ;;
+    *'"ts":'[1-9]*'"payload":5'*) okmsg 'counter_add create: ts and payload present' ;;
+    *) bad "counter_add create response: $LAST_BODY" ;;
 esac
+sleep 1
+call 'counter_add increment refreshes ts' 200 POST /counter_add '{"scope":"tsv","id":"c","by":3}'
+call 'verify counter ts refreshed'      200 GET    '/get?scope=tsv&id=c'
 case $LAST_BODY in
-    *'"id":"c"'*|*'"id":"d"'*|*'"id":"e"'*|*'"id":"f"'*) bad "ts_range until_ts leaked: $LAST_BODY" ;;
-    *) okmsg 'ts_range until_ts: c,d,e,f excluded' ;;
-esac
-
-# Degenerate window [2000, 2000] — boundary inclusivity check. Must be
-# exactly b, and nothing else.
-call 'ts_range [2000,2000] (inclusive)' 200 GET    '/ts_range?scope=tsr&since_ts=2000&until_ts=2000'
-case $LAST_BODY in
-    *'"count":1'*'"id":"b"'*) okmsg 'ts_range [2000,2000]: exactly b (inclusive on both ends)' ;;
-    *) bad "ts_range inclusive: $LAST_BODY" ;;
+    *'"ts":'[1-9]*'"payload":8'*) okmsg 'counter_add increment: ts and updated payload present' ;;
+    *) bad "counter_add increment response: $LAST_BODY" ;;
 esac
 
-# Truncation: window spans a..e (5 matches) but limit=2 caps at 2 and flags it.
-call 'ts_range truncated'               200 GET    '/ts_range?scope=tsr&since_ts=1000&limit=2'
+# Empty/missing ts in body is treated as "absent" (zero value) and passes
+# validation; the cache stamps now() on its own. ts:0 from a client is the
+# JSON-decode default for an absent field, so it must not be rejected.
+call 'absent ts on /append OK'          200 POST   /append '{"scope":"tsv","id":"d","payload":4}'
 case $LAST_BODY in
-    *'"count":2'*'"truncated":true'*) okmsg 'ts_range limit=2: count=2, truncated=true' ;;
-    *) bad "ts_range truncated: $LAST_BODY" ;;
+    *'"ts":'[1-9]*) okmsg 'absent ts: cache stamps anyway' ;;
+    *) bad "absent ts handling: $LAST_BODY" ;;
 esac
 
-# Non-existent scope returns 200 with hit:false, count:0, truncated:false.
-call 'ts_range missing scope'           200 GET    '/ts_range?scope=tsr_nope&since_ts=0'
-case $LAST_BODY in
-    *'"hit":false'*'"count":0'*'"truncated":false'*) okmsg 'ts_range missing scope: empty result envelope' ;;
-    *) bad "ts_range missing scope: $LAST_BODY" ;;
-esac
-
-# Negative and zero ts are legal int64 values; window must span them correctly.
-call 'ts seed neg (ts=-5000)'           200 POST   /append '{"scope":"tsr_neg","id":"n1","payload":1,"ts":-5000}'
-call 'ts seed zero (ts=0)'              200 POST   /append '{"scope":"tsr_neg","id":"n2","payload":2,"ts":0}'
-call 'ts_range spans negative..0'       200 GET    '/ts_range?scope=tsr_neg&since_ts=-10000&until_ts=0'
-case $LAST_BODY in
-    *'"count":2'*'"id":"n1"'*'"id":"n2"'*) okmsg 'ts_range: negative and zero ts both present' ;;
-    *) bad "ts_range negative: $LAST_BODY" ;;
-esac
-
-# /update with an explicit ts overwrites; without a ts field it preserves.
-call 'ts /update overwrites ts'         200 POST   /update '{"scope":"tsr","id":"a","payload":1,"ts":9999}'
-call 'ts_range sees a at 9999'          200 GET    '/ts_range?scope=tsr&since_ts=9000&until_ts=10000'
-case $LAST_BODY in
-    *'"id":"a"'*'"ts":9999'*) okmsg 'ts_range: /update ts=9999 overwrote a' ;;
-    *) bad "ts /update overwrite: $LAST_BODY" ;;
-esac
-call 'ts /update without ts preserves'  200 POST   /update '{"scope":"tsr","id":"a","payload":1}'
-call 'ts_range still sees a at 9999'    200 GET    '/ts_range?scope=tsr&since_ts=9000&until_ts=10000'
-case $LAST_BODY in
-    *'"id":"a"'*'"ts":9999'*) okmsg 'ts_range: /update without ts preserved 9999' ;;
-    *) bad "ts /update preserve: $LAST_BODY" ;;
-esac
-
-# /upsert without ts CLEARS it (whole-item replace semantics) — a must drop
-# out of the [9000, 10000] window after the upsert.
-call 'ts /upsert without ts clears'     200 POST   /upsert '{"scope":"tsr","id":"a","payload":1}'
-call 'ts_range after upsert-no-ts'      200 GET    '/ts_range?scope=tsr&since_ts=9000&until_ts=10000'
-case $LAST_BODY in
-    *'"id":"a"'*) bad "ts /upsert: a should no longer have ts: $LAST_BODY" ;;
-    *) okmsg 'ts_range: /upsert without ts cleared a from window' ;;
-esac
-
-# Validation (400)
-call 'ts_range: missing both bounds'    400 GET    '/ts_range?scope=tsr'
-call 'ts_range: inverted bounds'        400 GET    '/ts_range?scope=tsr&since_ts=5000&until_ts=1000'
-call 'ts_range: non-numeric since_ts'   400 GET    '/ts_range?scope=tsr&since_ts=notanumber'
-call 'ts_range: non-integer until_ts'   400 GET    '/ts_range?scope=tsr&until_ts=1.5'
+# /ts_range is gone — the route is unregistered on every adapter.
+call '/ts_range removed (404)'          404 GET    '/ts_range?scope=tsv'
 
 # --- /multi_call --------------------------------------------------------------
 # Sequential dispatch of N self-contained sub-calls in one HTTP roundtrip.
@@ -685,7 +635,6 @@ say '== reserved-scope boundary =='
 call 'public /get on _* blocked'      400 GET    '/get?scope=_tokens&id=x'
 call 'public /head on _* blocked'     400 GET    '/head?scope=_tokens'
 call 'public /tail on _* blocked'     400 GET    '/tail?scope=_tokens'
-call 'public /ts_range on _* blocked' 400 GET    '/ts_range?scope=_tokens&since_ts=0'
 call 'public /render on _* blocked'   400 GET    '/render?scope=_tokens&id=x'
 call 'public /append on _* blocked'   400 POST   /append       '{"scope":"_tokens","id":"x","payload":1}'
 call 'public /upsert on _* blocked'   400 POST   /upsert       '{"scope":"_tokens","id":"x","payload":1}'
@@ -1333,9 +1282,10 @@ esac
 
 # --- mega deterministic state-machine test ------------------------------------
 # One large end-to-end invariant test. Drives a full sequence:
-#   wipe → /rebuild → 50 appends → updates → 50 ts-appends → updates →
-#   explicit deletes → extra appends → delete_up_to → ts-range read+delete →
-#   /multi_call read-back of the entire final state → /stats verification.
+#   wipe → /rebuild → 50 appends → updates → 50 second-scope appends →
+#   updates → explicit deletes → extra appends → delete_up_to → range
+#   delete by id list → /multi_call read-back of the entire final state →
+#   /stats verification.
 #
 # Every step is deterministic in seq numbering, so the trailing
 # json_assert can compare against fully-populated expected arrays
@@ -1343,9 +1293,8 @@ esac
 #   - rewind seq under update/delete cycles
 #   - drop one row and silently insert another
 #   - leave per-scope counters out of sync with item-count
-#   - fail to refresh ts-index on /update of an existing item
 #   - leak items across scopes
-#   - return mis-ordered slices from /head or /ts_range
+#   - return mis-ordered slices from /head
 #
 # Uses the global quiet_call helper (defined near the top of the
 # file). Earlier draft of this block redefined quiet_call inline
@@ -1361,8 +1310,8 @@ mega_rebuild_body='{"items":['
 mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_data","id":"seed1","payload":{"phase":"rebuild","n":1}},'
 mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_data","id":"seed2","payload":{"phase":"rebuild","n":2}},'
 mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_data","id":"seed3","payload":{"phase":"rebuild","n":3}},'
-mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_ts","id":"ts_seed1","payload":{"phase":"rebuild","n":1},"ts":1000},'
-mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_ts","id":"ts_seed2","payload":{"phase":"rebuild","n":2},"ts":2000},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_extra","id":"x_seed1","payload":{"phase":"rebuild","n":1}},'
+mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_extra","id":"x_seed2","payload":{"phase":"rebuild","n":2}},'
 mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_other","id":"o1","payload":{"kind":"other","n":1}},'
 mega_rebuild_body="${mega_rebuild_body}"'{"scope":"mega_other","id":"o2","payload":{"kind":"other","n":2}}'
 mega_rebuild_body="${mega_rebuild_body}"']}'
@@ -1385,28 +1334,27 @@ quiet_call 'mega: update d10' 200 POST /update \
 quiet_call 'mega: update d20' 200 POST /update \
     '{"scope":"mega_data","id":"d20","payload":{"kind":"data","v":2000,"updated":true}}'
 
-# mega_ts after rebuild: ts_seed1=1, ts_seed2=2.
-# Append t1..t50 → t_i = seq (2+i), ts = 10000 + i*100.
-say '== mega: append 50 ts items =='
+# mega_extra after rebuild: x_seed1=1, x_seed2=2.
+# Append e1..e50 → e_i = seq (2+i).
+say '== mega: append 50 items to second scope =='
 i=1
 while [ $i -le 50 ]; do
-    ts=$((10000 + i * 100))
-    quiet_call "mega: append mega_ts t$i" 200 POST /append \
-        "{\"scope\":\"mega_ts\",\"id\":\"t$i\",\"payload\":{\"kind\":\"ts\",\"v\":$i},\"ts\":$ts}"
+    quiet_call "mega: append mega_extra e$i" 200 POST /append \
+        "{\"scope\":\"mega_extra\",\"id\":\"e$i\",\"payload\":{\"kind\":\"extra\",\"v\":$i}}"
     i=$((i+1))
 done
 
-# t20 keeps seq=22; payload + ts both overwritten by /update.
-quiet_call 'mega: update t20 payload + ts' 200 POST /update \
-    '{"scope":"mega_ts","id":"t20","payload":{"kind":"ts","v":2000,"updated":true},"ts":77777}'
+# e20 keeps seq=22; payload overwritten by /update.
+quiet_call 'mega: update e20 payload' 200 POST /update \
+    '{"scope":"mega_extra","id":"e20","payload":{"kind":"extra","v":2000,"updated":true}}'
 
 say '== mega: explicit deletes =='
 quiet_call 'mega: delete mega_data d3' 200 POST /delete '{"scope":"mega_data","id":"d3"}'
 quiet_call 'mega: delete mega_data d49' 200 POST /delete '{"scope":"mega_data","id":"d49"}'
-quiet_call 'mega: delete mega_ts t5' 200 POST /delete '{"scope":"mega_ts","id":"t5"}'
-quiet_call 'mega: delete mega_ts t49' 200 POST /delete '{"scope":"mega_ts","id":"t49"}'
+quiet_call 'mega: delete mega_extra e5' 200 POST /delete '{"scope":"mega_extra","id":"e5"}'
+quiet_call 'mega: delete mega_extra e49' 200 POST /delete '{"scope":"mega_extra","id":"e49"}'
 
-# Extra appends. last_seq mega_data was 53, mega_ts was 52
+# Extra appends. last_seq mega_data was 53, mega_extra was 52
 # (delete + update don't bump last_seq).
 say '== mega: extra appends after deletes =='
 quiet_call 'mega: append mega_data d51' 200 POST /append \
@@ -1415,73 +1363,56 @@ quiet_call 'mega: append mega_data d52' 200 POST /append \
     '{"scope":"mega_data","id":"d52","payload":{"kind":"data","v":52,"late":true}}'
 quiet_call 'mega: append mega_data d53' 200 POST /append \
     '{"scope":"mega_data","id":"d53","payload":{"kind":"data","v":53,"late":true}}'
-quiet_call 'mega: append mega_ts t51' 200 POST /append \
-    '{"scope":"mega_ts","id":"t51","payload":{"kind":"ts","v":51,"late":true},"ts":20000}'
-quiet_call 'mega: append mega_ts t52' 200 POST /append \
-    '{"scope":"mega_ts","id":"t52","payload":{"kind":"ts","v":52,"late":true},"ts":20100}'
+quiet_call 'mega: append mega_extra e51' 200 POST /append \
+    '{"scope":"mega_extra","id":"e51","payload":{"kind":"extra","v":51,"late":true}}'
+quiet_call 'mega: append mega_extra e52' 200 POST /append \
+    '{"scope":"mega_extra","id":"e52","payload":{"kind":"extra","v":52,"late":true}}'
 
 # delete_up_to:
 #   mega_data max_seq=5 → seed1, seed2, seed3, d1, d2 gone (d3 already gone).
-#   mega_ts max_seq=4 → ts_seed1, ts_seed2, t1, t2 gone.
+#   mega_extra max_seq=4 → x_seed1, x_seed2, e1, e2 gone.
 say '== mega: delete_up_to =='
 quiet_call 'mega: delete_up_to mega_data seq<=5' 200 POST /delete_up_to \
     '{"scope":"mega_data","max_seq":5}'
-quiet_call 'mega: delete_up_to mega_ts seq<=4' 200 POST /delete_up_to \
-    '{"scope":"mega_ts","max_seq":4}'
+quiet_call 'mega: delete_up_to mega_extra seq<=4' 200 POST /delete_up_to \
+    '{"scope":"mega_extra","max_seq":4}'
 
-# /ts_range range delete: original t12..t16 had ts 11200..11600 and
-# survive every prior delete. Read first to assert the exact range
-# result, then delete by id (no delete-by-ts endpoint).
-say '== mega: delete by deterministic ts_range =='
-call 'mega: ts_range delete-window before delete' 200 GET \
-    '/ts_range?scope=mega_ts&since_ts=11200&until_ts=11600&limit=100'
-json_assert 'mega: ts_range delete-window exactly t12..t16' '
-    .count == 5 and
-    [.items[].id] == ["t12","t13","t14","t15","t16"] and
-    [.items[].seq] == [14,15,16,17,18] and
-    [.items[].ts] == [11200,11300,11400,11500,11600]
-'
-for id in t12 t13 t14 t15 t16; do
-    quiet_call "mega: delete ts-window $id" 200 POST /delete \
-        "{\"scope\":\"mega_ts\",\"id\":\"$id\"}"
+# Range delete by id list: e12..e16 survive every prior delete; remove
+# them one by one to leave a contiguous mid-range hole and confirm the
+# final state is the union of (delete_up_to head) + (id-list mid hole).
+say '== mega: id-list range delete =='
+for id in e12 e13 e14 e15 e16; do
+    quiet_call "mega: delete mid-range $id" 200 POST /delete \
+        "{\"scope\":\"mega_extra\",\"id\":\"$id\"}"
 done
 
 # Expected final state, computed with jq so the assertion text
 # below is one line per scope rather than three pages of literals.
 mega_data_ids=$(jq -nc '[range(4;49) | "d"+tostring] + ["d50","d51","d52","d53"]')
 mega_data_seqs=$(jq -nc '[range(7;52)] + [53,54,55,56]')
-mega_ts_ids=$(jq -nc '
+mega_extra_ids=$(jq -nc '
     [range(3;53)
      | select(. != 5 and . != 12 and . != 13 and . != 14 and . != 15 and . != 16 and . != 49)
-     | "t"+tostring]
+     | "e"+tostring]
 ')
-mega_ts_seqs=$(jq -nc '
+mega_extra_seqs=$(jq -nc '
     [range(3;53)
      | select(. != 5 and . != 12 and . != 13 and . != 14 and . != 15 and . != 16 and . != 49)
      | . + 2]
 ')
 
 say '== mega: multi-get final state =='
-# Slots 5 + 6 prove ts-bounds invariants (no item below 10300, no
-# item above 77777). The cache does NOT expose oldest_ts/newest_ts
-# on /stats — those are derived properties, not tracked aggregates
-# — so two empty /ts_range queries outside the expected window are
-# the canonical way to assert it.
 mega_multi='{"calls":['
 mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_data","limit":100}},'
-mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_ts","limit":100}},'
-mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_other","limit":10}},'
-mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":11200,"until_ts":11600,"limit":100}},'
-mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":77777,"until_ts":77777,"limit":10}},'
-mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":0,"until_ts":10299,"limit":10}},'
-mega_multi="${mega_multi}"'{"path":"/ts_range","query":{"scope":"mega_ts","since_ts":77778,"until_ts":99999999,"limit":10}}'
+mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_extra","limit":100}},'
+mega_multi="${mega_multi}"'{"path":"/head","query":{"scope":"mega_other","limit":10}}'
 mega_multi="${mega_multi}"']}'
 call 'mega: multi-get all final scopes' 200 POST /multi_call "$mega_multi"
 
 json_assert 'mega: multi-get outer envelope and statuses are correct' '
     .ok == true and
-    .count == 7 and
-    ([.results[].status] == [200,200,200,200,200,200,200])
+    .count == 3 and
+    ([.results[].status] == [200,200,200])
 '
 
 # Slot 0 — /head mega_data: full id+seq array equality, plus spot
@@ -1495,34 +1426,36 @@ if printf '%s' "$LAST_BODY" | jq -e \
     ([.results[0].body.items[].id] == $ids) and
     ([.results[0].body.items[].seq] == $seqs) and
     (all(.results[0].body.items[]; .scope == "mega_data")) and
+    (all(.results[0].body.items[]; .ts > 0)) and
     (any(.results[0].body.items[]; .id == "d10" and .seq == 13 and .payload.v == 1000 and .payload.updated == true)) and
     (any(.results[0].body.items[]; .id == "d20" and .seq == 23 and .payload.v == 2000 and .payload.updated == true)) and
     (any(.results[0].body.items[]; .id == "d51" and .seq == 54 and .payload.late == true)) and
     ([.results[0].body.items[].id] | index("seed1") == null and index("seed2") == null and index("seed3") == null and index("d1") == null and index("d2") == null and index("d3") == null and index("d49") == null)
 ' >/dev/null; then
-    okmsg 'mega: mega_data final ids, seqs, payloads and deletes are exact'
+    okmsg 'mega: mega_data final ids, seqs, payloads, ts, deletes are exact'
 else
     bad "mega: mega_data final-state mismatch: $LAST_BODY"
 fi
 
-# Slot 1 — /head mega_ts: same shape, plus the t20 ts/payload
-# overwrite and the late t51/t52 entries.
+# Slot 1 — /head mega_extra: same shape, plus the e20 update and the
+# late e51/e52 entries.
 if printf '%s' "$LAST_BODY" | jq -e \
-    --argjson ids "$mega_ts_ids" \
-    --argjson seqs "$mega_ts_seqs" '
+    --argjson ids "$mega_extra_ids" \
+    --argjson seqs "$mega_extra_seqs" '
     .results[1].body.count == 43 and
     .results[1].body.truncated == false and
     ([.results[1].body.items[].id] == $ids) and
     ([.results[1].body.items[].seq] == $seqs) and
-    (all(.results[1].body.items[]; .scope == "mega_ts")) and
-    (any(.results[1].body.items[]; .id == "t20" and .seq == 22 and .ts == 77777 and .payload.v == 2000 and .payload.updated == true)) and
-    (any(.results[1].body.items[]; .id == "t51" and .seq == 53 and .ts == 20000 and .payload.late == true)) and
-    (any(.results[1].body.items[]; .id == "t52" and .seq == 54 and .ts == 20100 and .payload.late == true)) and
-    ([.results[1].body.items[].id] | index("ts_seed1") == null and index("ts_seed2") == null and index("t1") == null and index("t2") == null and index("t5") == null and index("t12") == null and index("t13") == null and index("t14") == null and index("t15") == null and index("t16") == null and index("t49") == null)
+    (all(.results[1].body.items[]; .scope == "mega_extra")) and
+    (all(.results[1].body.items[]; .ts > 0)) and
+    (any(.results[1].body.items[]; .id == "e20" and .seq == 22 and .payload.v == 2000 and .payload.updated == true)) and
+    (any(.results[1].body.items[]; .id == "e51" and .seq == 53 and .payload.late == true)) and
+    (any(.results[1].body.items[]; .id == "e52" and .seq == 54 and .payload.late == true)) and
+    ([.results[1].body.items[].id] | index("x_seed1") == null and index("x_seed2") == null and index("e1") == null and index("e2") == null and index("e5") == null and index("e12") == null and index("e13") == null and index("e14") == null and index("e15") == null and index("e16") == null and index("e49") == null)
 ' >/dev/null; then
-    okmsg 'mega: mega_ts final ids, seqs, ts, payloads and deletes are exact'
+    okmsg 'mega: mega_extra final ids, seqs, payloads, ts, deletes are exact'
 else
-    bad "mega: mega_ts final-state mismatch: $LAST_BODY"
+    bad "mega: mega_extra final-state mismatch: $LAST_BODY"
 fi
 
 # Slot 2 — /head mega_other: untouched throughout.
@@ -1532,60 +1465,12 @@ if printf '%s' "$LAST_BODY" | jq -e '
     ([.results[2].body.items[].id] == ["o1","o2"]) and
     ([.results[2].body.items[].seq] == [1,2]) and
     (all(.results[2].body.items[]; .scope == "mega_other")) and
+    (all(.results[2].body.items[]; .ts > 0)) and
     ([.results[2].body.items[].payload.n] == [1,2])
 ' >/dev/null; then
     okmsg 'mega: mega_other untouched after whole state-machine'
 else
     bad "mega: mega_other final-state mismatch: $LAST_BODY"
-fi
-
-# Slot 3 — /ts_range over the deleted window: must be empty.
-if printf '%s' "$LAST_BODY" | jq -e '
-    .results[3].body.count == 0 and
-    .results[3].body.items == [] and
-    .results[3].body.truncated == false
-' >/dev/null; then
-    okmsg 'mega: deleted ts_range [11200,11600] is now empty'
-else
-    bad "mega: deleted ts_range still contains data: $LAST_BODY"
-fi
-
-# Slot 4 — /ts_range at the t20-overwrite ts: proves /update
-# refreshed the ts index, not just the payload.
-if printf '%s' "$LAST_BODY" | jq -e '
-    .results[4].body.count == 1 and
-    .results[4].body.items[0].id == "t20" and
-    .results[4].body.items[0].seq == 22 and
-    .results[4].body.items[0].ts == 77777 and
-    .results[4].body.items[0].payload.updated == true
-' >/dev/null; then
-    okmsg 'mega: updated t20 is reachable at new ts=77777'
-else
-    bad "mega: updated t20 ts lookup mismatch: $LAST_BODY"
-fi
-
-# Slot 5 — ts-bounds floor: nothing in mega_ts has ts < 10300.
-# (delete_up_to removed t1 and t2 with ts 10100/10200; t3 at ts
-# 10300 should be the oldest survivor.)
-if printf '%s' "$LAST_BODY" | jq -e '
-    .results[5].body.count == 0 and
-    .results[5].body.items == []
-' >/dev/null; then
-    okmsg 'mega: no items below ts=10300 (oldest survivor is t3)'
-else
-    bad "mega: items leaked below ts=10300: $LAST_BODY"
-fi
-
-# Slot 6 — ts-bounds ceiling: nothing in mega_ts has ts > 77777.
-# (t20's /update bumped its ts to 77777; t52's late append used
-# ts=20100; nothing else got a higher ts.)
-if printf '%s' "$LAST_BODY" | jq -e '
-    .results[6].body.count == 0 and
-    .results[6].body.items == []
-' >/dev/null; then
-    okmsg 'mega: no items above ts=77777 (newest is updated t20)'
-else
-    bad "mega: items leaked above ts=77777: $LAST_BODY"
 fi
 
 # /stats final invariant: scope_count, total_items, and per-scope
@@ -1598,8 +1483,8 @@ json_assert 'mega: /stats scope_count, total_items, item_count and last_seq are 
     .total_items == 94 and
     .scopes.mega_data.item_count == 49 and
     .scopes.mega_data.last_seq == 56 and
-    .scopes.mega_ts.item_count == 43 and
-    .scopes.mega_ts.last_seq == 54 and
+    .scopes.mega_extra.item_count == 43 and
+    .scopes.mega_extra.last_seq == 54 and
     .scopes.mega_other.item_count == 2 and
     .scopes.mega_other.last_seq == 2
 '

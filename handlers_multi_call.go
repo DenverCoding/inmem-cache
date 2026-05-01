@@ -42,7 +42,6 @@ func (api *API) buildMultiCallSpecs() map[string]subCallSpec {
 		"/get":          {http.MethodGet, api.handleGet},
 		"/head":         {http.MethodGet, api.handleHead},
 		"/tail":         {http.MethodGet, api.handleTail},
-		"/ts_range":     {http.MethodGet, api.handleTsRange},
 		"/update":       {http.MethodPost, api.handleUpdate},
 		"/upsert":       {http.MethodPost, api.handleUpsert},
 		"/counter_add":  {http.MethodPost, api.handleCounterAdd},

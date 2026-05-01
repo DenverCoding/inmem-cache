@@ -78,7 +78,7 @@ func TestInbox_HappyPath(t *testing.T) {
 	if !strings.HasPrefix(item.ID, capID+":") {
 		t.Errorf("id=%q does not start with caller's capId %q", item.ID, capID)
 	}
-	if item.Ts == nil || *item.Ts == 0 {
+	if item.Ts == 0 {
 		t.Errorf("ts not auto-set: %v", item.Ts)
 	}
 	if string(item.Payload) != `{"event":"signup"}` {

@@ -162,8 +162,10 @@ func TestAppend_Success(t *testing.T) {
 	if item["seq"].(float64) != 1 {
 		t.Errorf("seq=%v want 1", item["seq"])
 	}
-	if _, hasTS := item["ts"]; hasTS {
-		t.Errorf("response item should not carry a 'ts' field: %v", item)
+	// ts is cache-owned: every item carries one after a write. Detailed
+	// ts behaviour is exercised in ts_test.go.
+	if _, hasTS := item["ts"]; !hasTS {
+		t.Errorf("response item must carry a cache-assigned 'ts' field: %v", item)
 	}
 }
 
@@ -1199,14 +1201,13 @@ func TestReadHeat_DisabledMode(t *testing.T) {
 
 	_, _, _ = doRequest(t, mux, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
 
-	// Five reads across /get, /render, /tail, /head, /ts_range — every
-	// hit-pad on the read side. With heat disabled, none should
-	// increment the heat counters.
+	// Four reads across /get, /render, /tail, /head — every hit-pad on
+	// the read side. With heat disabled, none should increment the heat
+	// counters.
 	_, _, _ = doRequest(t, mux, "GET", "/get?scope=s&id=a", "")
 	_ = doRawRequest(t, mux, "GET", "/render?scope=s&id=a")
 	_, _, _ = doRequest(t, mux, "GET", "/tail?scope=s&limit=10", "")
 	_, _, _ = doRequest(t, mux, "GET", "/head?scope=s&limit=10", "")
-	_, _, _ = doRequest(t, mux, "GET", "/ts_range?scope=s&since_ts=0&until_ts=999&limit=10", "")
 
 	buf, _ := api.store.getScope("s")
 	if got := buf.readCountTotal.Load(); got != 0 {

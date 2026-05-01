@@ -13,7 +13,7 @@ const (
 	ScopeMaxItems     = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
 	MaxStoreMiB       = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
 	MaxItemBytes      = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
-	MaxResponseMiB    = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head, /ts_range). Overridable via SCOPECACHE_MAX_RESPONSE_MB
+	MaxResponseMiB    = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head). Overridable via SCOPECACHE_MAX_RESPONSE_MB
 	MaxMultiCallMiB   = 16      // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
 	MaxMultiCallCount = 10      // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
 	// MaxInboxKiB is the per-call payload cap default for /inbox in KiB.
@@ -115,17 +115,24 @@ func (m MB) MarshalJSON() ([]byte, error) {
 // "cache must not inspect payload" contract and avoids a recursive walk
 // every time we need to estimate an item's size.
 //
-// Ts is an optional, client-supplied millisecond timestamp. The cache never
-// generates or mutates it on its own; its only server-side use is filtering
-// inside /ts_range. A pointer (not a plain int64) distinguishes "absent"
-// from the legitimate value 0 (unix epoch). Write-path semantics:
-//   - /append, /warm, /rebuild, /upsert: stored exactly as sent (absent → nil)
-//   - /update: absent → preserve existing, present → overwrite
+// Ts is a cache-owned microsecond timestamp (time.Now().UnixMicro())
+// set on every write that touches the item: /append, /upsert (create +
+// replace), /update, /counter_add (create + increment), /warm, /rebuild,
+// /inbox. Clients MUST NOT supply ts on writes — every write endpoint
+// rejects a client-supplied ts with 400. The field is observability
+// only: not searchable, not indexed, not used for ordering. It captures
+// "when did the cache last write this item" — useful for logging,
+// last-activity stamping on counters, and drainer telemetry on /inbox.
+// Microsecond granularity (not milliseconds) keeps two writes inside
+// the same millisecond distinguishable, which matters for ordered
+// /inbox draining and for "last activity" stamping on counters under
+// burst load. Cross-instance arrival time lives in the source of truth;
+// the cache only knows when it itself wrote the bytes.
 type Item struct {
 	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
 	Seq     uint64          `json:"seq,omitempty"`
-	Ts      *int64          `json:"ts,omitempty"`
+	Ts      int64           `json:"ts"`
 	Payload json.RawMessage `json:"payload"`
 
 	// renderBytes is the JSON-string-decoded form of Payload, populated
@@ -291,8 +298,8 @@ func approxItemSize(item Item) int64 {
 	n += 32
 	n += int64(len(item.Scope))
 	n += int64(len(item.ID))
-	n += 8
-	n += 8 // Ts pointer slot; the pointee (8 more bytes) when set is noise at this granularity
+	n += 8 // Seq
+	n += 8 // Ts (always set, plain int64)
 	n += int64(len(item.Payload))
 	// renderBytes is heap-resident only for JSON-string payloads
 	// (precomputed at write time so /render skips a per-hit
@@ -304,8 +311,8 @@ func approxItemSize(item Item) int64 {
 	return n
 }
 
-// Multi-item read pre-flight constants. Used to short-circuit /head,
-// /tail, and /ts_range with a 507 BEFORE writeJSONWithMeta calls
+// Multi-item read pre-flight constants. Used to short-circuit /head
+// and /tail with a 507 BEFORE writeJSONWithMeta calls
 // json.Marshal on the full payload — the post-flight cappedResponseWriter
 // catches the same case but only after the body has been built in
 // memory. Without pre-flight, an operator who raises
@@ -321,7 +328,7 @@ const (
 	// multiItemEnvelopeMinBytes is the minimum byte cost of the outer
 	// JSON envelope ({ok, hit, count, truncated, items, duration_us,
 	// approx_response_mb}). 80 bytes is below the smallest possible
-	// envelope encoding for any of the three handlers, even when count
+	// envelope encoding for either handler, even when count
 	// is single-digit and the float fields are at minimum width.
 	multiItemEnvelopeMinBytes = 80
 	// multiItemPerItemMinBytes is the minimum on-wire cost of one
@@ -333,8 +340,8 @@ const (
 )
 
 // estimateMultiItemResponseBytes returns a strict lower bound on the
-// JSON-marshalled response size for a /head, /tail, or /ts_range
-// payload with the given items. Used by the pre-flight check; see
+// JSON-marshalled response size for a /head or /tail payload with
+// the given items. Used by the pre-flight check; see
 // multiItemEnvelopeMinBytes for the rationale.
 //
 // Counts only bytes that MUST appear on the wire: the envelope

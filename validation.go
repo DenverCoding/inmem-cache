@@ -119,35 +119,6 @@ func normalizeOffset(raw string) (int, error) {
 	return n, nil
 }
 
-// parseTsParam decodes a since_ts/until_ts query string as a signed int64
-// (milliseconds since unix epoch, by convention; the cache is opaque to the
-// unit). An empty raw value returns (nil, nil) so callers can distinguish
-// "absent" from "present but zero". Any value that does not round-trip as an
-// int64 fails validation rather than silently clamping.
-func parseTsParam(name, raw string) (*int64, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return nil, errors.New("the '" + name + "' parameter must be a valid int64 (milliseconds since unix epoch)")
-	}
-	return &v, nil
-}
-
-// validateTsRangeParams enforces the shape rules for /ts_range's time window:
-// at least one bound must be present, and the window must be non-inverted.
-// Bounds are inclusive on both ends (SQL BETWEEN convention).
-func validateTsRangeParams(sinceTs, untilTs *int64) error {
-	if sinceTs == nil && untilTs == nil {
-		return errors.New("at least one of 'since_ts' or 'until_ts' must be provided for the '/ts_range' endpoint")
-	}
-	if sinceTs != nil && untilTs != nil && *sinceTs > *untilTs {
-		return errors.New("the 'since_ts' must not be greater than 'until_ts'")
-	}
-	return nil
-}
-
 func normalizeHours(raw string) (int64, error) {
 	if raw == "" {
 		return 0, nil
@@ -170,6 +141,21 @@ func normalizeHours(raw string) (int64, error) {
 	return n, nil
 }
 
+// rejectClientTs catches a non-zero Ts on any write request body. Ts is
+// cache-owned (assigned on every write that touches an item); a client
+// supplying it is almost always a confused integration that expects the
+// pre-v0.7.12 "client may set ts" semantics. Returning a clear 400 here
+// is more useful than silently overwriting. ts=0 is the JSON-decode
+// default for "field absent" and passes through — a client that
+// explicitly sends ts=0 (1970-01-01) gets the same treatment as omitting
+// the field; the buffer stamps now() either way.
+func rejectClientTs(item Item, endpoint string) error {
+	if item.Ts != 0 {
+		return errors.New("the 'ts' field is managed by the cache and must not be provided to the '" + endpoint + "' endpoint")
+	}
+	return nil
+}
+
 func validateWriteItem(item Item, endpoint string, maxItemBytes int64) error {
 	if err := validateScope(item.Scope, endpoint); err != nil {
 		return err
@@ -182,6 +168,9 @@ func validateWriteItem(item Item, endpoint string, maxItemBytes int64) error {
 	}
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '" + endpoint + "' endpoint")
+	}
+	if err := rejectClientTs(item, endpoint); err != nil {
+		return err
 	}
 	return checkItemSize(item, maxItemBytes)
 }
@@ -198,6 +187,9 @@ func validateUpsertItem(item Item, maxItemBytes int64) error {
 	}
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '/upsert' endpoint")
+	}
+	if err := rejectClientTs(item, "/upsert"); err != nil {
+		return err
 	}
 	return checkItemSize(item, maxItemBytes)
 }
@@ -218,6 +210,9 @@ func validateUpdateItem(item Item, maxItemBytes int64) error {
 	}
 	if !payloadPresent(item.Payload) {
 		return errors.New("the 'payload' field is required")
+	}
+	if err := rejectClientTs(item, "/update"); err != nil {
+		return err
 	}
 	return checkItemSize(item, maxItemBytes)
 }

@@ -2,7 +2,7 @@ package scopecache
 
 // Lock-free read-heat tracking for *ScopeBuffer.
 //
-// The hot read path (/get, /render, /head, /tail, /ts_range) holds
+// The hot read path (/get, /render, /head, /tail) holds
 // b.mu.RLock during the actual data fetch. Adding heat tracking under
 // b.mu.Lock would turn that into an exclusive serialise point — block
 // profiling pinned ~88% of read-path lock-wait time to that one call

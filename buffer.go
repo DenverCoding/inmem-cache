@@ -43,7 +43,7 @@ import (
 //   buffer_counter.go  — counterAdd, parseCounterValue
 //   buffer_delete.go   — deleteByID, deleteBySeq, deleteUpToSeq, deleteIndexLocked
 //   buffer_replace.go  — scopeReplacement type, build / commit pipeline, replaceAll
-//   buffer_read.go     — tailOffset, sinceSeq, tsRange, getByID, getBySeq
+//   buffer_read.go     — tailOffset, sinceSeq, getByID, getBySeq
 //   buffer_stats.go    — approxSizeBytes, ScopeStats type, stats()
 type ScopeBuffer struct {
 	mu sync.RWMutex
@@ -72,7 +72,7 @@ type ScopeBuffer struct {
 	// counts are atomic so the read-hot path (recordRead) does not need
 	// to take b.mu. recordRead used to take b.mu.Lock() — a write lock
 	// on the same mutex readers were just on under RLock — turning every
-	// hit on /get, /render, /head, /tail and /ts_range into a serialise
+	// hit on /get, /render, /head and /tail into a serialise
 	// point. Block profiling pinned ~88% of all read-path lock-wait time
 	// to that one call. Moving the bucket state to atomics drops it to
 	// effectively zero.

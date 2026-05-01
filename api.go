@@ -28,7 +28,7 @@ package scopecache
 //     module (a misconfigured public proxy is a real risk); standalone defaults to true
 //     because the Unix socket is the gating layer.
 //   - DisableReadHeat:   opt-out of per-scope read-heat tracking on the hot read
-//     path (/get, /render, /head, /tail, /ts_range). Saves time.Now() + atomic
+//     path (/get, /render, /head, /tail). Saves time.Now() + atomic
 //     adds at the cost of always-zero last_access_ts / last_7d_read_count /
 //     read_count_total in /stats. Default false (heat tracked).
 type APIConfig struct {
@@ -108,7 +108,7 @@ type API struct {
 	enableAdmin bool
 
 	// disableReadHeat skips recordRead() on every hot read-path call
-	// (/get, /render, /head, /tail, /ts_range). Default zero-value
+	// (/get, /render, /head, /tail). Default zero-value
 	// (false) keeps heat tracking on; setting true saves the time.Now()
 	// call plus the atomic adds on the heat counters. See
 	// APIConfig.DisableReadHeat.

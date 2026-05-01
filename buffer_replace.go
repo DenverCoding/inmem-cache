@@ -1,6 +1,9 @@
 package scopecache
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Bulk prepare-then-commit pipeline used by /warm and /rebuild.
 //
@@ -61,6 +64,13 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 	// seq is a cache-local cursor that is NOT stable across /warm or /rebuild.
 	// We regenerate it from 1 for every call so scope buffers have monotonic,
 	// dense seq values even when the input items came from elsewhere.
+	//
+	// ts is cache-owned: every item in a /warm or /rebuild batch is stamped
+	// with the same now() value. The cache cannot honestly recover "when did
+	// this item originally arrive in the universe" from a rebuild input —
+	// that's source-of-truth metadata. Stamping now() captures the only
+	// time the cache itself can attest to: when it received this batch.
+	nowUs := time.Now().UnixMicro()
 	var lastSeq uint64
 	for _, src := range items {
 		if src.ID != "" {
@@ -74,6 +84,7 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 		lastSeq++
 		item := src
 		item.Seq = lastSeq
+		item.Ts = nowUs
 		item.renderBytes = precomputeRenderBytes(item.Payload)
 
 		built = append(built, item)

@@ -99,7 +99,7 @@ func (c *cappedResponseWriter) flush() {
 // Side effects already applied by the handler are NOT rolled back. This
 // matches every other 507 in the cache: 2xx is not durability, and 507
 // does not roll back. In practice the cap-protected endpoints are
-// read-only (/head, /tail, /ts_range), so there is nothing to roll back.
+// read-only (/head, /tail), so there is nothing to roll back.
 func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int64) {
 	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
 		{"ok", false},
@@ -112,7 +112,7 @@ func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int
 // cappedResponseWriter is retained for /multi_call's per-sub-call cap
 // path (handlers_multi_call.go wraps each sub-call's recorder so an
 // oversized sub-call body becomes a per-slot truncation marker without
-// aborting the whole batch). The public mux's /head, /tail, /ts_range
+// aborting the whole batch). The public mux's /head and /tail
 // no longer use this wrapper — they enforce the cap inside
 // writeJSONWithMetaCap at marshal time, which avoids the second
 // body-buffering pass.

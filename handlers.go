@@ -27,7 +27,7 @@ import (
 // Per-endpoint families live in handlers_*.go siblings:
 //
 //   handlers_write.go    — /append, /upsert, /update, /counter_add
-//   handlers_read.go     — /head, /tail, /ts_range, /get, /render
+//   handlers_read.go     — /head, /tail, /get, /render
 //   handlers_delete.go   — /delete, /delete_up_to, /delete_scope, /wipe
 //   handlers_bulk.go     — /warm, /rebuild
 //   handlers_observe.go  — /stats, /delete_scope_candidates, /help
@@ -238,7 +238,7 @@ func marshalWithApproxSize(payload orderedFields, started time.Time) ([]byte, or
 // writeJSONWithMeta is writeJSONWithDuration plus an approx_response_mb
 // field. Used on read-item endpoints whose response size is bounded by
 // the operation (e.g. /get is single-item). For limit-scaled endpoints
-// (/head, /tail, /ts_range) use writeJSONWithMetaCap instead, which
+// (/head, /tail) use writeJSONWithMetaCap instead, which
 // rejects oversized bodies up-front.
 func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
 	out, augmented, err := marshalWithApproxSize(payload, started)
@@ -255,7 +255,7 @@ func writeJSONWithMeta(w http.ResponseWriter, code int, payload orderedFields, s
 }
 
 // writeJSONWithMetaCap is writeJSONWithMeta with a per-response byte
-// cap baked in. Used on /head, /tail, /ts_range — endpoints whose
+// cap baked in. Used on /head, /tail — endpoints whose
 // response can grow with limit × per-item-cap. Marshals the body
 // once, checks against maxBytes, and either emits the response or
 // replaces it with a 507 envelope. Replaces the older capResponse
@@ -375,8 +375,8 @@ func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 }
 
 // scopeLimit is the parsed form of the scope+limit query pair used by every
-// multi-item read (/head, /tail, /ts_range). Endpoint-specific params
-// (offset, after_seq, since_ts, …) are parsed by the handler itself — this
+// multi-item read (/head, /tail). Endpoint-specific params
+// (offset, after_seq) are parsed by the handler itself — this
 // helper deliberately stops at the common pair.
 type scopeLimit struct {
 	Scope string
@@ -409,7 +409,7 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
-	// /head, /tail, /ts_range enforce the per-response cap inside their
+	// /head and /tail enforce the per-response cap inside their
 	// shared writer (writeJSONWithMetaCap, called from writeItemsHit) —
 	// no outer middleware needed. Earlier versions wrapped these with
 	// a capResponse middleware that buffered the full handler output a
@@ -417,7 +417,6 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	// duplicate buffering.
 	mux.HandleFunc("/head", api.handleHead)
 	mux.HandleFunc("/tail", api.handleTail)
-	mux.HandleFunc("/ts_range", api.handleTsRange)
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
 	mux.HandleFunc("/help", api.handleHelp)

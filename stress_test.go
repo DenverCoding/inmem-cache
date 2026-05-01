@@ -140,7 +140,6 @@ func TestStress_MixedOps(t *testing.T) {
 				_, _ = buf.updateByID(
 					"upsert_"+strconv.Itoa(rng.Intn(30)),
 					json.RawMessage(`{"updated":true}`),
-					nil,
 				)
 				updates.Add(1)
 

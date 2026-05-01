@@ -195,9 +195,9 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	var updated int
 	var err error
 	if item.ID != "" {
-		updated, err = buf.updateByID(item.ID, item.Payload, item.Ts)
+		updated, err = buf.updateByID(item.ID, item.Payload)
 	} else {
-		updated, err = buf.updateBySeq(item.Seq, item.Payload, item.Ts)
+		updated, err = buf.updateBySeq(item.Seq, item.Payload)
 	}
 	if err != nil {
 		// /update only ever sees *StoreFullError on the cap path

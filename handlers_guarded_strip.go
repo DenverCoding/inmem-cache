@@ -12,7 +12,7 @@ import (
 // /guarded's whitelist:
 //
 //   - /get, /append, /upsert: body.item.scope
-//   - /head, /tail, /ts_range: body.items[].scope
+//   - /head, /tail: body.items[].scope
 //
 // Other endpoints (/update, /delete, /delete_up_to, /counter_add)
 // don't carry a scope field in their response, so the body passes
@@ -47,7 +47,7 @@ func stripGuardedPrefix(body []byte, prefix string) []byte {
 		}
 	}
 
-	// Multi-item shape: body.items[].scope (used by /head, /tail, /ts_range).
+	// Multi-item shape: body.items[].scope (used by /head, /tail).
 	if itemsRaw, ok := m["items"]; ok {
 		if newItems, changed := stripScopeFieldArray(itemsRaw, prefix); changed {
 			m["items"] = newItems

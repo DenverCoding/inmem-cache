@@ -63,21 +63,6 @@ func TestResponseCap_TailIncludesApproxResponseMB(t *testing.T) {
 	}
 }
 
-func TestResponseCap_TsRangeIncludesApproxResponseMB(t *testing.T) {
-	h := newCappedHandler(25 << 20)
-	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","ts":100,"payload":{"v":1}}`)
-	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","ts":200,"payload":{"v":2}}`)
-	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","ts":300,"payload":{"v":3}}`)
-
-	code, out, raw := doRequest(t, h, "GET", "/ts_range?scope=s&since_ts=0&until_ts=999", "")
-	if code != 200 {
-		t.Fatalf("code=%d want 200, body=%s", code, raw)
-	}
-	if _, ok := out["approx_response_mb"]; !ok {
-		t.Fatalf("missing approx_response_mb in response: %s", raw)
-	}
-}
-
 func TestResponseCap_HeadOverflowReturns507(t *testing.T) {
 	// 50 bytes is small enough that any non-trivial JSON envelope blows
 	// past it — perfect for forcing the cap path without having to load
@@ -112,21 +97,6 @@ func TestResponseCap_TailOverflowReturns507(t *testing.T) {
 	}
 
 	code, _, raw := doRequest(t, h, "GET", "/tail?scope=s&limit=10", "")
-	if code != http.StatusInsufficientStorage {
-		t.Fatalf("code=%d want 507, body=%s", code, raw)
-	}
-}
-
-func TestResponseCap_TsRangeOverflowReturns507(t *testing.T) {
-	h := newCappedHandler(50)
-	body1 := `{"scope":"s","ts":100,"payload":{"v":1}}`
-	body2 := `{"scope":"s","ts":200,"payload":{"v":2}}`
-	body3 := `{"scope":"s","ts":300,"payload":{"v":3}}`
-	_, _, _ = doRequest(t, h, "POST", "/append", body1)
-	_, _, _ = doRequest(t, h, "POST", "/append", body2)
-	_, _, _ = doRequest(t, h, "POST", "/append", body3)
-
-	code, _, raw := doRequest(t, h, "GET", "/ts_range?scope=s&since_ts=0&until_ts=9999", "")
 	if code != http.StatusInsufficientStorage {
 		t.Fatalf("code=%d want 507, body=%s", code, raw)
 	}
@@ -178,7 +148,7 @@ func TestResponseCap_BoundaryAtCap(t *testing.T) {
 }
 
 // TestGet_IncludesCountAndApproxResponseMB pins the uniform read-family
-// response shape: every read-item endpoint (/head, /tail, /ts_range, /get)
+// response shape: every read-item endpoint (/head, /tail, /get)
 // emits {count, approx_response_mb, duration_us} alongside its endpoint-
 // specific fields. /get is the single-item member of that family — count
 // is 1 on hit and 0 on miss; approx_response_mb is included regardless.
@@ -223,7 +193,7 @@ func TestGet_IncludesCountAndApproxResponseMB(t *testing.T) {
 // TestEstimateMultiItemResponseBytes_IsLowerBound guards the pre-flight
 // helper's correctness invariant: the returned estimate must be at or
 // below the actual JSON-marshal size of the envelope that handleHead /
-// handleTail / handleTsRange produces. Overestimating would reject
+// handleTail produces. Overestimating would reject
 // legitimate calls; the post-flight cappedResponseWriter would never
 // see them.
 //

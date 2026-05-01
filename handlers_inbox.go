@@ -28,10 +28,10 @@ type inboxRequest struct {
 // as /guarded, but no scope-rewrite — the request lands directly in
 // one of the operator-configured inbox scopes.
 //
-// The cache assigns id (`<capabilityID>:<16-hex random>`) and ts
-// (`now()` in millis). Tenants cannot read what they wrote — there
-// is no GET /inbox; reads happen through /admin /tail and
-// /admin /delete_up_to.
+// The cache assigns id (`<capabilityID>:<32-hex random>`, i.e.
+// 16 random bytes hex-encoded) and ts (`now()` in microseconds).
+// Tenants cannot read what they wrote — there is no GET /inbox; reads
+// happen through /admin /tail and /admin /delete_up_to.
 //
 // Registered only when ServerSecret is set (HMAC needed) AND at least
 // one InboxScope is configured. Either condition false → route not
@@ -134,13 +134,14 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	autoID := capabilityID + ":" + hex.EncodeToString(randomBytes[:])
-	nowMs := time.Now().UnixMilli()
 
 	item := Item{
 		Scope:   req.Scope,
 		ID:      autoID,
 		Payload: req.Payload,
-		Ts:      &nowMs,
+		// Ts is left at its zero value here; AppendOne stamps it to
+		// time.Now().UnixMicro() under the scope write-lock — same
+		// rule as every other write path.
 	}
 
 	// Validate the constructed item. Defensive: id and scope shapes
@@ -156,7 +157,8 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	// with `_` (operator's choice) — going through AppendOne bypasses
 	// the public reserved-prefix check, which is the right semantic:
 	// /inbox is operator-opted-in for these specific scope names.
-	if _, err := api.store.AppendOne(item); err != nil {
+	stored, err := api.store.AppendOne(item)
+	if err != nil {
 		if writeStoreCapacityError(w, started, err, req.Scope) {
 			return
 		}
@@ -165,8 +167,10 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Return the cache-assigned ts so clients with skewed clocks can
+	// log the authoritative receive time without reading it back.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
-		{"ts", nowMs},
+		{"ts", stored.Ts},
 	}, started)
 }

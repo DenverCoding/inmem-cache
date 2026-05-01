@@ -6,11 +6,10 @@ import "sort"
 //
 //   - tailOffset  — newest-first window with offset (drives /tail)
 //   - sinceSeq    — oldest-first window with after-seq cursor (drives /head)
-//   - tsRange     — inclusive ts-window scan (drives /ts_range)
 //   - getByID     — single-item lookup by id (drives /get?id=, /render)
 //   - getBySeq    — single-item lookup by seq (drives /get?seq=)
 //
-// All five take b.mu.RLock so multiple readers run concurrently. None
+// All four take b.mu.RLock so multiple readers run concurrently. None
 // of them check b.detached: reading from a detached buffer returns the
 // state the buffer had at detach time, which is fine for reads — there
 // is no orphan-write hazard, only an eventually-stale snapshot. The
@@ -76,37 +75,6 @@ func (b *ScopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	out := make([]Item, take)
 	copy(out, b.items[idx:idx+take])
 	return out, hasMore
-}
-
-// tsRange scans the scope in seq order, returning items whose Ts falls inside
-// the inclusive window defined by sinceTs and untilTs (either may be nil to
-// leave that side unbounded). Items without a Ts are always skipped. The bool
-// is true when at least one further matching item exists beyond the limit,
-// so the handler can set truncated=true. This is an O(n) scan — unindexed
-// because the per-scope cap (100k items) makes a linear pass sub-millisecond
-// and the code stays trivially correct under concurrent ts mutations.
-func (b *ScopeBuffer) tsRange(sinceTs, untilTs *int64, limit int) ([]Item, bool) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	out := make([]Item, 0, limit)
-	for _, it := range b.items {
-		if it.Ts == nil {
-			continue
-		}
-		if sinceTs != nil && *it.Ts < *sinceTs {
-			continue
-		}
-		if untilTs != nil && *it.Ts > *untilTs {
-			continue
-		}
-		if limit > 0 && len(out) == limit {
-			// Found one more match beyond the cap — signal truncation and stop.
-			return out, true
-		}
-		out = append(out, it)
-	}
-	return out, false
 }
 
 func (b *ScopeBuffer) getByID(id string) (Item, bool) {

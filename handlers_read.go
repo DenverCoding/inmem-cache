@@ -10,39 +10,36 @@ import (
 //
 //   - /head      — oldest-first window, optional after_seq cursor
 //   - /tail      — newest-first window, optional offset
-//   - /ts_range  — inclusive ts-window scan (skips items without ts)
 //   - /get       — single-item lookup by id or seq, JSON envelope
 //   - /render    — single-item raw payload, no JSON envelope
 //
-// /head, /tail and /ts_range share writeItemsHit / writeItemsMiss so
-// the wire shape (`ok`, `hit`, `count`, `truncated`, `items`,
+// /head and /tail share writeItemsHit / writeItemsMiss so the wire
+// shape (`ok`, `hit`, `count`, `truncated`, `items`,
 // `approx_response_mb`, `duration_us`) stays uniform across the
 // list-returning read family. The shared writers also enforce two
-// invariants that previously sat parallel in three handler bodies:
+// invariants that previously sat parallel in the handler bodies:
 // (1) recordRead only on non-empty results, (2) per-response cap
 // check before marshal-and-write.
 
 // writeItemsHit assembles and writes the success response for a
-// list-returning read endpoint (/head, /tail, /ts_range). Two
-// load-bearing invariants live in this helper that previously sat
-// parallel in three handler bodies:
+// list-returning read endpoint (/head, /tail). Two load-bearing
+// invariants live in this helper:
 //
 //  1. recordRead is called only when items is non-empty. An empty
 //     result window (e.g. /tail of an existing scope where no items
-//     match the offset, or /ts_range with no items in the time
-//     window) is effectively a miss and must NOT inflate the scope's
-//     last_7d_read_count — that signal drives operator decisions on
-//     /delete_scope_candidates and would silently corrupt if the
-//     `len > 0` guard was forgotten in any of the three handlers.
+//     match the offset) is effectively a miss and must NOT inflate
+//     the scope's last_7d_read_count — that signal drives operator
+//     decisions on /delete_scope_candidates and would silently
+//     corrupt if the `len > 0` guard was forgotten.
 //  2. estimateMultiItemResponseBytes runs BEFORE writeJSONWithMeta.
 //     Once the response body has been written there is no way to
 //     switch to a 507 without leaving a half-flushed body on the
 //     wire — the cap check is a one-shot opportunity per request.
 //
 // `extra` slots between `count` and `truncated` so /tail can carry
-// its `offset` field at the right wire position; /head and
-// /ts_range pass nil. Field order is load-bearing: matches the
-// existing wire shape exactly. Do not reorder.
+// its `offset` field at the right wire position; /head passes nil.
+// Field order is load-bearing: matches the existing wire shape
+// exactly. Do not reorder.
 func (api *API) writeItemsHit(
 	w http.ResponseWriter,
 	started time.Time,
@@ -183,53 +180,6 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 
 	items, truncated := buf.tailOffset(q.Limit, offset)
 	api.writeItemsHit(w, started, buf, items, truncated, offsetField)
-}
-
-// handleTsRange answers time-window queries: return every item in a scope
-// whose client-supplied Ts falls inside [since_ts, until_ts]. At least one
-// bound must be provided; both bounds are inclusive (SQL BETWEEN convention);
-// items without a Ts are always excluded. No pagination cursor — if the
-// response is capped by ?limit, the truncated flag tells the client to narrow
-// the window and retry rather than chase a seq cursor (seq has no meaningful
-// relationship to a ts-filtered view, especially because ts is user-mutable).
-func (api *API) handleTsRange(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, started)
-		return
-	}
-
-	q, err := parseScopeLimit(r, "/ts_range")
-	if err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-	query := r.URL.Query()
-
-	sinceTs, err := parseTsParam("since_ts", query.Get("since_ts"))
-	if err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-	untilTs, err := parseTsParam("until_ts", query.Get("until_ts"))
-	if err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-	if err := validateTsRangeParams(sinceTs, untilTs); err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
-	buf, ok := api.store.getScope(q.Scope)
-	if !ok {
-		api.writeItemsMiss(w, started, nil)
-		return
-	}
-
-	items, truncated := buf.tsRange(sinceTs, untilTs, q.Limit)
-	api.writeItemsHit(w, started, buf, items, truncated, nil)
 }
 
 func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {

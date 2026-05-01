@@ -3,13 +3,14 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"time"
 )
 
 // Single-item write paths on *ScopeBuffer:
 //
 //   - appendItem    — insert a fresh item; rejects on dup id, capacity, or byte cap
 //   - upsertByID    — insert-or-replace by id; replace-whole-item semantics on hit
-//   - updateByID    — modify payload (and optional ts) at an existing id
+//   - updateByID    — modify payload at an existing id
 //   - updateBySeq   — same, addressed by seq
 //
 // All four take b.mu exclusively, check b.detached first, and route
@@ -18,10 +19,15 @@ import (
 // reservePayloadDeltaLocked, replaceItemAtIndexLocked — live in
 // buffer_locked.go.
 //
-// /upsert vs /update: /upsert has replace-the-whole-item semantics, so
-// ts follows the client's input exactly (send → stored, omit → cleared).
-// /update is a partial modify: ts present → overwrite, ts absent →
-// preserve. The asymmetry is deliberate.
+// Ts is cache-owned: every path that mutates an item stamps
+// time.Now().UnixMicro() onto Item.Ts under b.mu before storing or
+// replacing. Clients cannot supply ts (rejected at the validator);
+// the field is observability only — "when did the cache last write
+// this item" — so refresh-on-every-write is the simplest honest model.
+// Microsecond granularity (not milliseconds): two writes inside the
+// same millisecond are still distinguishable, which matters for ordered
+// /inbox draining and for "last activity" stamping on counters under
+// burst load.
 
 func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 	b.mu.Lock()
@@ -40,6 +46,10 @@ func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 			return Item{}, errors.New("an item with this 'id' already exists in the scope")
 		}
 	}
+
+	// Stamp the cache-owned ts before sizing/storing. Validator already
+	// rejected any client-supplied ts; this is the single source of truth.
+	item.Ts = time.Now().UnixMicro()
 
 	// Precompute the render-bytes shortcut before sizing — approxItemSize
 	// counts renderBytes against the cap, so the reservation must reflect
@@ -89,6 +99,8 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		return Item{}, false, &ScopeDetachedError{}
 	}
 
+	nowUs := time.Now().UnixMicro()
+
 	if existing, exists := b.byID[item.ID]; exists {
 		// Delta covers both Payload and renderBytes: approxItemSize
 		// counts both, and the cap check must too. renderBytes is
@@ -109,10 +121,9 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 			return Item{}, false, nil
 		}
 		b.items[i].Payload = item.Payload
-		// /upsert has replace-the-whole-item semantics, so ts follows the
-		// client's input exactly: send ts → stored, omit → cleared. That
-		// differs from /update (which treats absent ts as "preserve").
-		b.items[i].Ts = item.Ts
+		// /upsert is whole-item replacement: refresh ts to "now" so the
+		// stored ts always reflects when the current content arrived.
+		b.items[i].Ts = nowUs
 		b.items[i].renderBytes = newRender
 
 		updated := b.items[i]
@@ -127,6 +138,10 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	if len(b.items) >= b.maxItems {
 		return Item{}, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
+
+	// Stamp ts on the create path. Same value as the replace path above
+	// so observers cannot distinguish create-vs-replace by timestamp drift.
+	item.Ts = nowUs
 
 	// Precompute renderBytes before sizing (approxItemSize counts it).
 	item.renderBytes = precomputeRenderBytes(item.Payload)
@@ -156,12 +171,10 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	return item, true, nil
 }
 
-// updateByID mutates the item at (scope, id). Payload is always overwritten.
-// Ts follows "absent → preserve, present → overwrite" semantics: a nil ts
-// leaves the stored ts alone, a non-nil ts replaces it. This asymmetry with
-// /upsert (which blind-overwrites ts) is deliberate — /update is a partial
-// modify, /upsert is a full replace.
-func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) (int, error) {
+// updateByID mutates the item at (scope, id). Payload is always overwritten;
+// ts is refreshed to time.Now().UnixMicro() — every write that touches an
+// item refreshes ts to "when did the cache write this content."
+func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -174,13 +187,13 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) 
 		return 0, nil
 	}
 
-	// Only the payload changes on /update; scope/id/ts are unchanged in
+	// Only the payload changes on /update; scope/id are unchanged in
 	// size, so the byte delta reduces to (new_payload + new_renderBytes)
 	// - (old_payload + old_renderBytes). renderBytes is non-nil only for
 	// JSON-string payloads (precomputed at write so /render skips a
 	// per-hit Unmarshal); approxItemSize counts it, so the cap check
 	// must too. A shrink can't fail the cap check, but a grow must
-	// reserve first.
+	// reserve first. Ts is a fixed-width int64, no delta contribution.
 	newRender := precomputeRenderBytes(payload)
 	delta, err := b.reservePayloadDeltaLocked(
 		len(existing.Payload)+len(existing.renderBytes),
@@ -195,11 +208,11 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage, ts *int64) 
 		// Unreachable under b.mu: b.byID confirmed the item exists and items/byID are kept in sync.
 		return 0, nil
 	}
-	b.replaceItemAtIndexLocked(i, payload, ts, newRender, delta)
+	b.replaceItemAtIndexLocked(i, payload, time.Now().UnixMicro(), newRender, delta)
 	return 1, nil
 }
 
-func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64) (int, error) {
+func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -227,6 +240,6 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, ts *int64
 		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
 		return 0, nil
 	}
-	b.replaceItemAtIndexLocked(i, payload, ts, newRender, delta)
+	b.replaceItemAtIndexLocked(i, payload, time.Now().UnixMicro(), newRender, delta)
 	return 1, nil
 }

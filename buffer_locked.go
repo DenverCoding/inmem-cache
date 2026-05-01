@@ -61,9 +61,9 @@ func (b *ScopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, er
 	return delta, nil
 }
 
-// replaceItemAtIndexLocked overwrites payload (and ts when non-nil)
-// at items[i], installs the caller-precomputed renderBytes, syncs
-// the secondary indexes, and applies the caller's delta to b.bytes.
+// replaceItemAtIndexLocked overwrites payload and ts at items[i],
+// installs the caller-precomputed renderBytes, syncs the secondary
+// indexes, and applies the caller's delta to b.bytes.
 //
 // PRECONDITION: caller holds b.mu and i is a valid index into
 // b.items. Bounds-check is the caller's responsibility — the helper
@@ -75,16 +75,21 @@ func (b *ScopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, er
 // an id (id="" is legal), so not every item has a byID entry to keep
 // in sync. bySeq is unconditional because every item has a seq.
 //
+// Ts is always overwritten by the caller-supplied value: every
+// caller (updateByID, updateBySeq, counterAdd) computes a fresh
+// time.Now().UnixMicro() under b.mu and passes it in. The "always
+// refresh" rule is enforced at the call site, not here — this helper
+// is a mechanical write of the values the caller has already decided
+// on.
+//
 // The caller passes renderBytes (rather than computing it inside the
 // helper) because approxItemSize counts renderBytes too — so the
 // caller must precompute it to derive `delta`, then pass both. This
 // keeps the cap accounting honest on string-payload updates whose
 // decoded form changes length.
-func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts *int64, renderBytes []byte, delta int64) {
+func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts int64, renderBytes []byte, delta int64) {
 	b.items[i].Payload = payload
-	if ts != nil {
-		b.items[i].Ts = ts
-	}
+	b.items[i].Ts = ts
 	b.items[i].renderBytes = renderBytes
 	updated := b.items[i]
 	// replaceItemAtIndexLocked is only reachable when the item already

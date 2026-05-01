@@ -178,7 +178,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 	original, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
-	n, err := buf.updateByID("a", newPayload, nil)
+	n, err := buf.updateByID("a", newPayload)
 	if err != nil {
 		t.Fatalf("updateByID: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 func TestUpdateByID_Miss(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
-	n, err := buf.updateByID("missing", raw, nil)
+	n, err := buf.updateByID("missing", raw)
 	if err != nil {
 		t.Fatalf("updateByID: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestUpdateBySeq_Hit(t *testing.T) {
 	it, _ := buf.appendItem(newItem("s", "", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
-	n, err := buf.updateBySeq(it.Seq, newPayload, nil)
+	n, err := buf.updateBySeq(it.Seq, newPayload)
 	if err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 	it, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 42})
-	if _, err := buf.updateBySeq(it.Seq, newPayload, nil); err != nil {
+	if _, err := buf.updateBySeq(it.Seq, newPayload); err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
 
@@ -261,7 +261,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 func TestUpdateBySeq_Miss(t *testing.T) {
 	buf := NewScopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
-	n, err := buf.updateBySeq(999, raw, nil)
+	n, err := buf.updateBySeq(999, raw)
 	if err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
