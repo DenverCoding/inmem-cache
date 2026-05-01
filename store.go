@@ -3,8 +3,10 @@ package scopecache
 import (
 	"errors"
 	"hash/maphash"
+	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // numShards splits the scope map into independently-locked shards.
@@ -632,4 +634,40 @@ func (s *Store) listScopes() map[string]*ScopeBuffer {
 		sh.mu.RUnlock()
 	}
 	return out
+}
+
+// scopeCandidates returns the eviction-candidate list used by
+// /delete_scope_candidates: every scope with its heat metadata,
+// optionally filtered to scopes older than `hours`, sorted by
+// last_access_ts ascending (stalest first), then truncated to
+// `limit`. Walks every shard via listScopes — per-scope-consistent
+// but not a global atomic snapshot, same caveat as stats(). Advisory
+// data, not authoritative.
+func (s *Store) scopeCandidates(hours int64, limit int) []Candidate {
+	now := nowUnixMicro()
+	minAgeMicros := hours * int64(time.Hour/time.Microsecond)
+
+	scopes := s.listScopes()
+	list := make([]Candidate, 0, len(scopes))
+	for name, buf := range scopes {
+		st := buf.stats(now)
+		if hours > 0 && now-st.CreatedTS < minAgeMicros {
+			continue
+		}
+		list = append(list, Candidate{
+			Scope:           name,
+			CreatedTS:       st.CreatedTS,
+			LastAccessTS:    st.LastAccessTS,
+			Last7dReadCount: st.Last7DReadCount,
+			ItemCount:       st.ItemCount,
+			ApproxScopeMB:   st.ApproxScopeMB,
+		})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].LastAccessTS < list[j].LastAccessTS
+	})
+	if len(list) > limit {
+		list = list[:limit]
+	}
+	return list
 }

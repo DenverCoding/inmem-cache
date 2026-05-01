@@ -328,6 +328,34 @@ func TestStore_render_MissingScope(t *testing.T) {
 	}
 }
 
+// scopeCandidates is the walk-filter-sort-truncate pipeline that
+// /delete_scope_candidates surfaces. The HTTP-level tests cover the
+// happy path; this pin is for the empty-store contract and the
+// limit-truncation invariant — both are easy to silently break by a
+// future "always allocate len(scopes)" or "skip the truncate when
+// limit > 0" change.
+func TestStore_scopeCandidates_EmptyStore(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	got := s.scopeCandidates(0, 100)
+	if len(got) != 0 {
+		t.Errorf("scopeCandidates on empty store=%v; want empty slice", got)
+	}
+}
+
+func TestStore_scopeCandidates_TruncatesToLimit(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	for i := 0; i < 5; i++ {
+		_, err := s.appendOne(Item{Scope: fmt.Sprintf("s%d", i), Payload: json.RawMessage(`"v"`)})
+		if err != nil {
+			t.Fatalf("appendOne %d: %v", i, err)
+		}
+	}
+	got := s.scopeCandidates(0, 3)
+	if len(got) != 3 {
+		t.Errorf("len=%d; want 3 (truncated)", len(got))
+	}
+}
+
 // render peels the renderBytes shortcut for JSON-string payloads — a
 // store-level invariant that handleRender used to enforce inline.
 // Pin it on the Store boundary now that the handler is dumb.

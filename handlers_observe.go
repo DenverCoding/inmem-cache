@@ -2,7 +2,6 @@ package scopecache
 
 import (
 	"net/http"
-	"sort"
 	"time"
 )
 
@@ -45,35 +44,7 @@ func (api *API) handleDeleteScopeCandidates(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	scopes := api.store.listScopes()
-	list := make([]Candidate, 0, len(scopes))
-	now := nowUnixMicro()
-	minAgeMicros := hours * int64(time.Hour/time.Microsecond)
-
-	for name, buf := range scopes {
-		st := buf.stats(now)
-
-		if hours > 0 && now-st.CreatedTS < minAgeMicros {
-			continue
-		}
-
-		list = append(list, Candidate{
-			Scope:           name,
-			CreatedTS:       st.CreatedTS,
-			LastAccessTS:    st.LastAccessTS,
-			Last7dReadCount: st.Last7DReadCount,
-			ItemCount:       st.ItemCount,
-			ApproxScopeMB:   st.ApproxScopeMB,
-		})
-	}
-
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].LastAccessTS < list[j].LastAccessTS
-	})
-
-	if len(list) > limit {
-		list = list[:limit]
-	}
+	list := api.store.scopeCandidates(hours, limit)
 
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
