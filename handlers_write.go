@@ -15,9 +15,9 @@ import (
 //
 // All four decode an Item body, run shape validation, reject reserved
 // scope prefixes for non-admin callers, route through the matching
-// Store atomic write-path (appendOne / upsertOne / counterAddOne or
-// buf.update*), and map *ScopeFullError / *ScopeCapacityError /
-// *StoreFullError uniformly via writeStoreCapacityError.
+// Store method (appendOne / upsertOne / counterAddOne / updateOne),
+// and map *ScopeFullError / *ScopeCapacityError / *StoreFullError
+// uniformly via writeStoreCapacityError.
 
 func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()

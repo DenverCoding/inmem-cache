@@ -16,10 +16,10 @@ import (
 // /head and /tail share writeItemsHit / writeItemsMiss so the wire
 // shape (`ok`, `hit`, `count`, `truncated`, `items`,
 // `approx_response_mb`, `duration_us`) stays uniform across the
-// list-returning read family. The shared writers also enforce two
-// invariants that previously sat parallel in the handler bodies:
-// (1) recordRead only on non-empty results, (2) per-response cap
-// check before marshal-and-write.
+// list-returning read family. writeItemsHit enforces the
+// per-response cap before marshal-and-write; the read-heat stamp
+// (only on non-empty results) lives one layer down in Store.head /
+// Store.tail.
 
 // writeItemsHit assembles and writes the success response for a
 // list-returning read endpoint (/head, /tail). The Store-layer read
