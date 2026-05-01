@@ -140,7 +140,7 @@ func BenchmarkStore_Append(b *testing.B) {
 //
 // Useful for cpuprofile + memprofile to find what dominates after the
 // scope-map mutex was sharded: candidates are atomic-CAS contention on
-// totalBytes, *ScopeBuffer alloc + map header alloc, and fmt formatting.
+// totalBytes, *scopeBuffer alloc + map header alloc, and fmt formatting.
 func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
 	store := NewStore(Config{
 		ScopeMaxItems: 50_000,    // matches phase4 Caddyfile setting

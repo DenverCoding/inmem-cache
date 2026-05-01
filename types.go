@@ -182,7 +182,7 @@ type ItemsRequest struct {
 // heat ring buffer. Day is the unix-day this slot is currently
 // representing (0 = empty); Count is the number of reads recorded on
 // that day. Both fields are atomic so the read-hot path
-// (ScopeBuffer.recordRead) can update them without taking the scope
+// (scopeBuffer.recordRead) can update them without taking the scope
 // write lock — see the lock-free state machine in recordRead for the
 // claim/expire protocol.
 type ScopeReadHeatBucket struct {
@@ -207,7 +207,7 @@ type ScopeCapacityOffender struct {
 	Cap   int    `json:"cap"`
 }
 
-// ScopeFullError is returned by ScopeBuffer.appendItem when the buffer is at
+// ScopeFullError is returned by scopeBuffer.appendItem when the buffer is at
 // capacity. The handler converts it to a 507 response with the scope name.
 type ScopeFullError struct {
 	Count int
@@ -248,7 +248,7 @@ func (e *StoreFullError) Error() string {
 	return "store is at byte capacity"
 }
 
-// CounterPayloadError is returned by ScopeBuffer.counterAdd when the existing
+// CounterPayloadError is returned by scopeBuffer.counterAdd when the existing
 // item at scope+id cannot participate in a counter operation: its payload is
 // not a JSON number, not an integer, or outside the allowed ±MaxCounterValue
 // range. The handler converts it to 409 Conflict.
@@ -260,7 +260,7 @@ func (e *CounterPayloadError) Error() string {
 	return e.Reason
 }
 
-// CounterOverflowError is returned by ScopeBuffer.counterAdd when the
+// CounterOverflowError is returned by scopeBuffer.counterAdd when the
 // resulting value would exceed ±MaxCounterValue. The handler converts it to
 // 400 Bad Request — the caller supplied a `by` that combined with the current
 // value would push the counter outside the JS-safe integer range.

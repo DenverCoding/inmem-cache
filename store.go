@@ -22,7 +22,7 @@ const (
 
 type scopeShard struct {
 	mu     sync.RWMutex
-	scopes map[string]*ScopeBuffer
+	scopes map[string]*scopeBuffer
 }
 
 type Store struct {
@@ -54,7 +54,7 @@ type Store struct {
 	// and the value compared against maxStoreBytes on the next write
 	// all describe the same accounting model.
 	//
-	// totalBytes is leaner than ScopeBuffer.approxSizeBytes — the
+	// totalBytes is leaner than scopeBuffer.approxSizeBytes — the
 	// per-scope estimate folds in Go map/slice overhead for byID, bySeq
 	// and the heat-bucket ring, which admission control deliberately
 	// does NOT charge against the cap. Counting per-scope overhead is
@@ -76,7 +76,7 @@ func NewStore(c Config) *Store {
 		maxItemBytes:    c.MaxItemBytes,
 	}
 	for i := range s.shards {
-		s.shards[i].scopes = make(map[string]*ScopeBuffer)
+		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
 	return s
 }
@@ -180,7 +180,7 @@ func (s *Store) reserveBytes(delta int64) (bool, int64, int64) {
 }
 
 // scopeBufferOverhead is the byte-cost the cache charges per allocated
-// scope, on top of the scope's items. Covers the *ScopeBuffer struct
+// scope, on top of the scope's items. Covers the *scopeBuffer struct
 // itself (mutex, slice header, two map headers, heat-bucket
 // ringbuffer, scope-name string in its shard's map), plus slack for the
 // per-key map entry overhead. A conservative single-KiB number.
@@ -197,18 +197,18 @@ func (s *Store) reserveBytes(delta int64) (bool, int64, int64) {
 // matches actual memory pressure, not just item bytes.
 const scopeBufferOverhead = 1024
 
-// newScopeBuffer builds a fresh ScopeBuffer bound to this store so its
+// newscopeBuffer builds a fresh scopeBuffer bound to this store so its
 // mutations can participate in byte tracking. Keeping this helper on the
 // store means every production path creates bound buffers; tests that
-// exercise ScopeBuffer in isolation use NewScopeBuffer directly and
+// exercise scopeBuffer in isolation use newscopeBuffer directly and
 // accept that byte tracking is a no-op there.
-func (s *Store) newScopeBuffer() *ScopeBuffer {
-	b := NewScopeBuffer(s.defaultMaxItems)
+func (s *Store) newscopeBuffer() *scopeBuffer {
+	b := newscopeBuffer(s.defaultMaxItems)
 	b.store = s
 	return b
 }
 
-func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
+func (s *Store) getOrCreateScope(scope string) (*scopeBuffer, error) {
 	buf, _, err := s.getOrCreateScopeTrackingCreated(scope)
 	return buf, err
 }
@@ -219,7 +219,7 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 // the `created` flag to roll the empty scope back when the subsequent
 // item-byte reservation fails — see cleanupIfEmptyAndUnused. All other
 // callers go through getOrCreateScope, which discards the flag.
-func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, bool, error) {
+func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, bool, error) {
 	if scope == "" {
 		return nil, false, errors.New("the 'scope' field is required")
 	}
@@ -249,7 +249,7 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, boo
 	// that drove this rewrite, race-loss is essentially never (every
 	// scope name is distinct); in same-scope writes the caller hits
 	// the RLock fast-path above and never reaches this branch.
-	preBuf := s.newScopeBuffer()
+	preBuf := s.newscopeBuffer()
 
 	sh.mu.Lock()
 	if existing, ok := sh.scopes[scope]; ok {
@@ -287,7 +287,7 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*ScopeBuffer, boo
 //     concurrent in-flight writer that wakes up on this buf after we
 //     released the locks returns *ScopeDetachedError, same semantics
 //     as a /delete_scope race.
-func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *ScopeBuffer) {
+func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 	sh := s.shardFor(scope)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -503,7 +503,7 @@ func (s *Store) render(scope, id string, seq uint64, recordHeat bool) ([]byte, b
 // expected to treat such infrastructure writes as best-effort and
 // silently skip on nil (observability is not auth — losing a counter
 // must never block a legitimate request).
-func (s *Store) ensureScope(scope string) *ScopeBuffer {
+func (s *Store) ensureScope(scope string) *scopeBuffer {
 	sh := s.shardFor(scope)
 
 	sh.mu.RLock()
@@ -525,12 +525,12 @@ func (s *Store) ensureScope(scope string) *ScopeBuffer {
 		return nil
 	}
 
-	buf = s.newScopeBuffer()
+	buf = s.newscopeBuffer()
 	sh.scopes[scope] = buf
 	return buf
 }
 
-func (s *Store) getScope(scope string) (*ScopeBuffer, bool) {
+func (s *Store) getScope(scope string) (*scopeBuffer, bool) {
 	sh := s.shardFor(scope)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
@@ -575,18 +575,18 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	return itemCount, true
 }
 
-// StoreStats is the typed snapshot of the store. stats() returns it so the
+// storeStats is the typed snapshot of the store. stats() returns it so the
 // /stats handler can flatten it into orderedFields for the wire, and so any
 // in-package caller (tests, future adapters) can read fields directly.
-type StoreStats struct {
+type storeStats struct {
 	ScopeCount    int
 	TotalItems    int
 	ApproxStoreMB MB
 	MaxStoreMB    MB
-	Scopes        map[string]ScopeStats
+	Scopes        map[string]scopeStats
 }
 
-func (s *Store) stats() StoreStats {
+func (s *Store) stats() storeStats {
 	// Per-shard snapshot: each shard is RLock'd, walked, RUnlock'd in
 	// turn. scope_count and total_items still reflect the same set of
 	// scopes that were captured into Scopes (loop derives them from
@@ -600,7 +600,7 @@ func (s *Store) stats() StoreStats {
 	// sharding too (totalBytes is read after the lock, by design) and
 	// /stats has always been an approximation.
 	now := nowUnixMicro()
-	scopeStats := make(map[string]ScopeStats)
+	byScope := make(map[string]scopeStats)
 	totalItems := 0
 
 	for i := range s.shards {
@@ -608,23 +608,23 @@ func (s *Store) stats() StoreStats {
 		sh.mu.RLock()
 		for scope, buf := range sh.scopes {
 			st := buf.stats(now)
-			scopeStats[scope] = st
+			byScope[scope] = st
 			totalItems += st.ItemCount
 		}
 		sh.mu.RUnlock()
 	}
 
-	return StoreStats{
-		ScopeCount:    len(scopeStats),
+	return storeStats{
+		ScopeCount:    len(byScope),
 		TotalItems:    totalItems,
 		ApproxStoreMB: MB(s.totalBytes.Load()),
 		MaxStoreMB:    MB(s.maxStoreBytes),
-		Scopes:        scopeStats,
+		Scopes:        byScope,
 	}
 }
 
-func (s *Store) listScopes() map[string]*ScopeBuffer {
-	out := make(map[string]*ScopeBuffer)
+func (s *Store) listScopes() map[string]*scopeBuffer {
+	out := make(map[string]*scopeBuffer)
 	for i := range s.shards {
 		sh := &s.shards[i]
 		sh.mu.RLock()

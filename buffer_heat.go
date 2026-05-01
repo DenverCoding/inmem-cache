@@ -1,6 +1,6 @@
 package scopecache
 
-// Lock-free read-heat tracking for *ScopeBuffer.
+// Lock-free read-heat tracking for *scopeBuffer.
 //
 // The hot read path (/get, /render, /head, /tail) holds
 // b.mu.RLock during the actual data fetch. Adding heat tracking under
@@ -9,11 +9,11 @@ package scopecache
 // before the algorithm here moved bucket state to atomics. Now reads
 // scale with cores up to RLock cache-line contention.
 //
-// State lives entirely in atomic fields on ScopeBuffer:
+// State lives entirely in atomic fields on scopeBuffer:
 //   - readHeatBuckets: ring buffer indexed by day % ReadHeatWindowDays,
 //     each bucket has atomic Day + atomic Count.
 //   - lastAccessTS, readCountTotal, last7DReadCount: per-scope atomic
-//     counters surfaced via ScopeStats.
+//     counters surfaced via scopeStats.
 //
 // Coordination uses CAS on bucket.Day for both expiry and slot-claim;
 // Count is a simple atomic add per increment.
@@ -26,7 +26,7 @@ package scopecache
 // consistent (a concurrent recordRead may land between two bucket
 // reads here) which is acceptable for the observability use cases
 // this drives.
-func (b *ScopeBuffer) computeLast7DReadCount(now int64) uint64 {
+func (b *scopeBuffer) computeLast7DReadCount(now int64) uint64 {
 	day := unixDay(now)
 	oldestValidDay := day - ReadHeatWindowDays + 1
 	var sum uint64
@@ -81,7 +81,7 @@ func (b *ScopeBuffer) computeLast7DReadCount(now int64) uint64 {
 // recomputes from the buckets via computeLast7DReadCount), but the
 // runtime b.last7DReadCount is the canonical "last 7 days of reads"
 // counter for any future in-process consumer.
-func (b *ScopeBuffer) recordRead(now int64) {
+func (b *scopeBuffer) recordRead(now int64) {
 	day := unixDay(now)
 	oldestValidDay := day - ReadHeatWindowDays + 1
 

@@ -16,7 +16,7 @@ package scopecache
 // relative to item bytes.
 //
 // PRECONDITION: caller holds b.mu.
-func (b *ScopeBuffer) approxSizeBytesLocked() int64 {
+func (b *scopeBuffer) approxSizeBytesLocked() int64 {
 	var total int64
 	total += 64
 	total += int64(len(b.items)) * 32
@@ -36,17 +36,17 @@ func (b *ScopeBuffer) approxSizeBytesLocked() int64 {
 	return total
 }
 
-func (b *ScopeBuffer) approxSizeBytes() int64 {
+func (b *scopeBuffer) approxSizeBytes() int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.approxSizeBytesLocked()
 }
 
-// ScopeStats is the typed snapshot of a single ScopeBuffer. It is what
+// scopeStats is the typed snapshot of a single scopeBuffer. It is what
 // buf.stats() returns so callers inside the package (e.g. the candidate-
 // selection path) can read fields directly, and what API-layer handlers
 // flatten into orderedFields for the wire format.
-type ScopeStats struct {
+type scopeStats struct {
 	ItemCount       int
 	LastSeq         uint64
 	ApproxScopeMB   MB
@@ -62,11 +62,11 @@ type ScopeStats struct {
 // by recordRead, so a scope that hasn't been read in 7+ days would
 // otherwise still report a stale "warm" count to observability
 // callers.
-func (b *ScopeBuffer) stats(now int64) ScopeStats {
+func (b *scopeBuffer) stats(now int64) scopeStats {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	return ScopeStats{
+	return scopeStats{
 		ItemCount:       len(b.items),
 		LastSeq:         b.lastSeq,
 		ApproxScopeMB:   MB(b.approxSizeBytesLocked()),

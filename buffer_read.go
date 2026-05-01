@@ -2,7 +2,7 @@ package scopecache
 
 import "sort"
 
-// Read paths on *ScopeBuffer:
+// Read paths on *scopeBuffer:
 //
 //   - tailOffset  — newest-first window with offset (drives /tail)
 //   - sinceSeq    — oldest-first window with after-seq cursor (drives /head)
@@ -21,7 +21,7 @@ import "sort"
 // start > 0), signalling to the caller that the response is clipped at the
 // oldest end. It does NOT signal truncation at the newest end (that is what
 // offset already describes to the client).
-func (b *ScopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
+func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -49,7 +49,7 @@ func (b *ScopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 // bool is true when more matching items exist beyond the returned slice, which
 // lets the handler surface truncated=true without the client having to guess
 // from count == limit.
-func (b *ScopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
+func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -77,14 +77,14 @@ func (b *ScopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	return out, hasMore
 }
 
-func (b *ScopeBuffer) getByID(id string) (Item, bool) {
+func (b *scopeBuffer) getByID(id string) (Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	item, ok := b.byID[id]
 	return item, ok
 }
 
-func (b *ScopeBuffer) getBySeq(seq uint64) (Item, bool) {
+func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	item, ok := b.bySeq[seq]

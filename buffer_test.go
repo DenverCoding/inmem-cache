@@ -17,10 +17,10 @@ func newItem(scope, id string, payload map[string]interface{}) Item {
 	return Item{Scope: scope, ID: id, Payload: raw}
 }
 
-// --- ScopeBuffer.appendItem ---------------------------------------------------
+// --- scopeBuffer.appendItem ---------------------------------------------------
 
 func TestAppendItem_AssignsSeqMonotonically(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	for i := 1; i <= 5; i++ {
 		it, err := buf.appendItem(newItem("s", "", nil))
@@ -34,7 +34,7 @@ func TestAppendItem_AssignsSeqMonotonically(t *testing.T) {
 }
 
 func TestAppendItem_RejectsDuplicateID(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
 		t.Fatalf("first append: %v", err)
@@ -45,7 +45,7 @@ func TestAppendItem_RejectsDuplicateID(t *testing.T) {
 }
 
 func TestAppendItem_AllowsMultipleEmptyIDs(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	for i := 0; i < 3; i++ {
 		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
@@ -62,7 +62,7 @@ func TestAppendItem_AllowsMultipleEmptyIDs(t *testing.T) {
 // is rejected with ScopeFullError. No eviction happens — state, seq cursor
 // and byID index stay exactly as they were before the failed append.
 func TestAppendItem_RejectsAtCapacity(t *testing.T) {
-	buf := NewScopeBuffer(3)
+	buf := newscopeBuffer(3)
 
 	for i := 0; i < 3; i++ {
 		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
@@ -93,10 +93,10 @@ func TestAppendItem_RejectsAtCapacity(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.replaceAll ---------------------------------------------------
+// --- scopeBuffer.replaceAll ---------------------------------------------------
 
 func TestReplaceAll_AssignsFreshSeqFromOne(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "", nil))
 	_, _ = buf.appendItem(newItem("s", "", nil))
 
@@ -121,7 +121,7 @@ func TestReplaceAll_AssignsFreshSeqFromOne(t *testing.T) {
 // no silent truncation. Pre-existing state must stay untouched since the
 // buffer is the mutation target and the caller expects all-or-nothing.
 func TestReplaceAll_RejectsOverCap(t *testing.T) {
-	buf := NewScopeBuffer(3)
+	buf := newscopeBuffer(3)
 	_, _ = buf.appendItem(newItem("s", "keep", nil))
 	priorLen := len(buf.items)
 
@@ -148,7 +148,7 @@ func TestReplaceAll_RejectsOverCap(t *testing.T) {
 }
 
 func TestReplaceAll_RejectsDuplicateIDs(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	items := []Item{
 		newItem("s", "a", nil),
@@ -160,7 +160,7 @@ func TestReplaceAll_RejectsDuplicateIDs(t *testing.T) {
 }
 
 func TestReplaceAll_EmptyItemsClearsScope(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "", nil))
 
 	if _, err := buf.replaceAll([]Item{}); err != nil {
@@ -171,10 +171,10 @@ func TestReplaceAll_EmptyItemsClearsScope(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.updateByID ---------------------------------------------------
+// --- scopeBuffer.updateByID ---------------------------------------------------
 
 func TestUpdateByID_HitPreservesSeq(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	original, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
@@ -200,7 +200,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 }
 
 func TestUpdateByID_Miss(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
 	n, err := buf.updateByID("missing", raw)
 	if err != nil {
@@ -211,10 +211,10 @@ func TestUpdateByID_Miss(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.updateBySeq --------------------------------------------------
+// --- scopeBuffer.updateBySeq --------------------------------------------------
 
 func TestUpdateBySeq_Hit(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	it, _ := buf.appendItem(newItem("s", "", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
@@ -237,7 +237,7 @@ func TestUpdateBySeq_Hit(t *testing.T) {
 }
 
 func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	it, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 42})
@@ -259,7 +259,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 }
 
 func TestUpdateBySeq_Miss(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
 	n, err := buf.updateBySeq(999, raw)
 	if err != nil {
@@ -270,10 +270,10 @@ func TestUpdateBySeq_Miss(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.upsertByID ---------------------------------------------------
+// --- scopeBuffer.upsertByID ---------------------------------------------------
 
 func TestUpsertByID_CreatesNewItem(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	result, created, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 1}))
 	if err != nil {
@@ -294,7 +294,7 @@ func TestUpsertByID_CreatesNewItem(t *testing.T) {
 }
 
 func TestUpsertByID_ReplacesPayloadAndPreservesSeq(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	first, _, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 1}))
 	if err != nil {
 		t.Fatalf("first upsert: %v", err)
@@ -323,7 +323,7 @@ func TestUpsertByID_ReplacesPayloadAndPreservesSeq(t *testing.T) {
 }
 
 func TestUpsertByID_CoexistsWithAppend(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 
 	result, created, err := buf.upsertByID(newItem("s", "b", map[string]interface{}{"v": 9}))
@@ -339,7 +339,7 @@ func TestUpsertByID_CoexistsWithAppend(t *testing.T) {
 }
 
 func TestUpsertByID_RejectsAtCapacity(t *testing.T) {
-	buf := NewScopeBuffer(2)
+	buf := newscopeBuffer(2)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 
@@ -358,10 +358,10 @@ func TestUpsertByID_RejectsAtCapacity(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.counterAdd ---------------------------------------------------
+// --- scopeBuffer.counterAdd ---------------------------------------------------
 
 func TestCounterAdd_CreatesWithStartingValue(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	value, created, err := buf.counterAdd("views", "article_1", 1)
 	if err != nil {
@@ -386,7 +386,7 @@ func TestCounterAdd_CreatesWithStartingValue(t *testing.T) {
 }
 
 func TestCounterAdd_IncrementsExistingCounter(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _, _ = buf.counterAdd("views", "article_1", 10)
 
 	value, created, err := buf.counterAdd("views", "article_1", 5)
@@ -409,7 +409,7 @@ func TestCounterAdd_IncrementsExistingCounter(t *testing.T) {
 }
 
 func TestCounterAdd_NegativeByDecrements(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _, _ = buf.counterAdd("c", "k", 100)
 
 	value, _, err := buf.counterAdd("c", "k", -40)
@@ -422,7 +422,7 @@ func TestCounterAdd_NegativeByDecrements(t *testing.T) {
 }
 
 func TestCounterAdd_AllowsNegativeCreate(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	value, created, err := buf.counterAdd("c", "k", -5)
 	if err != nil {
@@ -440,7 +440,7 @@ func TestCounterAdd_AllowsNegativeCreate(t *testing.T) {
 // string or object) must not be silently overwritten — /counter_add returns
 // a CounterPayloadError so the handler can map it to 409 Conflict.
 func TestCounterAdd_RejectsNonNumericExisting(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`"hello"`)})
 
 	_, _, err := buf.counterAdd("c", "k", 1)
@@ -454,7 +454,7 @@ func TestCounterAdd_RejectsNonNumericExisting(t *testing.T) {
 }
 
 func TestCounterAdd_RejectsFloatExisting(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`3.14`)})
 
 	_, _, err := buf.counterAdd("c", "k", 1)
@@ -468,7 +468,7 @@ func TestCounterAdd_RejectsFloatExisting(t *testing.T) {
 }
 
 func TestCounterAdd_RejectsObjectExisting(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`{"v":1}`)})
 
 	_, _, err := buf.counterAdd("c", "k", 1)
@@ -479,7 +479,7 @@ func TestCounterAdd_RejectsObjectExisting(t *testing.T) {
 }
 
 func TestCounterAdd_RejectsOutOfRangeExisting(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	// 2^53 — one above the allowed ±(2^53-1) range.
 	_, _ = buf.appendItem(Item{Scope: "c", ID: "k", Payload: json.RawMessage(`9007199254740992`)})
 
@@ -491,7 +491,7 @@ func TestCounterAdd_RejectsOutOfRangeExisting(t *testing.T) {
 }
 
 func TestCounterAdd_RejectsOverflow(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	// Seed at max.
 	_, _, _ = buf.counterAdd("c", "k", MaxCounterValue)
 
@@ -512,7 +512,7 @@ func TestCounterAdd_RejectsOverflow(t *testing.T) {
 }
 
 func TestCounterAdd_RejectsUnderflow(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _, _ = buf.counterAdd("c", "k", -MaxCounterValue)
 
 	_, _, err := buf.counterAdd("c", "k", -1)
@@ -523,7 +523,7 @@ func TestCounterAdd_RejectsUnderflow(t *testing.T) {
 }
 
 func TestCounterAdd_RejectsAtScopeCapacity(t *testing.T) {
-	buf := NewScopeBuffer(1)
+	buf := newscopeBuffer(1)
 	_, _, _ = buf.counterAdd("c", "existing", 1)
 
 	_, _, err := buf.counterAdd("c", "another", 1)
@@ -552,10 +552,10 @@ func strconvFormatInt(n int64) string {
 	return string(b)
 }
 
-// --- ScopeBuffer.deleteByID ---------------------------------------------------
+// --- scopeBuffer.deleteByID ---------------------------------------------------
 
 func TestDeleteByID_Hit(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 
@@ -572,7 +572,7 @@ func TestDeleteByID_Hit(t *testing.T) {
 }
 
 func TestDeleteByID_Miss(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	n, _ := buf.deleteByID("missing")
 	if n != 0 {
 		t.Fatalf("deleted=%d want 0", n)
@@ -580,7 +580,7 @@ func TestDeleteByID_Miss(t *testing.T) {
 }
 
 func TestDeleteByID_DoesNotRollbackLastSeq(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 
@@ -591,10 +591,10 @@ func TestDeleteByID_DoesNotRollbackLastSeq(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.deleteBySeq --------------------------------------------------
+// --- scopeBuffer.deleteBySeq --------------------------------------------------
 
 func TestDeleteBySeq_Hit(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	it2, _ := buf.appendItem(newItem("s", "b", nil))
 	_, _ = buf.appendItem(newItem("s", "c", nil))
@@ -615,7 +615,7 @@ func TestDeleteBySeq_Hit(t *testing.T) {
 }
 
 func TestDeleteBySeq_Miss(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 
 	if n, _ := buf.deleteBySeq(999); n != 0 {
@@ -627,7 +627,7 @@ func TestDeleteBySeq_Miss(t *testing.T) {
 }
 
 func TestDeleteBySeq_NoIDItem(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	it, _ := buf.appendItem(newItem("s", "", nil))
 
 	if n, _ := buf.deleteBySeq(it.Seq); n != 1 {
@@ -639,7 +639,7 @@ func TestDeleteBySeq_NoIDItem(t *testing.T) {
 }
 
 func TestDeleteBySeq_DoesNotRollbackLastSeq(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	it2, _ := buf.appendItem(newItem("s", "b", nil))
 
@@ -650,10 +650,10 @@ func TestDeleteBySeq_DoesNotRollbackLastSeq(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.deleteUpToSeq ---------------------------------------------
+// --- scopeBuffer.deleteUpToSeq ---------------------------------------------
 
 func TestDeleteUpToSeq_RemovesPrefix(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 1; i <= 5; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -676,7 +676,7 @@ func TestDeleteUpToSeq_RemovesPrefix(t *testing.T) {
 }
 
 func TestDeleteUpToSeq_RemovesIDsToo(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "a", nil))
 	_, _ = buf.appendItem(newItem("s", "b", nil))
 	_, _ = buf.appendItem(newItem("s", "c", nil))
@@ -695,7 +695,7 @@ func TestDeleteUpToSeq_RemovesIDsToo(t *testing.T) {
 }
 
 func TestDeleteUpToSeq_NoOpBelowRange(t *testing.T) {
-	buf := NewScopeBuffer(5)
+	buf := newscopeBuffer(5)
 	// Append 3 items, then delete through the prefix before seq 3's start.
 	// Nothing matches because no item has seq <= 0.
 	for i := 1; i <= 3; i++ {
@@ -715,7 +715,7 @@ func TestDeleteUpToSeq_NoOpBelowRange(t *testing.T) {
 }
 
 func TestDeleteUpToSeq_RemovesAllWhenMaxAtOrAboveLast(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 1; i <= 3; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -730,7 +730,7 @@ func TestDeleteUpToSeq_RemovesAllWhenMaxAtOrAboveLast(t *testing.T) {
 }
 
 func TestDeleteUpToSeq_DoesNotRollbackLastSeq(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 1; i <= 3; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -749,7 +749,7 @@ func TestDeleteUpToSeq_ReleasesBackingArray(t *testing.T) {
 	// — that is the guarantee that frees the removed-payload memory for
 	// GC in the write-buffer drain-from-front pattern.
 	const fill = 1000
-	buf := NewScopeBuffer(fill * 2)
+	buf := newscopeBuffer(fill * 2)
 	for i := 0; i < fill; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -771,10 +771,10 @@ func TestDeleteUpToSeq_ReleasesBackingArray(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.tailOffset ---------------------------------------------------
+// --- scopeBuffer.tailOffset ---------------------------------------------------
 
 func TestTailOffset_BasicAndEdges(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 1; i <= 5; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -803,10 +803,10 @@ func TestTailOffset_BasicAndEdges(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.sinceSeq -----------------------------------------------------
+// --- scopeBuffer.sinceSeq -----------------------------------------------------
 
 func TestSinceSeq_ReturnsItemsAfterCursor(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 1; i <= 5; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -821,7 +821,7 @@ func TestSinceSeq_ReturnsItemsAfterCursor(t *testing.T) {
 }
 
 func TestSinceSeq_RespectsLimit(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 1; i <= 5; i++ {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
@@ -833,7 +833,7 @@ func TestSinceSeq_RespectsLimit(t *testing.T) {
 }
 
 func TestSinceSeq_EmptyWhenPastEnd(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "", nil))
 
 	got, _ := buf.sinceSeq(100, 0)
@@ -842,10 +842,10 @@ func TestSinceSeq_EmptyWhenPastEnd(t *testing.T) {
 	}
 }
 
-// --- ScopeBuffer.getByID / getBySeq -------------------------------------------
+// --- scopeBuffer.getByID / getBySeq -------------------------------------------
 
 func TestGetByIDAndSeq(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	it, _ := buf.appendItem(newItem("s", "a", nil))
 
 	if got, ok := buf.getByID("a"); !ok || got.Seq != it.Seq {
@@ -870,7 +870,7 @@ func microsOnDay(day int64) int64 {
 }
 
 func TestRecordRead_KeepsReadsWithinWindow(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	// Read on day 1000 and day 1001 (both within the 7-day window).
 	buf.recordRead(microsOnDay(1000))
@@ -882,7 +882,7 @@ func TestRecordRead_KeepsReadsWithinWindow(t *testing.T) {
 }
 
 func TestRecordRead_ExpiresBucketsOutsideWindow(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	buf.recordRead(microsOnDay(1000))
 	buf.recordRead(microsOnDay(1001))
@@ -901,7 +901,7 @@ func TestRecordRead_ExpiresBucketsOutsideWindow(t *testing.T) {
 }
 
 func TestRecordRead_ReusesBucketSlotAcross7DayCycle(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	// Day 1000 lands in slot 1000%7 = 6.
 	buf.recordRead(microsOnDay(1000))
@@ -920,7 +920,7 @@ func TestRecordRead_ReusesBucketSlotAcross7DayCycle(t *testing.T) {
 // "warm" count via /stats and /delete_scope_candidates, biasing
 // eviction decisions against scopes that are actually cold.
 func TestStats_Last7DReadCount_ExpiresWithoutNewReads(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	// Three reads on day 1000 — cached field reads 3.
 	buf.recordRead(microsOnDay(1000))
@@ -949,7 +949,7 @@ func TestStats_Last7DReadCount_ExpiresWithoutNewReads(t *testing.T) {
 }
 
 func TestRecordRead_RollingWindowSum(t *testing.T) {
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 
 	// 2 reads on day 1000, 1 on day 1003, 3 on day 1006.
 	buf.recordRead(microsOnDay(1000))
@@ -975,7 +975,7 @@ func TestRecordRead_RollingWindowSum(t *testing.T) {
 // --- approxSizeBytes ----------------------------------------------------------
 
 func TestApproxSizeBytes_IgnoresReservedCapacity(t *testing.T) {
-	buf := NewScopeBuffer(10000)
+	buf := newscopeBuffer(10000)
 	size := buf.approxSizeBytes()
 
 	// Buggy code counted cap(items)*32 = 320KB for an empty scope.
@@ -985,7 +985,7 @@ func TestApproxSizeBytes_IgnoresReservedCapacity(t *testing.T) {
 }
 
 func TestApproxSizeBytes_GrowsWithItems(t *testing.T) {
-	buf := NewScopeBuffer(10000)
+	buf := newscopeBuffer(10000)
 	before := buf.approxSizeBytes()
 
 	_, _ = buf.appendItem(newItem("s", "a", map[string]interface{}{"text": "hello world"}))
@@ -1001,7 +1001,7 @@ func TestApproxSizeBytes_GrowsWithItems(t *testing.T) {
 // payload map is eligible for GC. The backing array still exists at full
 // capacity, so we reslice past the current length to peek at the vacated slot.
 func TestDeleteByID_ClearsBackingSlot(t *testing.T) {
-	buf := NewScopeBuffer(8)
+	buf := newscopeBuffer(8)
 
 	_, _ = buf.appendItem(newItem("s", "a", map[string]interface{}{"marker": "A"}))
 	_, _ = buf.appendItem(newItem("s", "b", map[string]interface{}{"marker": "B"}))

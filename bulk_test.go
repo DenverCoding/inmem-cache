@@ -230,7 +230,7 @@ func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 	}
 }
 
-// A ScopeBuffer pointer held before wipe must detach cleanly: further
+// A scopeBuffer pointer held before wipe must detach cleanly: further
 // writes on it must return *ScopeDetachedError rather than silently
 // succeeding into an orphan buffer no reader can reach. The store's byte
 // counter must also remain at zero.
@@ -255,7 +255,7 @@ func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
 	}
 }
 
-// /rebuild swaps the entire store map. Any stale ScopeBuffer pointer held
+// /rebuild swaps the entire store map. Any stale scopeBuffer pointer held
 // by an in-flight /append must be detached — otherwise reserveBytes on the
 // post-rebuild counter inflates totalBytes permanently, while the item
 // lands in an orphan buffer that no reader can reach. Mirrors the wipe and

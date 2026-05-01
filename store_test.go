@@ -687,7 +687,7 @@ func TestStore_EnsureScope_Concurrent(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	const N = 50
-	bufs := make([]*ScopeBuffer, N)
+	bufs := make([]*scopeBuffer, N)
 	var wg sync.WaitGroup
 	wg.Add(N)
 	for i := 0; i < N; i++ {

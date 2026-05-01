@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Single-item write paths on *ScopeBuffer:
+// Single-item write paths on *scopeBuffer:
 //
 //   - appendItem    — insert a fresh item; rejects on dup id, capacity, or byte cap
 //   - upsertByID    — insert-or-replace by id; replace-whole-item semantics on hit
@@ -32,7 +32,7 @@ import (
 // /inbox draining and for "last activity" stamping on counters under
 // burst load.
 
-func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
+func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -59,7 +59,7 @@ func (b *ScopeBuffer) appendItem(item Item) (Item, error) {
 // existence check and the mutation. Seq is preserved on replace (stable
 // cursor for consumers) and freshly assigned on create (matches /append).
 // Returns the final item and whether a new item was created.
-func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
+func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -119,7 +119,7 @@ func (b *ScopeBuffer) upsertByID(item Item) (Item, bool, error) {
 // updateByID mutates the item at (scope, id). Payload is always overwritten;
 // ts is refreshed to time.Now().UnixMicro() — every write that touches an
 // item refreshes ts to "when did the cache write this content."
-func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error) {
+func (b *scopeBuffer) updateByID(id string, payload json.RawMessage) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -157,7 +157,7 @@ func (b *ScopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 	return 1, nil
 }
 
-func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, error) {
+func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -220,7 +220,7 @@ func (b *ScopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 // scope state is untouched (no Seq increment, no b.items mutation, no
 // b.bytes increment), so the caller can return the error without
 // rolling anything back.
-func (b *ScopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) {
+func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) {
 	item.Ts = nowUs
 	item.renderBytes = precomputeRenderBytes(item.Payload)
 

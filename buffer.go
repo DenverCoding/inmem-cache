@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 )
 
-// Locking invariants for *ScopeBuffer
+// Locking invariants for *scopeBuffer
 // -----------------------------------
 //
 // 1. Lock-acquisition order is strictly TOP-DOWN:
@@ -13,10 +13,10 @@ import (
 //    Multi-shard ops additionally acquire shard.mu in ascending
 //    shard-index order (see numShards comment in store.go).
 //
-// 2. ScopeBuffer methods MUST NOT reach back up to acquire any
+// 2. scopeBuffer methods MUST NOT reach back up to acquire any
 //    Store-level lock — neither scopeShard.mu nor any future
 //    Store-side mutex — while holding b.mu. The only Store-state a
-//    ScopeBuffer method may touch with b.mu held is the atomic
+//    scopeBuffer method may touch with b.mu held is the atomic
 //    counter (b.store.totalBytes.Add / b.store.reserveBytes); those
 //    take no locks. Reverse-direction locking (buf → shard) would
 //    deadlock against deleteScope, replaceScopes, wipe, rebuildAll
@@ -29,10 +29,10 @@ import (
 //    without serialising on the heat counters. See recordRead's own
 //    comment in buffer_heat.go for the CAS state machine.
 //
-// Adding a new ScopeBuffer method that violates rule 2 is the most
+// Adding a new scopeBuffer method that violates rule 2 is the most
 // likely future deadlock — flag it in code review.
 //
-// File layout for ScopeBuffer methods:
+// File layout for scopeBuffer methods:
 //
 //   buffer.go          — struct + ctor + this invariant header
 //   buffer_locked.go   — cross-cutting helpers (precomputeRenderBytes,
@@ -44,8 +44,8 @@ import (
 //   buffer_delete.go   — deleteByID, deleteBySeq, deleteUpToSeq, deleteIndexLocked
 //   buffer_replace.go  — scopeReplacement type, build / commit pipeline, replaceAll
 //   buffer_read.go     — tailOffset, sinceSeq, getByID, getBySeq
-//   buffer_stats.go    — approxSizeBytes, ScopeStats type, stats()
-type ScopeBuffer struct {
+//   buffer_stats.go    — approxSizeBytes, scopeStats type, stats()
+type scopeBuffer struct {
 	mu sync.RWMutex
 	// store is set when the buffer is owned by a Store. When nil (orphan
 	// buffers used in unit tests) byte-budget accounting is skipped — the
@@ -65,7 +65,7 @@ type ScopeBuffer struct {
 	// bytes is the running sum of approxItemSize(item) over items. Only
 	// mutated under b.mu; the store-level total is kept in sync via
 	// Store.reserveBytes (single-item write paths) and
-	// ScopeBuffer.commitReplacement (bulk /warm and /rebuild).
+	// scopeBuffer.commitReplacement (bulk /warm and /rebuild).
 	bytes     int64
 	createdTS int64
 	// lastAccessTS, readCountTotal, last7DReadCount and the heat-bucket
@@ -87,7 +87,7 @@ type ScopeBuffer struct {
 	readHeatBuckets [ReadHeatWindowDays]ScopeReadHeatBucket
 }
 
-func NewScopeBuffer(maxItems int) *ScopeBuffer {
+func newscopeBuffer(maxItems int) *scopeBuffer {
 	// items, byID and bySeq all grow on-demand. Pre-allocating any of
 	// them on every scope-create is the wrong default: a unique-scope-
 	// per-write workload creates millions of buffers, most of which
@@ -97,7 +97,7 @@ func NewScopeBuffer(maxItems int) *ScopeBuffer {
 	//   - phase-4 finding "Sharded scopes map: pre-existing-scope
 	//     writes 2× faster, unique-scope writes barely" — traces the
 	//     items-slice pre-alloc that GC could not keep up with.
-	//   - the follow-up "Lazy maps in NewScopeBuffer" — extends the
+	//   - the follow-up "Lazy maps in newscopeBuffer" — extends the
 	//     same reasoning to byID and bySeq. Lazy bySeq saves the
 	//     create-time alloc on every scope; lazy byID skips the
 	//     allocation entirely on scopes whose items never carry an id.
@@ -106,7 +106,7 @@ func NewScopeBuffer(maxItems int) *ScopeBuffer {
 	// replaceItemAtIndexLocked helper lazily initialise these maps
 	// before assigning into them. Reads, deletes, len and range are
 	// nil-safe in Go and need no guard.
-	return &ScopeBuffer{
+	return &scopeBuffer{
 		maxItems:  maxItems,
 		createdTS: nowUnixMicro(),
 	}

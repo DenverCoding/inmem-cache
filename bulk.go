@@ -91,7 +91,7 @@ func (s *Store) wipe() (int, int, int64) {
 
 	freedBytes := s.totalBytes.Swap(0)
 	for i := range s.shards {
-		s.shards[i].scopes = make(map[string]*ScopeBuffer)
+		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
 
 	return scopeCount, totalItems, freedBytes
@@ -206,7 +206,7 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		sh := s.shardFor(p.scope)
 		buf, ok := sh.scopes[p.scope]
 		if !ok {
-			buf = s.newScopeBuffer()
+			buf = s.newscopeBuffer()
 			sh.scopes[p.scope] = buf
 		}
 		buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
@@ -221,9 +221,9 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// fails validation the existing store is left fully intact. Capacity
 	// offenders are collected across the whole batch; any offender aborts
 	// the rebuild.
-	var newShardMaps [numShards]map[string]*ScopeBuffer
+	var newShardMaps [numShards]map[string]*scopeBuffer
 	for i := range newShardMaps {
-		newShardMaps[i] = make(map[string]*ScopeBuffer)
+		newShardMaps[i] = make(map[string]*scopeBuffer)
 	}
 	totalItems := 0
 	totalScopes := 0
@@ -246,7 +246,7 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		// buf is not yet shared; bypass commitReplacement (which would try
 		// to adjust the store counter) and initialize state directly. The
 		// store counter is reset in phase 2 once the new maps are swapped.
-		buf := s.newScopeBuffer()
+		buf := s.newscopeBuffer()
 		buf.items = r.items
 		buf.byID = r.byID
 		buf.bySeq = r.bySeq
@@ -281,7 +281,7 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// pointer obtained via getOrCreateScope would run AFTER the swap and
 	// call reserveBytes against the freshly reset counter, permanently
 	// inflating totalBytes (its item lands in an unreachable orphan
-	// buffer). Mirrors wipe and /delete_scope; see ScopeBuffer.detached.
+	// buffer). Mirrors wipe and /delete_scope; see scopeBuffer.detached.
 	s.lockAllShards()
 	defer s.unlockAllShards()
 	for i := range s.shards {

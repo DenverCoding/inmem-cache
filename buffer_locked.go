@@ -6,7 +6,7 @@ import (
 	"sort"
 )
 
-// Cross-cutting helpers shared by ScopeBuffer's mutation paths. The
+// Cross-cutting helpers shared by scopeBuffer's mutation paths. The
 // `*Locked` suffix on three of them signals: caller MUST hold b.mu.
 // Calling them without the lock is a race; calling them WITH the lock
 // then re-acquiring is a deadlock — they do not lock themselves. The
@@ -50,7 +50,7 @@ func precomputeRenderBytes(payload json.RawMessage) []byte {
 // delta != 0) guard: forgetting either condition produces a nil-
 // pointer crash on orphan buffers (used in tests) or a CAS for a
 // zero delta (cheap but pointless).
-func (b *ScopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, error) {
+func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, error) {
 	delta := int64(newSize) - int64(oldSize)
 	if b.store != nil && delta != 0 {
 		ok, current, max := b.store.reserveBytes(delta)
@@ -87,7 +87,7 @@ func (b *ScopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, er
 // caller must precompute it to derive `delta`, then pass both. This
 // keeps the cap accounting honest on string-payload updates whose
 // decoded form changes length.
-func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts int64, renderBytes []byte, delta int64) {
+func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts int64, renderBytes []byte, delta int64) {
 	b.items[i].Payload = payload
 	b.items[i].Ts = ts
 	b.items[i].renderBytes = renderBytes
@@ -110,7 +110,7 @@ func (b *ScopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 // mutation. Caller must hold b.mu (read or write — both are fine,
 // callers have a write lock in practice because every user is about to
 // mutate b.items[i]).
-func (b *ScopeBuffer) indexBySeqLocked(seq uint64) (int, bool) {
+func (b *scopeBuffer) indexBySeqLocked(seq uint64) (int, bool) {
 	i := sort.Search(len(b.items), func(i int) bool {
 		return b.items[i].Seq >= seq
 	})

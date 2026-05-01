@@ -2,7 +2,7 @@ package scopecache
 
 import "sort"
 
-// Delete paths on *ScopeBuffer:
+// Delete paths on *scopeBuffer:
 //
 //   - deleteByID     — single-item delete by id
 //   - deleteBySeq    — single-item delete by seq
@@ -36,7 +36,7 @@ import "sort"
 //  3. Conditional byID delete. Forgetting the `if removed.ID != ""`
 //     guard would `delete(map, "")` which is a no-op but signals the
 //     reader didn't think about empty-id items.
-func (b *ScopeBuffer) deleteIndexLocked(i int) {
+func (b *scopeBuffer) deleteIndexLocked(i int) {
 	removed := b.items[i]
 	removedSize := approxItemSize(removed)
 
@@ -59,7 +59,7 @@ func (b *ScopeBuffer) deleteIndexLocked(i int) {
 	}
 }
 
-func (b *ScopeBuffer) deleteByID(id string) (int, error) {
+func (b *scopeBuffer) deleteByID(id string) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -81,7 +81,7 @@ func (b *ScopeBuffer) deleteByID(id string) (int, error) {
 	return 1, nil
 }
 
-func (b *ScopeBuffer) deleteBySeq(seq uint64) (int, error) {
+func (b *scopeBuffer) deleteBySeq(seq uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -108,7 +108,7 @@ func (b *ScopeBuffer) deleteBySeq(seq uint64) (int, error) {
 // Returns the number of items removed and any *ScopeDetachedError if the
 // buffer was orphaned by /delete_scope, /wipe, or /rebuild before the
 // caller's mutation could land.
-func (b *ScopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
+func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

@@ -242,7 +242,7 @@ func TestStress_RecordRead_NoLast7DDriftAcrossRollover(t *testing.T) {
 	// so the today-bucket on day 1007 starts populated with stale day-1000
 	// reads, forcing every concurrent caller to race through Phase 1's
 	// drain on the same slot.
-	buf := NewScopeBuffer(10)
+	buf := newscopeBuffer(10)
 	for i := 0; i < staleCount; i++ {
 		buf.recordRead(microsOnDay(1000))
 	}

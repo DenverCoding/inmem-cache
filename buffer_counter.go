@@ -29,7 +29,7 @@ import (
 //   - *CounterOverflowError → result would exceed ±MaxCounterValue
 //
 // The caller must have already rejected by==0 and by outside ±MaxCounterValue.
-func (b *ScopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error) {
+func (b *scopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

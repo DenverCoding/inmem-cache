@@ -32,7 +32,7 @@ import (
 // TestStore_ReplaceScopes_RaceVsRebuild repeatedly under stress.
 
 // scopeReplacement holds a fully built scope state ready to be atomically
-// swapped into a ScopeBuffer. Separating "prepare" from "commit" lets callers
+// swapped into a scopeBuffer. Separating "prepare" from "commit" lets callers
 // like /warm and /rebuild validate every scope up-front and only mutate state
 // once they know all scopes will succeed.
 type scopeReplacement struct {
@@ -126,7 +126,7 @@ func sumItemBytes(items []Item) int64 {
 // The caller must have already validated and built the replacement via
 // buildReplacementState — commitReplacement cannot fail, which is what lets
 // multi-scope /warm behave atomically.
-func (b *ScopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
+func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -159,7 +159,7 @@ func (b *ScopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 //     is positive, compensating for the extra release so the scope's net
 //     contribution to totalBytes is exactly (newBytes - oldSnapshot).
 //   - No concurrent activity: drift = 0, no counter adjustment.
-func (b *ScopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes int64, oldSnapshot int64) {
+func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes int64, oldSnapshot int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -176,7 +176,7 @@ func (b *ScopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	b.lastSeq = r.lastSeq
 }
 
-func (b *ScopeBuffer) replaceAll(items []Item) ([]Item, error) {
+func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
 	if len(items) > b.maxItems {
 		return nil, &ScopeFullError{Count: len(items), Cap: b.maxItems}
 	}
