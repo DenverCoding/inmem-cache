@@ -182,23 +182,7 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, ok := api.store.getScope(item.Scope)
-	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"updated_count", 0},
-		}, started)
-		return
-	}
-
-	var updated int
-	var err error
-	if item.ID != "" {
-		updated, err = buf.updateByID(item.ID, item.Payload)
-	} else {
-		updated, err = buf.updateBySeq(item.Seq, item.Payload)
-	}
+	updated, err := api.store.updateOne(item)
 	if err != nil {
 		// /update only ever sees *StoreFullError on the cap path
 		// (existing-item replace can grow byte size); scopeForSFE is

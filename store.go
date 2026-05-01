@@ -355,6 +355,47 @@ func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	return value, counterCreated, addErr
 }
 
+// updateOne mutates the payload of an item addressed by scope+id or
+// scope+seq. Returns (updated_count, err); a missing scope is reported
+// as (0, nil), the same wire shape an absent id/seq inside an existing
+// scope would produce. The caller-side validator enforces the
+// id-xor-seq invariant; updateOne assumes id != "" picks the id path
+// and otherwise routes by seq.
+func (s *Store) updateOne(item Item) (int, error) {
+	buf, ok := s.getScope(item.Scope)
+	if !ok {
+		return 0, nil
+	}
+	if item.ID != "" {
+		return buf.updateByID(item.ID, item.Payload)
+	}
+	return buf.updateBySeq(item.Seq, item.Payload)
+}
+
+// deleteOne removes a single item by scope+id or scope+seq. Returns
+// (deleted_count, err); missing scope reports (0, nil) — same miss
+// shape as updateOne. Validator-enforced id-xor-seq invariant.
+func (s *Store) deleteOne(scope, id string, seq uint64) (int, error) {
+	buf, ok := s.getScope(scope)
+	if !ok {
+		return 0, nil
+	}
+	if id != "" {
+		return buf.deleteByID(id)
+	}
+	return buf.deleteBySeq(seq)
+}
+
+// deleteUpTo removes every item in the scope with seq <= maxSeq.
+// Returns (deleted_count, err); missing scope reports (0, nil).
+func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
+	buf, ok := s.getScope(scope)
+	if !ok {
+		return 0, nil
+	}
+	return buf.deleteUpToSeq(maxSeq)
+}
+
 // ensureScope returns the named scope, creating an empty buffer if it
 // does not yet exist. Used by API-layer features that lazily provision
 // cache-owned infrastructure scopes (e.g. observability counters)

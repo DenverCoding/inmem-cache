@@ -239,6 +239,46 @@ func TestStore_GetScope_Miss(t *testing.T) {
 	}
 }
 
+// updateOne, deleteOne, deleteUpTo all share a "missing scope = (0, nil)"
+// contract that handlers translate into hit:false / count:0 wire shape.
+// Pin it explicitly so a future refactor cannot quietly change miss
+// semantics to (0, ScopeNotFoundError) — handlers would then surface 409
+// for what should be a 200 miss response.
+
+func TestStore_updateOne_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	item := Item{Scope: "nope", ID: "x", Payload: json.RawMessage(`"v"`)}
+	n, err := s.updateOne(item)
+	if err != nil {
+		t.Fatalf("err=%v; want nil", err)
+	}
+	if n != 0 {
+		t.Errorf("updated=%d; want 0", n)
+	}
+}
+
+func TestStore_deleteOne_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	n, err := s.deleteOne("nope", "x", 0)
+	if err != nil {
+		t.Fatalf("err=%v; want nil", err)
+	}
+	if n != 0 {
+		t.Errorf("deleted=%d; want 0", n)
+	}
+}
+
+func TestStore_deleteUpTo_MissingScope(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	n, err := s.deleteUpTo("nope", 100)
+	if err != nil {
+		t.Fatalf("err=%v; want nil", err)
+	}
+	if n != 0 {
+		t.Errorf("deleted=%d; want 0", n)
+	}
+}
+
 // appendOne, upsertOne, counterAddOne must roll back the freshly-created
 // scope when the item-byte reservation fails. Without rollback, every
 // failed write to a new scope would leak scopeBufferOverhead onto the

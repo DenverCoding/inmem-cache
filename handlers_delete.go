@@ -39,26 +39,10 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, ok := api.store.getScope(req.Scope)
-	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"deleted_count", 0},
-		}, started)
-		return
-	}
-
-	var deleted int
-	var err error
-	if req.ID != "" {
-		deleted, err = buf.deleteByID(req.ID)
-	} else {
-		deleted, err = buf.deleteBySeq(req.Seq)
-	}
+	deleted, err := api.store.deleteOne(req.Scope, req.ID, req.Seq)
 	if err != nil {
 		// *ScopeDetachedError: the scope was wiped/deleted/rebuilt
-		// between getScope and the mutation. Surface as 409 — same
+		// between the lookup and the mutation. Surface as 409 — same
 		// stance as /append, /upsert, /update, /counter_add. A retry
 		// will see the new state (possibly miss, possibly a fresh
 		// scope with no such id).
@@ -95,17 +79,7 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf, ok := api.store.getScope(req.Scope)
-	if !ok {
-		writeJSONWithDuration(w, http.StatusOK, orderedFields{
-			{"ok", true},
-			{"hit", false},
-			{"deleted_count", 0},
-		}, started)
-		return
-	}
-
-	deleted, err := buf.deleteUpToSeq(req.MaxSeq)
+	deleted, err := api.store.deleteUpTo(req.Scope, req.MaxSeq)
 	if err != nil {
 		// Same orphan-detect rationale as handleDelete above.
 		conflict(w, started, err.Error())
