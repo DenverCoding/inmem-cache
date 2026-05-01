@@ -239,7 +239,7 @@ func TestStore_GetScope_Miss(t *testing.T) {
 	}
 }
 
-// AppendOne, UpsertOne, CounterAddOne must roll back the freshly-created
+// appendOne, upsertOne, counterAddOne must roll back the freshly-created
 // scope when the item-byte reservation fails. Without rollback, every
 // failed write to a new scope would leak scopeBufferOverhead onto the
 // store-byte cap — a multi-tenant attacker could fill the cap with
@@ -258,79 +258,79 @@ func bigPayload(n int) json.RawMessage {
 	return json.RawMessage(buf)
 }
 
-func TestStore_AppendOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
-	// Cap = overhead + 50 bytes. AppendOne reserves overhead first,
+func TestStore_appendOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
+	// Cap = overhead + 50 bytes. appendOne reserves overhead first,
 	// then the item-bytes reservation overflows — scope must be
 	// rolled back so the overhead is released.
 	capBytes := int64(scopeBufferOverhead) + 50
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	bigItem := Item{Scope: "victim", ID: "x", Payload: bigPayload(200)}
-	_, err := s.AppendOne(bigItem)
+	_, err := s.appendOne(bigItem)
 	var stfe *StoreFullError
 	if !errors.As(err, &stfe) {
 		t.Fatalf("expected StoreFullError, got %T: %v", err, err)
 	}
 
 	if got := s.totalBytes.Load(); got != 0 {
-		t.Errorf("totalBytes=%d after rolled-back AppendOne; want 0", got)
+		t.Errorf("totalBytes=%d after rolled-back appendOne; want 0", got)
 	}
 	if _, ok := s.getScope("victim"); ok {
 		t.Errorf("scope 'victim' still present in s.scopes after rollback")
 	}
 }
 
-func TestStore_UpsertOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
+func TestStore_upsertOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 	capBytes := int64(scopeBufferOverhead) + 50
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	bigItem := Item{Scope: "victim", ID: "x", Payload: bigPayload(200)}
-	_, _, err := s.UpsertOne(bigItem)
+	_, _, err := s.upsertOne(bigItem)
 	var stfe *StoreFullError
 	if !errors.As(err, &stfe) {
 		t.Fatalf("expected StoreFullError, got %T: %v", err, err)
 	}
 
 	if got := s.totalBytes.Load(); got != 0 {
-		t.Errorf("totalBytes=%d after rolled-back UpsertOne; want 0", got)
+		t.Errorf("totalBytes=%d after rolled-back upsertOne; want 0", got)
 	}
 	if _, ok := s.getScope("victim"); ok {
 		t.Errorf("scope 'victim' still present in s.scopes after rollback")
 	}
 }
 
-func TestStore_CounterAddOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
+func TestStore_counterAddOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 	// Cap = overhead + 1 byte. Even the smallest counter payload
 	// (a one-digit integer) overflows on the item-bytes reservation
 	// after the per-scope overhead has been claimed.
 	capBytes := int64(scopeBufferOverhead) + 1
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
-	_, _, err := s.CounterAddOne("victim", "c1", 42)
+	_, _, err := s.counterAddOne("victim", "c1", 42)
 	var stfe *StoreFullError
 	if !errors.As(err, &stfe) {
 		t.Fatalf("expected StoreFullError, got %T: %v", err, err)
 	}
 
 	if got := s.totalBytes.Load(); got != 0 {
-		t.Errorf("totalBytes=%d after rolled-back CounterAddOne; want 0", got)
+		t.Errorf("totalBytes=%d after rolled-back counterAddOne; want 0", got)
 	}
 	if _, ok := s.getScope("victim"); ok {
 		t.Errorf("scope 'victim' still present in s.scopes after rollback")
 	}
 }
 
-// AppendOne loop with new scope names + oversized items must not leak
+// appendOne loop with new scope names + oversized items must not leak
 // per-scope overhead. Without the rollback this is the multi-tenant
 // DoS path: ~100k requests fill the default 100 MiB cap with empty
 // scopes, after which all legitimate writes 507.
-func TestStore_AppendOne_DoSPathStaysClean(t *testing.T) {
+func TestStore_appendOne_DoSPathStaysClean(t *testing.T) {
 	capBytes := int64(scopeBufferOverhead) + 50
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	for i := 0; i < 1000; i++ {
 		item := Item{Scope: fmt.Sprintf("attempt_%d", i), ID: "x", Payload: bigPayload(200)}
-		_, err := s.AppendOne(item)
+		_, err := s.appendOne(item)
 		var stfe *StoreFullError
 		if !errors.As(err, &stfe) {
 			t.Fatalf("iter %d: expected StoreFullError, got %T: %v", i, err, err)
@@ -344,21 +344,21 @@ func TestStore_AppendOne_DoSPathStaysClean(t *testing.T) {
 		s.shards[shIdx].mu.RUnlock()
 	}
 	if scopeCount != 0 {
-		t.Errorf("after 1000 failed AppendOne calls, %d empty scopes leaked", scopeCount)
+		t.Errorf("after 1000 failed appendOne calls, %d empty scopes leaked", scopeCount)
 	}
 	if got := s.totalBytes.Load(); got != 0 {
-		t.Errorf("totalBytes=%d after 1000 rolled-back AppendOne calls; want 0", got)
+		t.Errorf("totalBytes=%d after 1000 rolled-back appendOne calls; want 0", got)
 	}
 }
 
-// AppendOne must NOT roll back the scope when a concurrent caller has
+// appendOne must NOT roll back the scope when a concurrent caller has
 // successfully committed an item to the same scope between our create
 // and our cleanup. The cleanup helper checks len(buf.items)==0 under
 // buf.mu, so a successful concurrent write keeps the scope alive.
 //
 // Race-detector-friendly: pairs of goroutines per scope — one tries an
 // oversized write, the other a small write. No empty scopes may leak.
-func TestStore_AppendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
+func TestStore_appendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 	const N = 50
 	// Cap room for N small items + their scope overheads, plus slack
 	// for the oversized writers' interleaving overhead-reservations.
@@ -372,12 +372,12 @@ func TestStore_AppendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 		go func(scope string) {
 			defer wg.Done()
 			big := Item{Scope: scope, ID: "big", Payload: bigPayload(int(capBytes))}
-			_, _ = s.AppendOne(big)
+			_, _ = s.appendOne(big)
 		}(scope)
 		go func(scope string) {
 			defer wg.Done()
 			small := Item{Scope: scope, ID: "small", Payload: json.RawMessage(`"hi"`)}
-			_, _ = s.AppendOne(small)
+			_, _ = s.appendOne(small)
 		}(scope)
 	}
 	wg.Wait()
@@ -396,7 +396,7 @@ func TestStore_AppendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 	}
 }
 
-// TestStore_AppendOne_DetachRaceErrorContract pins the error contract for
+// TestStore_appendOne_DetachRaceErrorContract pins the error contract for
 // the race between a failed create+rollback and a concurrent fast-path
 // writer on the same scope. cleanupIfEmptyAndUnused detaches the buffer
 // it created when its caller's item-reservation failed; a writer that
@@ -423,7 +423,7 @@ func TestStore_AppendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 // stealthily closes the race window: without exercising Case 2 the test
 // is silently meaningless. 5000 iterations matches the cadence of the
 // other race-window tests in bulk_test.go.
-func TestStore_AppendOne_DetachRaceErrorContract(t *testing.T) {
+func TestStore_appendOne_DetachRaceErrorContract(t *testing.T) {
 	const iterations = 5000
 	capBytes := int64(scopeBufferOverhead) + 1000
 
@@ -440,14 +440,14 @@ func TestStore_AppendOne_DetachRaceErrorContract(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			big := Item{Scope: "shared", ID: "big", Payload: bigPayload(2000)}
-			_, _ = s.AppendOne(big)
+			_, _ = s.appendOne(big)
 		}()
 
 		// B: small — must observe either nil (Case 1) or *ScopeDetachedError (Case 2).
 		go func() {
 			defer wg.Done()
 			small := Item{Scope: "shared", ID: "small", Payload: json.RawMessage(`"hi"`)}
-			_, bErr = s.AppendOne(small)
+			_, bErr = s.appendOne(small)
 		}()
 		wg.Wait()
 

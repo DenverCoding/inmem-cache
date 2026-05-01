@@ -155,8 +155,8 @@ func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		scope := "u:" + strconv.Itoa(i)
-		if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
-			b.Fatalf("AppendOne: %v", err)
+		if _, err := store.appendOne(Item{Scope: scope, Payload: payload}); err != nil {
+			b.Fatalf("appendOne: %v", err)
 		}
 	}
 }
@@ -192,8 +192,8 @@ func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
 		for pb.Next() {
 			n := counter.Add(1)
 			scope := "u:" + strconv.FormatUint(n, 10)
-			if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
-				b.Fatalf("AppendOne: %v", err)
+			if _, err := store.appendOne(Item{Scope: scope, Payload: payload}); err != nil {
+				b.Fatalf("appendOne: %v", err)
 			}
 		}
 	})
@@ -469,8 +469,8 @@ func BenchmarkStore_Append1Scope_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if _, err := store.AppendOne(Item{Scope: "shared", Payload: payload}); err != nil {
-				b.Fatalf("AppendOne: %v", err)
+			if _, err := store.appendOne(Item{Scope: "shared", Payload: payload}); err != nil {
+				b.Fatalf("appendOne: %v", err)
 			}
 		}
 	})
@@ -513,8 +513,8 @@ func BenchmarkStore_Append32Scopes_Parallel(b *testing.B) {
 		for pb.Next() {
 			i := counter.Add(1) - 1
 			scope := scopes[i%numScopes]
-			if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
-				b.Fatalf("AppendOne: %v", err)
+			if _, err := store.appendOne(Item{Scope: scope, Payload: payload}); err != nil {
+				b.Fatalf("appendOne: %v", err)
 			}
 		}
 	})
@@ -548,7 +548,7 @@ func BenchmarkStore_AppendNearCap_Parallel(b *testing.B) {
 		MaxStoreBytes: capBytes,
 		MaxItemBytes:  1 << 20,
 	})
-	if _, err := store.AppendOne(Item{Scope: "victim", ID: "anchor", Payload: json.RawMessage(`1`)}); err != nil {
+	if _, err := store.appendOne(Item{Scope: "victim", ID: "anchor", Payload: json.RawMessage(`1`)}); err != nil {
 		b.Fatalf("anchor: %v", err)
 	}
 	payload := json.RawMessage(`{"data":"benchmark"}`)
@@ -561,7 +561,7 @@ func BenchmarkStore_AppendNearCap_Parallel(b *testing.B) {
 			// Expected: every call returns *StoreFullError. We don't
 			// inspect the error type here — the benchmark cost IS the
 			// rejection-path cost.
-			_, _ = store.AppendOne(Item{Scope: "victim", Payload: payload})
+			_, _ = store.appendOne(Item{Scope: "victim", Payload: payload})
 		}
 	})
 }

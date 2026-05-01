@@ -15,7 +15,7 @@ import (
 //
 // All four decode an Item body, run shape validation, reject reserved
 // scope prefixes for non-admin callers, route through the matching
-// Store atomic write-path (AppendOne / UpsertOne / CounterAddOne or
+// Store atomic write-path (appendOne / upsertOne / counterAddOne or
 // buf.update*), and map *ScopeFullError / *ScopeCapacityError /
 // *StoreFullError uniformly via writeStoreCapacityError.
 
@@ -42,7 +42,7 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origScope := item.Scope
-	item, err := api.store.AppendOne(item)
+	item, err := api.store.appendOne(item)
 	if err != nil {
 		if writeStoreCapacityError(w, started, err, origScope) {
 			return
@@ -84,7 +84,7 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origScope := item.Scope
-	result, created, err := api.store.UpsertOne(item)
+	result, created, err := api.store.upsertOne(item)
 	if err != nil {
 		if writeStoreCapacityError(w, started, err, origScope) {
 			return
@@ -129,7 +129,7 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origScope := req.Scope
-	value, created, err := api.store.CounterAddOne(req.Scope, req.ID, by)
+	value, created, err := api.store.counterAddOne(req.Scope, req.ID, by)
 	if err != nil {
 		// Common capacity-class errors first (sfe + stfe). Counter-
 		// specific errors (cpe → 409, coe → 400) are handled inline

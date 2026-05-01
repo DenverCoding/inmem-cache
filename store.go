@@ -212,7 +212,7 @@ func (s *Store) getOrCreateScope(scope string) (*ScopeBuffer, error) {
 }
 
 // getOrCreateScopeTrackingCreated is the variant used by the atomic
-// write paths (AppendOne, UpsertOne, CounterAddOne) that need to know
+// write paths (appendOne, upsertOne, counterAddOne) that need to know
 // whether the buffer was freshly allocated by this call. Callers use
 // the `created` flag to roll the empty scope back when the subsequent
 // item-byte reservation fails — see cleanupIfEmptyAndUnused. All other
@@ -308,12 +308,12 @@ func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *ScopeBuffer) {
 	buf.store = nil
 }
 
-// AppendOne is the atomic /append write-path. It creates the target
+// appendOne is the atomic /append write-path. It creates the target
 // scope on demand, reserves item bytes, commits the item, and rolls
 // back the empty scope on item-reservation failure so a 507 cannot
 // leak per-scope overhead onto the store-byte cap. See
 // cleanupIfEmptyAndUnused for the rollback semantics.
-func (s *Store) AppendOne(item Item) (Item, error) {
+func (s *Store) appendOne(item Item) (Item, error) {
 	buf, created, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
 		return Item{}, err
@@ -325,10 +325,10 @@ func (s *Store) AppendOne(item Item) (Item, error) {
 	return result, appendErr
 }
 
-// UpsertOne is the atomic /upsert write-path; same rollback contract
-// as AppendOne. Returns (item, created, err) where created reflects
+// upsertOne is the atomic /upsert write-path; same rollback contract
+// as appendOne. Returns (item, created, err) where created reflects
 // the upsert outcome, not the scope-creation outcome.
-func (s *Store) UpsertOne(item Item) (Item, bool, error) {
+func (s *Store) upsertOne(item Item) (Item, bool, error) {
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
 		return Item{}, false, err
@@ -340,10 +340,10 @@ func (s *Store) UpsertOne(item Item) (Item, bool, error) {
 	return result, itemCreated, upsertErr
 }
 
-// CounterAddOne is the atomic /counter_add write-path; same rollback
-// contract as AppendOne. Returns (value, created, err) where created
+// counterAddOne is the atomic /counter_add write-path; same rollback
+// contract as appendOne. Returns (value, created, err) where created
 // reflects the counter outcome, not the scope-creation outcome.
-func (s *Store) CounterAddOne(scope, id string, by int64) (int64, bool, error) {
+func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
 	if err != nil {
 		return 0, false, err

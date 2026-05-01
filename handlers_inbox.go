@@ -139,7 +139,7 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 		Scope:   req.Scope,
 		ID:      autoID,
 		Payload: req.Payload,
-		// Ts is left at its zero value here; AppendOne stamps it to
+		// Ts is left at its zero value here; appendOne stamps it to
 		// time.Now().UnixMicro() under the scope write-lock — same
 		// rule as every other write path.
 	}
@@ -154,10 +154,10 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reach the scope buffer directly. Inbox scopes commonly start
-	// with `_` (operator's choice) — going through AppendOne bypasses
+	// with `_` (operator's choice) — going through appendOne bypasses
 	// the public reserved-prefix check, which is the right semantic:
 	// /inbox is operator-opted-in for these specific scope names.
-	stored, err := api.store.AppendOne(item)
+	stored, err := api.store.appendOne(item)
 	if err != nil {
 		if writeStoreCapacityError(w, started, err, req.Scope) {
 			return
