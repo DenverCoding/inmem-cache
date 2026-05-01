@@ -89,7 +89,7 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Scope must be in the operator's inbox-scope allowlist.
-	if !api.store.isInboxScope(req.Scope) {
+	if !api.isInboxScope(req.Scope) {
 		badRequest(w, started, "scope is not configured as an inbox scope")
 		return
 	}
@@ -107,16 +107,16 @@ func (api *API) handleInbox(w http.ResponseWriter, r *http.Request) {
 	// real issue is request size, not auth — same pattern as
 	// /guarded's pre-flight response-cap check). Default 64 KiB;
 	// override via SCOPECACHE_MAX_INBOX_KB.
-	if int64(len(req.Payload)) > api.store.maxInboxBytes {
+	if int64(len(req.Payload)) > api.maxInboxBytes {
 		badRequest(w, started, fmt.Sprintf(
 			"the 'payload' field (%d bytes) exceeds the /inbox cap of %d bytes",
-			len(req.Payload), api.store.maxInboxBytes,
+			len(req.Payload), api.maxInboxBytes,
 		))
 		return
 	}
 
 	// Auth-gate: same _tokens lookup as /guarded.
-	capabilityID := computeCapabilityID(api.store.serverSecret, req.Token)
+	capabilityID := computeCapabilityID(api.serverSecret, req.Token)
 	if !api.tenantIsProvisioned(capabilityID) {
 		badRequest(w, started, "tenant_not_provisioned")
 		return

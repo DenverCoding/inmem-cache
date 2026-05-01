@@ -73,7 +73,7 @@ func (api *API) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Pre-build subURLs and bodies before any side effect can land.
-	// See prepareSubCalls in multi_call.go for the rationale.
+	// See prepareSubCalls in handlers_multi_call.go for the rationale.
 	prepared, err := prepareSubCalls(calls, api.adminCallSpecs)
 	if err != nil {
 		badRequest(w, started, err.Error())

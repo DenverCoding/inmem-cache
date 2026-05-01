@@ -419,15 +419,15 @@ func TestGuarded_RejectsQueryScopeOnPostSubcall(t *testing.T) {
 // Runs before the token check so an undersized cap surfaces directly,
 // not as a misleading 401.
 func TestGuarded_TinyResponseCapRejectedPreflight(t *testing.T) {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  200,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		ServerSecret:      "test-secret",
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  200,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			ServerSecret:      "test-secret",
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -764,15 +764,15 @@ func TestGuarded_TenantIsolation(t *testing.T) {
 // --- /guarded disabled when SERVER_SECRET unset -------------------------------
 
 func TestGuarded_NotRegisteredWithoutSecret(t *testing.T) {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		// ServerSecret deliberately empty.
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			// ServerSecret deliberately empty.
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

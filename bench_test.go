@@ -19,7 +19,7 @@ func benchStore(b *testing.B, numScopes, itemsPerScope, payloadBytes int) (*Stor
 	b.Helper()
 
 	// Cap tall enough for the dataset: 1 GiB store, 1M items per scope.
-	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20, MaxResponseBytes: 1 << 30, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10})
+	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20})
 
 	payloadFiller := make([]byte, payloadBytes)
 	for i := range payloadFiller {
@@ -143,12 +143,9 @@ func BenchmarkStore_Append(b *testing.B) {
 // totalBytes, *ScopeBuffer alloc + map header alloc, and fmt formatting.
 func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
 	store := NewStore(Config{
-		ScopeMaxItems:     50_000,    // matches phase4 Caddyfile setting
-		MaxStoreBytes:     128 << 30, // 128 GiB; b.N is open-ended so don't risk a 507 mid-bench
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  1 << 30,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
+		ScopeMaxItems: 50_000,    // matches phase4 Caddyfile setting
+		MaxStoreBytes: 128 << 30, // 128 GiB; b.N is open-ended so don't risk a 507 mid-bench
+		MaxItemBytes:  1 << 20,
 	})
 
 	payload := json.RawMessage(`{"data":"benchmark"}`)
@@ -180,12 +177,9 @@ func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
 //	go tool pprof -top -alloc_space mem.prof
 func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
 	store := NewStore(Config{
-		ScopeMaxItems:     1_000_000,
-		MaxStoreBytes:     8 << 30,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  1 << 30,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
+		ScopeMaxItems: 1_000_000,
+		MaxStoreBytes: 8 << 30,
+		MaxItemBytes:  1 << 20,
 	})
 
 	payload := json.RawMessage(`{"data":"benchmark"}`)
@@ -214,10 +208,9 @@ func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
 // bench is the cleaner read of the per-call cache-side savings.
 func BenchmarkStore_RenderStringPayload_Parallel(b *testing.B) {
 	store := NewStore(Config{
-		ScopeMaxItems:    100_000,
-		MaxStoreBytes:    1 << 30,
-		MaxItemBytes:     1 << 20,
-		MaxResponseBytes: 1 << 30,
+		ScopeMaxItems: 100_000,
+		MaxStoreBytes: 1 << 30,
+		MaxItemBytes:  1 << 20,
 	})
 	const scope = "html"
 	buf, err := store.getOrCreateScope(scope)
@@ -266,10 +259,9 @@ func BenchmarkStore_RenderStringPayload_Parallel(b *testing.B) {
 // hot-loop on a handful of scopes with many items see this directly.
 func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
 	store := NewStore(Config{
-		ScopeMaxItems:    100_000,
-		MaxStoreBytes:    1 << 30,
-		MaxItemBytes:     1 << 20,
-		MaxResponseBytes: 1 << 30,
+		ScopeMaxItems: 100_000,
+		MaxStoreBytes: 1 << 30,
+		MaxItemBytes:  1 << 20,
 	})
 	const scope = "counters"
 	buf, err := store.getOrCreateScope(scope)
@@ -305,7 +297,7 @@ func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
 func benchTsScope(b *testing.B, n int) *ScopeBuffer {
 	b.Helper()
 
-	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20, MaxResponseBytes: 1 << 30, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10})
+	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20})
 	buf, err := store.getOrCreateScope("bench_ts")
 	if err != nil {
 		b.Fatalf("getOrCreateScope: %v", err)
@@ -431,7 +423,7 @@ func BenchmarkStore_GetByID_Parallel_WithRecordRead(b *testing.B) {
 
 // BenchmarkStore_GetByID_Parallel_HeatDisabled is the equivalent of
 // _WithRecordRead but with the path that handlers take when
-// Config.DisableReadHeat is true: skip recordRead entirely (and the
+// APIConfig.DisableReadHeat is true: skip recordRead entirely (and the
 // time.Now() that feeds it). Mimics what /get and /render do at runtime
 // in heat-off mode. Compare to _WithRecordRead to see the per-op
 // savings on the read-hot path when heat tracking is off.
@@ -516,6 +508,145 @@ func BenchmarkStore_TsRange_Parallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			_, _ = buf.tsRange(&since, &until, 10)
+		}
+	})
+}
+
+// --- Post-sharding write-path contention probes -------------------------------
+//
+// After sharding the scopes map, the store-wide RWMutex is no longer the
+// scaling ceiling on the write path. The next-most-shared resource is
+// totalBytes (atomic.Int64) — every reserveBytes() call hits its CAS loop.
+// These three benchmarks isolate where the remaining contention sits so a
+// future "shard-local byte counter" rewrite can be measured-justified
+// instead of preemptively guessed.
+//
+// Run all three with cpuprofile + memprofile:
+//
+//	go test -run=^$ -bench='Append1Scope_Parallel|Append32Scopes_Parallel|AppendNearCap_Parallel' \
+//	    -benchtime=3s -cpuprofile=cpu.prof -memprofile=mem.prof
+//	go tool pprof -top -cum cpu.prof
+//
+// Look for reserveBytes / (*atomic.Int64).CompareAndSwap in the top
+// frames. If they dominate, sharded byte counters become a real option;
+// if they don't, leave the central counter alone.
+
+// BenchmarkStore_Append1Scope_Parallel pins every goroutine to a single
+// pre-existing scope. Maximises buf.mu serialisation and hits totalBytes
+// CAS contention on top. The scope-map fast-path (sh.mu.RLock + map
+// lookup) is essentially free since the scope already exists.
+//
+// Compare against _Append32Scopes_Parallel: the throughput delta is the
+// upper bound on how much buf.mu costs us.
+func BenchmarkStore_Append1Scope_Parallel(b *testing.B) {
+	store := NewStore(Config{
+		ScopeMaxItems: 100_000_000, // far above any realistic b.N
+		MaxStoreBytes: 128 << 30,
+		MaxItemBytes:  1 << 20,
+	})
+	if _, err := store.getOrCreateScope("shared"); err != nil {
+		b.Fatalf("pre-create: %v", err)
+	}
+	payload := json.RawMessage(`{"data":"benchmark"}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := store.AppendOne(Item{Scope: "shared", Payload: payload}); err != nil {
+				b.Fatalf("AppendOne: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkStore_Append32Scopes_Parallel uses 32 pre-existing scopes,
+// goroutines round-robin across them via an atomic counter. With the
+// per-process maphash seed, 32 names land on ~21 unique shards on
+// average (birthday-paradox), so buf.mu contention drops by ~32× vs
+// the 1-scope variant and shard-write-lock contention is zero (RLock
+// fast-path on every iteration). What's left of the contention budget
+// is overwhelmingly totalBytes CAS — this is the benchmark whose CPU
+// profile most directly answers "is the central byte counter the next
+// bottleneck?".
+//
+// Compare to _Append1Scope_Parallel (much higher buf.mu pressure) and
+// to _AppendUniqueScope_Parallel (adds shard-write-lock + scope-create
+// + struct-alloc overhead on top of the same totalBytes CAS).
+func BenchmarkStore_Append32Scopes_Parallel(b *testing.B) {
+	store := NewStore(Config{
+		ScopeMaxItems: 100_000_000,
+		MaxStoreBytes: 128 << 30,
+		MaxItemBytes:  1 << 20,
+	})
+	const numScopes = 32
+	scopes := make([]string, numScopes)
+	for i := range scopes {
+		scopes[i] = "shard-" + strconv.Itoa(i)
+		if _, err := store.getOrCreateScope(scopes[i]); err != nil {
+			b.Fatalf("pre-create %d: %v", i, err)
+		}
+	}
+	payload := json.RawMessage(`{"data":"benchmark"}`)
+	var counter atomic.Uint64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			i := counter.Add(1) - 1
+			scope := scopes[i%numScopes]
+			if _, err := store.AppendOne(Item{Scope: scope, Payload: payload}); err != nil {
+				b.Fatalf("AppendOne: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkStore_AppendNearCap_Parallel measures the 507-rejection path.
+// Cap is sized so the pre-fill anchor item + scope overhead exactly
+// fits, leaving zero headroom; every parallel benchmark iteration then
+// fails reserveBytes() with *StoreFullError. Useful to:
+//
+//   - profile what dominates the rejection path (allocation cost in
+//     the *StoreFullError construction is a candidate)
+//   - confirm reserveBytes' CAS loop only retries on lost CAS, not on
+//     cap-exceeded — under heavy rejection traffic the loop should
+//     execute exactly once per call (Load + compare + return false)
+//   - rule out pathological behaviour (livelock, unbounded retry) when
+//     admission control is the hot path on a multi-tenant cache that's
+//     pegged at its byte cap.
+//
+// The anchor item exists so cleanupIfEmptyAndUnused never runs (its
+// guard sees len(buf.items) > 0 and returns early), keeping the
+// rejection path pure — no scope-create churn.
+func BenchmarkStore_AppendNearCap_Parallel(b *testing.B) {
+	// scopeBufferOverhead (1024) + room for one 61-byte anchor item.
+	// approxItemSize(anchor) = 32 + 6 (scope "victim") + 6 (id "anchor")
+	// + 8 (Seq) + 8 (Ts slot) + 1 (payload "1") = 61.
+	const anchorSize = 61
+	capBytes := int64(scopeBufferOverhead) + anchorSize
+	store := NewStore(Config{
+		ScopeMaxItems: 100_000_000,
+		MaxStoreBytes: capBytes,
+		MaxItemBytes:  1 << 20,
+	})
+	if _, err := store.AppendOne(Item{Scope: "victim", ID: "anchor", Payload: json.RawMessage(`1`)}); err != nil {
+		b.Fatalf("anchor: %v", err)
+	}
+	payload := json.RawMessage(`{"data":"benchmark"}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// Expected: every call returns *StoreFullError. We don't
+			// inspect the error type here — the benchmark cost IS the
+			// rejection-path cost.
+			_, _ = store.AppendOne(Item{Scope: "victim", Payload: payload})
 		}
 	})
 }

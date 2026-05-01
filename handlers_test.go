@@ -16,7 +16,10 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// 100 MiB byte budget is more than enough for handler tests with tiny
 	// payloads; dedicated byte-cap behaviour tests construct stores with a
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
-	api := NewAPI(NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20, MaxResponseBytes: 25 << 20, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10, ServerSecret: "test-secret", EnableAdmin: true}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{MaxResponseBytes: 25 << 20, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10, ServerSecret: "test-secret", EnableAdmin: true},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux, api
@@ -1187,13 +1190,10 @@ func TestRender_BySeq(t *testing.T) {
 // who don't use /delete_scope_candidates can take for ~2× faster
 // reads.
 func TestReadHeat_DisabledMode(t *testing.T) {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:    10,
-		MaxStoreBytes:    100 << 20,
-		MaxItemBytes:     1 << 20,
-		MaxResponseBytes: 25 << 20,
-		DisableReadHeat:  true,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{MaxResponseBytes: 25 << 20, DisableReadHeat: true},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

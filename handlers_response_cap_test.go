@@ -11,12 +11,10 @@ import (
 // pin MaxResponseBytes to an arbitrary value. The other caps stay generous
 // so the test can drive only the per-response cap.
 func newCappedHandler(maxResponseBytes int64) http.Handler {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:    1000,
-		MaxStoreBytes:    100 << 20,
-		MaxItemBytes:     1 << 20,
-		MaxResponseBytes: maxResponseBytes,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 1000, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{MaxResponseBytes: maxResponseBytes},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux

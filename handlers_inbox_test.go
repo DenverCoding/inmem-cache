@@ -15,17 +15,17 @@ import (
 // in the mux.
 func newInboxHandler(t *testing.T, scopes ...string) (http.Handler, *API) {
 	t.Helper()
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     100,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		ServerSecret:      testServerSecret,
-		InboxScopes:       scopes,
-		EnableAdmin:       true,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			ServerSecret:      testServerSecret,
+			InboxScopes:       scopes,
+			EnableAdmin:       true,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux, api
@@ -309,16 +309,16 @@ func TestInbox_GETRejected(t *testing.T) {
 // server secret AND at least one inbox scope. Either missing → route
 // not in the mux, public callers get 404.
 func TestInbox_NotRegisteredWithoutServerSecret(t *testing.T) {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		// no ServerSecret
-		InboxScopes: []string{"_inbox"},
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			// no ServerSecret
+			InboxScopes: []string{"_inbox"},
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	code, _, _ := doRequest(t, mux, "POST", "/inbox", `{"token":"x","scope":"_inbox","payload":1}`)
@@ -390,18 +390,18 @@ func TestInbox_TenantCannotReadOwnInbox(t *testing.T) {
 // All other capacity knobs match newInboxHandler.
 func newInboxHandlerCap(t *testing.T, maxInboxBytes int64, scopes ...string) (http.Handler, *API) {
 	t.Helper()
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     100,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		MaxInboxBytes:     maxInboxBytes,
-		ServerSecret:      testServerSecret,
-		InboxScopes:       scopes,
-		EnableAdmin:       true,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			MaxInboxBytes:     maxInboxBytes,
+			ServerSecret:      testServerSecret,
+			InboxScopes:       scopes,
+			EnableAdmin:       true,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux, api

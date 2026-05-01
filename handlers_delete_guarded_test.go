@@ -247,7 +247,7 @@ func TestDeleteGuarded_NotInGuardedWhitelist(t *testing.T) {
 	// and we actually exercise the whitelist check (rather than
 	// failing earlier on tenant_not_provisioned).
 	tokenIssue := `{"calls":[{"path":"/upsert","body":{"scope":"_tokens","id":"%s","payload":{"issued":1}}}]}`
-	capID := computeCapabilityID(api.store.serverSecret, "tenant-token")
+	capID := computeCapabilityID(api.serverSecret, "tenant-token")
 	doRequest(t, h, "POST", "/admin", fmt.Sprintf(tokenIssue, capID))
 
 	body := fmt.Sprintf(`{"token":"tenant-token","calls":[{"path":"/delete_guarded","body":{"capability_id":%q}}]}`, capA)
@@ -269,7 +269,7 @@ func TestDeleteGuarded_FullRevocationBatch(t *testing.T) {
 
 	// Set up: token item, two counter items (via a /guarded call so
 	// counter scopes auto-provision), and tenant data.
-	capID := computeCapabilityID(api.store.serverSecret, "rev-token")
+	capID := computeCapabilityID(api.serverSecret, "rev-token")
 	provision := fmt.Sprintf(`{"calls":[{"path":"/upsert","body":{"scope":"_tokens","id":%q,"payload":{"u":1}}}]}`, capID)
 	doRequest(t, h, "POST", "/admin", provision)
 

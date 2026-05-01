@@ -110,8 +110,9 @@ func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int
 }
 
 // cappedResponseWriter is retained for /multi_call's per-sub-call cap
-// path (multi_call.go wraps each sub-call's recorder so an oversized
-// sub-call body becomes a per-slot truncation marker without aborting
-// the whole batch). The public mux's /head, /tail, /ts_range no longer
-// use this wrapper — they enforce the cap inside writeJSONWithMetaCap
-// at marshal time, which avoids the second body-buffering pass.
+// path (handlers_multi_call.go wraps each sub-call's recorder so an
+// oversized sub-call body becomes a per-slot truncation marker without
+// aborting the whole batch). The public mux's /head, /tail, /ts_range
+// no longer use this wrapper — they enforce the cap inside
+// writeJSONWithMetaCap at marshal time, which avoids the second
+// body-buffering pass.

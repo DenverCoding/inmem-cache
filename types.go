@@ -55,80 +55,30 @@ const (
 	MaxCounterValue int64 = (1 << 53) - 1 // 9,007,199,254,740,991
 )
 
-// Config bundles the three store-wide capacity knobs into one value that
+// Config bundles the cache-internal capacity knobs into one value that
 // every adapter (standalone, Caddy module) fills in its own way — env vars
 // for the standalone binary, JSON config for the Caddy module — and hands
-// to NewStore. Keeping the shape in one place means new knobs land in a
-// single file instead of rippling through every adapter's call site.
+// to NewStore. Keeping the shape in one place means new cache knobs land
+// in a single file instead of rippling through every adapter's call site.
+//
+// HTTP/transport-layer knobs (response sizing, /multi_call composition,
+// /guarded auth, /inbox allowlist, /admin gate, read-heat opt-out) live
+// on APIConfig in api.go and are passed to NewAPI separately. The split
+// matches the boundary rule in CLAUDE.md: the core stays
+// transport-agnostic; HTTP concerns are an adapter-layer concept.
 //
 // Fields:
-//   - ScopeMaxItems:     per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
-//   - MaxStoreBytes:     aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
-//   - MaxItemBytes:      per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
-//   - MaxResponseBytes:  per-response cap on read endpoints whose body can grow
-//     with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
-//   - MaxMultiCallBytes: input body cap for /multi_call. In bytes. Default MaxMultiCallMiB << 20.
-//   - MaxMultiCallCount: max sub-calls per /multi_call batch. Default MaxMultiCallCount (10).
-//   - MaxInboxBytes:     per-call payload cap on /inbox. In bytes. Default MaxInboxKiB << 10 (64 KiB).
+//   - ScopeMaxItems: per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
+//   - MaxStoreBytes: aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
+//   - MaxItemBytes:  per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
 //
 // Bytes (not MiB) are the core unit because admission control arithmetic
 // lives in bytes; adapters convert their MiB-facing configuration at the
 // boundary.
 type Config struct {
-	ScopeMaxItems     int
-	MaxStoreBytes     int64
-	MaxItemBytes      int64
-	MaxResponseBytes  int64
-	MaxMultiCallBytes int64
-	MaxMultiCallCount int
-	// MaxInboxBytes caps the per-call payload size on /inbox, in bytes.
-	// Tighter than MaxItemBytes by design — /inbox tenants push events
-	// they cannot read back, drained by the operator in batches; without
-	// a separate cap a single rogue tenant pushing 1 MiB items fills
-	// /admin /tail response budgets very fast. Default int64(MaxInboxKiB) << 10
-	// (64 KiB). Adapter env: SCOPECACHE_MAX_INBOX_KB.
-	MaxInboxBytes int64
-	// ServerSecret is the HMAC key for /guarded. Empty string disables
-	// /guarded entirely — the route is not registered, public callers get
-	// 404. When non-empty, both scopecache (validating tokens) and the
-	// application using it (PHP/workers computing capability_ids) must
-	// see the same value via their own configuration. See guardedflow.md
-	// §I.
-	ServerSecret string
-	// InboxScopes lists the scope names that /inbox is allowed to write
-	// to. /inbox accepts a single tenant /append into one of these
-	// scopes; reads are operator-only (via /admin). Empty list disables
-	// /inbox entirely (the route is not registered). Together with
-	// ServerSecret, this is the operator's opt-in for shared
-	// write-only ingestion.
-	InboxScopes []string
-	// EnableAdmin gates whether the /admin endpoint is registered on
-	// the public mux. /admin has no body-level auth and reaches
-	// reserved scopes (/wipe, /warm, /rebuild, /delete_scope, _* writes)
-	// — gating relies entirely on transport-layer access (Unix-socket
-	// permissions on the standalone binary; Caddyfile route-restriction
-	// or client_ip matcher on the module path). When the cache is
-	// fronted by a public reverse proxy and the operator forgets to
-	// add a route guard, an exposed /admin lets any caller wipe the
-	// cache. The standalone binary defaults this to true (the Unix
-	// socket is the gating layer); the Caddy module defaults it to
-	// false (a misconfigured proxy is a real risk and the integrator
-	// must opt in). Operators who need /admin from a Caddyfile MUST
-	// set both this flag AND a route guard in front of /admin.
-	EnableAdmin bool
-	// DisableReadHeat turns off per-scope read-heat tracking
-	// (recordRead) on the hot read path (/get, /render, /head, /tail,
-	// /ts_range). Zero-value (false) preserves the default — heat is
-	// tracked, so /delete_scope_candidates can rank scopes by
-	// last_7d_read_count and /stats reports last_access_ts and
-	// read_count_total accurately. Setting to true skips the entire
-	// recordRead call, including the time.Now() that feeds it; the
-	// scope-level counters stay at zero and /delete_scope_candidates
-	// will return no useful ranking. Operators who don't use
-	// /delete_scope_candidates can set this for ~2× faster reads on
-	// the hottest paths. Negative framing is deliberate: we want the
-	// zero-value Config{} to keep the documented default behavior.
-	DisableReadHeat bool
+	ScopeMaxItems int
+	MaxStoreBytes int64
+	MaxItemBytes  int64
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields
@@ -136,8 +86,7 @@ type Config struct {
 // this internally so library users can pass a partially-filled Config
 // (or `Config{}` for "all defaults") and still get a working Store —
 // without it, every cap would be zero and every positive write would
-// be rejected with 507. ServerSecret is left untouched: empty is a
-// documented kill-switch for /guarded, not a missing value.
+// be rejected with 507.
 func (c Config) WithDefaults() Config {
 	if c.ScopeMaxItems <= 0 {
 		c.ScopeMaxItems = ScopeMaxItems
@@ -147,18 +96,6 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.MaxItemBytes <= 0 {
 		c.MaxItemBytes = int64(MaxItemBytes)
-	}
-	if c.MaxResponseBytes <= 0 {
-		c.MaxResponseBytes = int64(MaxResponseMiB) << 20
-	}
-	if c.MaxMultiCallBytes <= 0 {
-		c.MaxMultiCallBytes = int64(MaxMultiCallMiB) << 20
-	}
-	if c.MaxMultiCallCount <= 0 {
-		c.MaxMultiCallCount = MaxMultiCallCount
-	}
-	if c.MaxInboxBytes <= 0 {
-		c.MaxInboxBytes = int64(MaxInboxKiB) << 10
 	}
 	return c
 }

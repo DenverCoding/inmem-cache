@@ -88,6 +88,10 @@ NETWORK="scopecache-bench"
 PORT=8084
 WRK_CPUSET="0-3"
 SERVER_CPUSET="4-31"
+RUNS="${RUNS:-5}"
+WRK_THREADS="${WRK_THREADS:-2}"
+WRK_CONNECTIONS="${WRK_CONNECTIONS:-32}"
+WRK_DURATION="${WRK_DURATION:-3s}"
 
 # --- ensure dedicated docker network exists ---
 docker network inspect "$NETWORK" >/dev/null 2>&1 \
@@ -324,7 +328,7 @@ run_wrk() {
     MSYS_NO_PATHCONV=1 docker run --rm --network "$NETWORK" \
         --cpuset-cpus="$WRK_CPUSET" \
         -v "$lua:/script.lua:ro" \
-        williamyeh/wrk -t2 -c32 -d3s --latency --timeout 2s -s /script.lua \
+        williamyeh/wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" --latency --timeout 2s -s /script.lua \
         "$url" 2>&1
 }
 
@@ -376,13 +380,13 @@ echo "================================================================"
 echo "  scopecache bench"
 echo "  version: $VERSION"
 echo "  mode:    $MODE"
-echo "  wrk:     -t2 -c32 -d3s --latency --timeout 2s, cpuset $WRK_CPUSET"
+echo "  wrk:     -t$WRK_THREADS -c$WRK_CONNECTIONS -d$WRK_DURATION --latency --timeout 2s, cpuset $WRK_CPUSET"
 echo "  server:  caddyscope, cpuset $SERVER_CPUSET"
 echo "  config:  scope_max_items=10M, max_store_mb=8192, max_item_mb=16"
 echo "================================================================"
 echo
 
-# --- 5 runs ---
+# --- runs ---
 RESULTS_CSV="$RESULTS_DIR/results.csv"
 echo "run,rps,p50_us,p99_us,non2xx,timeouts,status_breakdown" > "$RESULTS_CSV"
 
@@ -404,7 +408,7 @@ if [[ "$MODE" == "get" || "$MODE" == "get-seq" ]]; then
     seed_for_get
 fi
 
-for run in 1 2 3 4 5; do
+for run in $(seq 1 "$RUNS"); do
     if [[ "$MODE" != "get" && "$MODE" != "get-seq" ]]; then
         wipe
         sleep 1
@@ -453,8 +457,9 @@ for run in 1 2 3 4 5; do
 done
 
 # --- median + totals ---
+median_pos=$(( (RUNS + 1) / 2 ))
 median_rps_int=$(printf '%s\n' "${rps_arr[@]}" | awk '{print int($1+0)}' \
-    | sort -n | awk 'NR==3{print}')
+    | sort -n | awk -v pos="$median_pos" 'NR==pos{print}')
 median_p50=$(median_int "${p50_arr[@]}")
 median_p99=$(median_int "${p99_arr[@]}")
 
@@ -462,7 +467,8 @@ echo
 printf '  median: rps=%-8s  p50=%-10s  p99=%-10s\n' \
     "$median_rps_int" "$(fmt_us "$median_p50")" "$(fmt_us "$median_p99")"
 echo
-printf '  totals over 5 runs: non-2xx=%s timeouts=%s socket-errors=%s\n' \
+printf '  totals over %s runs: non-2xx=%s timeouts=%s socket-errors=%s\n' \
+    "$RUNS" \
     "$total_non2xx" "$total_timeouts" "$total_socket_errors"
 
 echo

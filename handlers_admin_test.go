@@ -85,16 +85,16 @@ func TestAdmin_WhitelistMissRejectsBatch(t *testing.T) {
 // 507 (no side effects), not after dispatch when the wrapper would
 // erase per-slot status.
 func TestAdmin_TinyResponseCapRejectedPreflight(t *testing.T) {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  200,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		ServerSecret:      "test-secret",
-		EnableAdmin:       true,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  200,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			ServerSecret:      "test-secret",
+			EnableAdmin:       true,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -178,15 +178,15 @@ func TestAdmin_BlocksHelp(t *testing.T) {
 // avoid an exposed wipe-the-cache endpoint when a Caddyfile mounts
 // the handler at a public listener root.
 func TestAdmin_NotRegisteredWhenDisabled(t *testing.T) {
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		// EnableAdmin deliberately false (zero value).
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			// EnableAdmin deliberately false (zero value).
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

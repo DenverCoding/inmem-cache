@@ -218,11 +218,11 @@ func (api *API) validateBatchShape(
 		return nil, true
 	}
 	calls := *callsPtr
-	if len(calls) > api.store.maxMultiCallCount {
-		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.store.maxMultiCallCount))
+	if len(calls) > api.maxMultiCallCount {
+		badRequest(w, started, fmt.Sprintf("the 'calls' array has %d entries; the maximum is %d", len(calls), api.maxMultiCallCount))
 		return nil, true
 	}
-	if preflightResponseCap(w, started, len(calls), api.store.maxResponseBytes) {
+	if preflightResponseCap(w, started, len(calls), api.maxResponseBytes) {
 		return nil, true
 	}
 	for i, call := range calls {
@@ -321,10 +321,10 @@ type batchDispatchOptions struct {
 //     leak the un-stripped form)
 //   - defensive copy of the slot body before the next iteration
 //
-// The respCap is read from api.store.maxResponseBytes — all three
+// The respCap is read from api.maxResponseBytes — all three
 // callers pass the same value, so it's not part of the options.
 func (api *API) dispatchPreparedCalls(prepared []preparedCall, opts batchDispatchOptions) ([]multiCallResult, int64) {
-	respCap := api.store.maxResponseBytes
+	respCap := api.maxResponseBytes
 	bodyBudget := respCap - multiCallEnvelopeOverhead - int64(len(prepared))*multiCallSlotOverhead
 	if bodyBudget < 0 {
 		bodyBudget = 0
@@ -410,7 +410,7 @@ func (api *API) handleMultiCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req multiCallRequest
-	if err := decodeBody(w, r, api.store.maxMultiCallBytes, &req); err != nil {
+	if err := decodeBody(w, r, api.maxMultiCallBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}

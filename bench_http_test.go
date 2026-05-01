@@ -29,7 +29,7 @@ func benchHTTPServer(b *testing.B, numScopes, itemsPerScope, payloadBytes int) (
 
 	store, scopes, ids := benchStore(b, numScopes, itemsPerScope, payloadBytes)
 
-	api := NewAPI(store)
+	api := NewAPI(store, APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -168,10 +168,9 @@ func BenchmarkHTTP_RenderByID_StringPayload_Parallel(b *testing.B) {
 	// Seed a single scope where every payload is a JSON-encoded string,
 	// roughly 512 bytes after encoding (matches benchStore's payload size).
 	store := NewStore(Config{
-		ScopeMaxItems:    100_000,
-		MaxStoreBytes:    1 << 30,
-		MaxItemBytes:     1 << 20,
-		MaxResponseBytes: 1 << 30,
+		ScopeMaxItems: 100_000,
+		MaxStoreBytes: 1 << 30,
+		MaxItemBytes:  1 << 20,
 	})
 	const scope = "html"
 	buf, err := store.getOrCreateScope(scope)
@@ -190,7 +189,7 @@ func BenchmarkHTTP_RenderByID_StringPayload_Parallel(b *testing.B) {
 		}
 	}
 
-	api := NewAPI(store)
+	api := NewAPI(store, APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	dir, err := os.MkdirTemp("", "scopecache-bench-")

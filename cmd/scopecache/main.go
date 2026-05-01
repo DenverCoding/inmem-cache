@@ -255,9 +255,11 @@ func listenUnixSocket(path string) (net.Listener, error) {
 
 func main() {
 	cfg := scopecache.Config{
-		ScopeMaxItems:     scopeMaxItemsFromEnv(),
-		MaxStoreBytes:     maxStoreBytesFromEnv(),
-		MaxItemBytes:      maxItemBytesFromEnv(),
+		ScopeMaxItems: scopeMaxItemsFromEnv(),
+		MaxStoreBytes: maxStoreBytesFromEnv(),
+		MaxItemBytes:  maxItemBytesFromEnv(),
+	}
+	apiCfg := scopecache.APIConfig{
 		MaxResponseBytes:  maxResponseBytesFromEnv(),
 		MaxMultiCallBytes: maxMultiCallBytesFromEnv(),
 		MaxMultiCallCount: maxMultiCallCountFromEnv(),
@@ -268,25 +270,25 @@ func main() {
 		DisableReadHeat:   disableReadHeatFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
-	api := scopecache.NewAPI(store)
+	api := scopecache.NewAPI(store, apiCfg)
 
 	adminStatus := "DISABLED (SCOPECACHE_ENABLE_ADMIN=off)"
-	if cfg.EnableAdmin {
+	if apiCfg.EnableAdmin {
 		adminStatus = "enabled (gated by Unix-socket permissions)"
 	}
 	guardedStatus := "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
-	if cfg.ServerSecret != "" {
+	if apiCfg.ServerSecret != "" {
 		guardedStatus = "enabled"
 	}
 	inboxStatus := "DISABLED (SCOPECACHE_INBOX_SCOPES unset)"
-	if cfg.ServerSecret == "" {
+	if apiCfg.ServerSecret == "" {
 		inboxStatus = "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
-	} else if len(cfg.InboxScopes) > 0 {
-		inboxStatus = "enabled, scopes=" + strings.Join(cfg.InboxScopes, ",")
+	} else if len(apiCfg.InboxScopes) > 0 {
+		inboxStatus = "enabled, scopes=" + strings.Join(apiCfg.InboxScopes, ",")
 	}
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch, %d KiB per /inbox payload", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, cfg.MaxResponseBytes>>20, cfg.MaxMultiCallBytes>>20, cfg.MaxMultiCallCount, cfg.MaxInboxBytes>>10)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch, %d KiB per /inbox payload", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, apiCfg.MaxResponseBytes>>20, apiCfg.MaxMultiCallBytes>>20, apiCfg.MaxMultiCallCount, apiCfg.MaxInboxBytes>>10)
 	heatStatus := "enabled"
-	if cfg.DisableReadHeat {
+	if apiCfg.DisableReadHeat {
 		heatStatus = "DISABLED (SCOPECACHE_DISABLE_READ_HEAT=on; /delete_scope_candidates won't have ranking data)"
 	}
 	log.Printf("scopecache features: /admin %s; /guarded %s; /inbox %s; read-heat %s", adminStatus, guardedStatus, inboxStatus, heatStatus)

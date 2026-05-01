@@ -228,14 +228,14 @@ func TestMultiCall_CountOverflow(t *testing.T) {
 
 func TestMultiCall_BodyOverflow(t *testing.T) {
 	// Build a tiny-cap handler so we can blow the body budget cheaply.
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 64, // ridiculously small
-		MaxMultiCallCount: 10,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 64, // ridiculously small
+			MaxMultiCallCount: 10,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -292,15 +292,15 @@ func TestMultiCall_QueryNestedRejected(t *testing.T) {
 func TestMultiCall_TinyResponseCapRejectedPreflight(t *testing.T) {
 	// 200 bytes is below minMultiCallResponseSize for any non-trivial
 	// batch (envelope ~256 alone). Single /append batch easily trips it.
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  200,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-		ServerSecret:      "test-secret",
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  200,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+			ServerSecret:      "test-secret",
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -359,14 +359,14 @@ func TestMultiCall_NestedQueryRejectsBeforeSideEffects(t *testing.T) {
 func TestMultiCall_SubCallResponseTooLarge(t *testing.T) {
 	// 1 MiB per-response cap; one /tail of ~3 items at ~512 KiB each will
 	// trip the cap on the *sub-call*, producing 507 in the slot.
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     100,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  1 << 20, // 1 MiB
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  1 << 20, // 1 MiB
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -403,14 +403,14 @@ func TestMultiCall_OuterEnvelopeTrimSuccess(t *testing.T) {
 	// 2 MiB cap. Each sub-call returns ~800 KiB of body; 3+ of those overflow
 	// the outer envelope so the later slots get the {"ok":true,"response_truncated":true}
 	// marker but keep status 200.
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     100,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  2 << 20,
-		MaxMultiCallBytes: 16 << 20,
-		MaxMultiCallCount: 10,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  2 << 20,
+			MaxMultiCallBytes: 16 << 20,
+			MaxMultiCallCount: 10,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -502,14 +502,14 @@ func TestMultiCall_MalformedJSON(t *testing.T) {
 func TestMultiCall_InputBodyOversize(t *testing.T) {
 	// Build a request body large enough to trip the 16 MiB default cap.
 	// Cheaper to use a small-cap handler.
-	api := NewAPI(NewStore(Config{
-		ScopeMaxItems:     10,
-		MaxStoreBytes:     100 << 20,
-		MaxItemBytes:      1 << 20,
-		MaxResponseBytes:  25 << 20,
-		MaxMultiCallBytes: 1024,
-		MaxMultiCallCount: 10,
-	}))
+	api := NewAPI(
+		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		APIConfig{
+			MaxResponseBytes:  25 << 20,
+			MaxMultiCallBytes: 1024,
+			MaxMultiCallCount: 10,
+		},
+	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

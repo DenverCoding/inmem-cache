@@ -186,7 +186,7 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 
 	// Step 1: parse body.
 	var req guardedRequest
-	if err := decodeBody(w, r, api.store.maxMultiCallBytes, &req); err != nil {
+	if err := decodeBody(w, r, api.maxMultiCallBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}
@@ -217,7 +217,7 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 4-5: compute capability_id and prefix.
-	capabilityID := computeCapabilityID(api.store.serverSecret, req.Token)
+	capabilityID := computeCapabilityID(api.serverSecret, req.Token)
 	prefix := "_guarded:" + capabilityID + ":"
 
 	// Step 6: auth-gate. Single lookup in the _tokens scope: does an

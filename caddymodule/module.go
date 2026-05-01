@@ -114,9 +114,11 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		return err
 	}
 	store := scopecache.NewStore(scopecache.Config{
-		ScopeMaxItems:     h.ScopeMaxItems,
-		MaxStoreBytes:     int64(h.MaxStoreMB) << 20,
-		MaxItemBytes:      int64(h.MaxItemMB) << 20,
+		ScopeMaxItems: h.ScopeMaxItems,
+		MaxStoreBytes: int64(h.MaxStoreMB) << 20,
+		MaxItemBytes:  int64(h.MaxItemMB) << 20,
+	})
+	h.api = scopecache.NewAPI(store, scopecache.APIConfig{
 		MaxResponseBytes:  int64(h.MaxResponseMB) << 20,
 		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
 		MaxMultiCallCount: h.MaxMultiCallCount,
@@ -126,7 +128,6 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		EnableAdmin:       h.EnableAdmin,
 		DisableReadHeat:   h.DisableReadHeat,
 	})
-	h.api = scopecache.NewAPI(store)
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
 	return nil
