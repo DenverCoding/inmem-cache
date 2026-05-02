@@ -1,0 +1,45 @@
+#!/usr/bin/env sh
+# pre-commit gate: rejects the commit when any staged Go file would be
+# reformatted by gofmt. Catches the godoc list/code-block formatting
+# that Go 1.19+ enforces, before the CI step does.
+#
+# Activate once per clone: `git config core.hooksPath .githooks`
+# (see .githooks/README.md). This file is intentionally version-
+# controlled so every contributor (and every Claude Code session) sees
+# the same gate.
+
+# Collect staged Go files (Added, Copied, Modified). Deleted files are
+# excluded by --diff-filter=ACM.
+files=$(git diff --cached --name-only --diff-filter=ACM | grep '\.go$' || true)
+
+if [ -z "$files" ]; then
+    exit 0
+fi
+
+# Prefer host gofmt (fast path for contributors who have Go installed
+# locally). Fall back to the dev container's gofmt when the host has
+# no Go toolchain — common on Docker-only setups. If both are
+# unavailable, skip with a warning rather than blocking the commit:
+# the CI's "Verify gofmt" step is the final safety net.
+if command -v gofmt >/dev/null 2>&1; then
+    unformatted=$(echo "$files" | xargs gofmt -l 2>/dev/null)
+elif command -v docker >/dev/null 2>&1; then
+    unformatted=$(echo "$files" | MSYS_NO_PATHCONV=1 docker compose exec -T dev sh -c 'xargs gofmt -l' 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        echo "pre-commit: gofmt not on host and dev container unavailable; gofmt check skipped" >&2
+        exit 0
+    fi
+else
+    echo "pre-commit: neither gofmt nor docker available; gofmt check skipped" >&2
+    exit 0
+fi
+
+if [ -n "$unformatted" ]; then
+    echo "gofmt: the following staged files would be reformatted:"
+    echo "$unformatted" | sed 's/^/  /'
+    echo
+    echo "Fix:   gofmt -w $(echo "$unformatted" | tr '\n' ' ')"
+    echo "Stage: git add $(echo "$unformatted" | tr '\n' ' ')"
+    echo "Then re-commit."
+    exit 1
+fi
