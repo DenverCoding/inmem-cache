@@ -100,6 +100,7 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 		b.byID[updated.ID] = updated
 	}
 	b.bytes += delta
+	b.lastWriteTS = ts
 }
 
 // indexBySeqLocked returns the position of the item with the given seq

@@ -51,12 +51,14 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	delete(b.bySeq, removed.Seq)
 	if removed.ID != "" {
 		delete(b.byID, removed.ID)
+		b.idKeyBytes -= int64(len(removed.ID))
 	}
 
 	b.bytes -= removedSize
 	if b.store != nil {
 		b.store.totalBytes.Add(-removedSize)
 	}
+	b.lastWriteTS = nowUnixMicro()
 }
 
 func (b *scopeBuffer) deleteByID(id string) (int, error) {
@@ -124,12 +126,14 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	}
 
 	var freedBytes int64
+	var freedIDKeyBytes int64
 	for i := 0; i < idx; i++ {
 		removed := b.items[i]
 		freedBytes += approxItemSize(removed)
 		delete(b.bySeq, removed.Seq)
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
+			freedIDKeyBytes += int64(len(removed.ID))
 		}
 	}
 	// Copy the kept suffix into a fresh backing array so the old one —
@@ -143,8 +147,10 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	b.items = rest
 
 	b.bytes -= freedBytes
+	b.idKeyBytes -= freedIDKeyBytes
 	if b.store != nil {
 		b.store.totalBytes.Add(-freedBytes)
 	}
+	b.lastWriteTS = nowUnixMicro()
 	return idx, nil
 }

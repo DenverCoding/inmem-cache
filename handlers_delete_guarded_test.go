@@ -288,13 +288,16 @@ func TestDeleteGuarded_FullRevocationBatch(t *testing.T) {
 		t.Fatal("setup: tenant scope missing")
 	}
 
-	// Full four-call revocation batch.
+	// Full five-call revocation batch — three counter scopes
+	// (calls, kb_in, kb_out) plus the token item plus the
+	// /delete_guarded sweep.
 	revoke := fmt.Sprintf(`{"calls":[
-		{"path":"/delete",         "body":{"scope":"_tokens",               "id":%q}},
-		{"path":"/delete",         "body":{"scope":"_counters_count_calls", "id":%q}},
-		{"path":"/delete",         "body":{"scope":"_counters_count_kb",    "id":%q}},
+		{"path":"/delete",         "body":{"scope":"_tokens",                 "id":%q}},
+		{"path":"/delete",         "body":{"scope":"_counters_count_calls",   "id":%q}},
+		{"path":"/delete",         "body":{"scope":"_counters_count_kb_in",   "id":%q}},
+		{"path":"/delete",         "body":{"scope":"_counters_count_kb_out",  "id":%q}},
 		{"path":"/delete_guarded", "body":{"capability_id":%q}}
-	]}`, capID, capID, capID, capID)
+	]}`, capID, capID, capID, capID, capID)
 
 	code, out, raw := doRequest(t, h, "POST", "/admin", revoke)
 	if code != 200 {

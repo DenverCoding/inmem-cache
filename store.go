@@ -657,6 +657,7 @@ func (s *Store) scopeCandidates(hours int64, limit int) []Candidate {
 		list = append(list, Candidate{
 			Scope:           name,
 			CreatedTS:       st.CreatedTS,
+			LastWriteTS:     st.LastWriteTS,
 			LastAccessTS:    st.LastAccessTS,
 			Last7dReadCount: st.Last7DReadCount,
 			ItemCount:       st.ItemCount,

@@ -95,6 +95,11 @@ func TestGuarded_ResponseStripping_Append(t *testing.T) {
 	if strings.HasPrefix(scope, "_guarded:") {
 		t.Errorf("response leaked internal prefix: %q", scope)
 	}
+	// Pin the no-payload-echo invariant on the same response: the strip
+	// keeps scope/id/seq/ts but payload is intentionally absent.
+	if _, present := item["payload"]; present {
+		t.Errorf("/append response item must not echo payload back: %v", item)
+	}
 }
 
 func TestGuarded_ResponseStripping_Tail(t *testing.T) {
@@ -598,17 +603,19 @@ func TestGuarded_CounterCreatesOnFirstRead(t *testing.T) {
 	}
 }
 
-// _counters_count_kb skips the increment when the rounded KiB value is
-// 0, so a small /guarded response (well under 1 KiB) must NOT cause
-// the kb counter scope to come into existence. Bookends the calls
-// counter test: calls always increments (so the scope always exists
-// after one call), kb is conditional.
-func TestGuarded_KBCounterSkippedForTinyResponse(t *testing.T) {
+// Both kb counters skip the increment when the rounded KiB value is
+// 0, so a small /guarded request+response (well under 1 KiB on either
+// side) must NOT cause either kb scope to come into existence.
+// Bookends the calls counter test: calls always increments (so the
+// scope always exists after one call), both kb counters are
+// conditional and symmetric.
+func TestGuarded_KBCountersSkippedForTinyRequestAndResponse(t *testing.T) {
 	h, api := newTestHandler(100)
 	provisionTenant(t, h, "tok-tiny")
 
-	// One /guarded /append with a 1-byte payload — outer envelope is a
-	// few hundred bytes, way under 1 KiB.
+	// One /guarded /append with a 1-byte payload — request envelope is
+	// ~80 bytes, response envelope is a few hundred bytes; both well
+	// under 1 KiB.
 	body := `{"token":"tok-tiny","calls":[{"path":"/append","body":{"scope":"events","id":"x","payload":1}}]}`
 	if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
 		t.Fatalf("tiny /guarded code=%d body=%s", code, raw)
@@ -618,10 +625,48 @@ func TestGuarded_KBCounterSkippedForTinyResponse(t *testing.T) {
 	if _, ok := api.store.getScope(countersScopeCalls); !ok {
 		t.Error("_counters_count_calls missing — calls increment must always fire")
 	}
-	// KB counter does NOT exist — sub-1-KiB response triggers the
-	// kb > 0 skip in guardedIncrementCounters.
-	if _, ok := api.store.getScope(countersScopeKB); ok {
-		t.Error("_counters_count_kb created for sub-1-KiB response — kb-skip rule violated")
+	// Both kb counters do NOT exist — sub-1-KiB on each side triggers
+	// the kbIn > 0 / kbOut > 0 skips in guardedIncrementCounters.
+	if _, ok := api.store.getScope(countersScopeKBIn); ok {
+		t.Error("_counters_count_kb_in created for sub-1-KiB request — kb-skip rule violated")
+	}
+	if _, ok := api.store.getScope(countersScopeKBOut); ok {
+		t.Error("_counters_count_kb_out created for sub-1-KiB response — kb-skip rule violated")
+	}
+}
+
+// kb_in must increment when the outer request envelope is >= 1 KiB,
+// independent of response size. A /guarded /append with a multi-KiB
+// payload tests the ingress side specifically — the response is small
+// (a slim ack) but the request body crosses the KiB threshold.
+func TestGuarded_KBInIncrementsForLargeRequest(t *testing.T) {
+	h, _ := newTestHandler(100)
+	provisionTenant(t, h, "tok-fat-in")
+	capID := computeCapForTest(testServerSecret, "tok-fat-in")
+
+	// Build a payload that pushes the outer body well past 1 KiB.
+	// 4096 'a' chars + JSON quoting ≈ 4 KiB request body.
+	bigPayload := `"` + strings.Repeat("a", 4096) + `"`
+	body := `{"token":"tok-fat-in","calls":[{"path":"/append","body":{"scope":"events","id":"big","payload":` + bigPayload + `}}]}`
+	if code, _, raw := doRequest(t, h, "POST", "/guarded", body); code != 200 {
+		t.Fatalf("fat /guarded code=%d body=%s", code, raw)
+	}
+
+	// kb_in counter must exist and value must be at least 4 (4 KiB
+	// request body). Read via /admin /get to verify the integer payload.
+	getBody := `{"calls":[{"path":"/get","query":{"scope":"_counters_count_kb_in","id":"` + capID + `"}}]}`
+	code, out, raw := doRequest(t, h, "POST", "/admin", getBody)
+	if code != 200 {
+		t.Fatalf("admin get code=%d body=%s", code, raw)
+	}
+	results := out["results"].([]interface{})
+	getResp := results[0].(map[string]interface{})["body"].(map[string]interface{})
+	if hit, _ := getResp["hit"].(bool); !hit {
+		t.Fatalf("_counters_count_kb_in[%s] missing after large /guarded request: %s", capID, raw)
+	}
+	item := getResp["item"].(map[string]interface{})
+	if v, _ := item["payload"].(float64); int64(v) < 4 {
+		t.Errorf("kb_in counter=%v want >= 4 (request body was ~4 KiB)", v)
 	}
 }
 

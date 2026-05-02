@@ -882,20 +882,23 @@ case $LAST_BODY in
     *) bad "gd: tenant B item missing after tenant A delete: $LAST_BODY" ;;
 esac
 
-# Counter self-healing. The two internal counter scopes
-# (_counters_count_calls, _counters_count_kb) are auto-provisioned
-# by ensureScope on the first /guarded call after they go missing.
-# Documented in guardedflow.md §M as the recovery path after a
-# /wipe; this test exercises the same path via /admin
-# /delete_scope so a regression in either ensureScope (commit
-# 165628b made it overhead-aware) or guardedIncrementCounters'
-# nil-tolerant skip would surface here. Only the calls counter is
-# checked because the kb counter only fires when the response
-# crosses 1 KiB, and a single /get response stays well below that.
+# Counter self-healing. The three internal counter scopes
+# (_counters_count_calls, _counters_count_kb_in,
+# _counters_count_kb_out) are auto-provisioned by ensureScope on the
+# first /guarded call after they go missing. Documented in
+# guardedflow.md §M as the recovery path after a /wipe; this test
+# exercises the same path via /admin /delete_scope so a regression
+# in either ensureScope (commit 165628b made it overhead-aware) or
+# guardedIncrementCounters' nil-tolerant skip would surface here.
+# Only the calls counter is checked after re-provisioning because
+# the kb counters only fire when the request/response crosses 1 KiB,
+# and a single /get stays well below that on both sides.
 admin_call 'gd: delete calls counter scope' 200 /delete_scope \
     '{"scope":"_counters_count_calls"}'
-admin_call 'gd: delete kb counter scope' 200 /delete_scope \
-    '{"scope":"_counters_count_kb"}'
+admin_call 'gd: delete kb_in counter scope' 200 /delete_scope \
+    '{"scope":"_counters_count_kb_in"}'
+admin_call 'gd: delete kb_out counter scope' 200 /delete_scope \
+    '{"scope":"_counters_count_kb_out"}'
 guarded_call_query 'gd: guarded still works after counter scope delete' 200 "$TENANT_A_TOKEN" /get \
     '{"scope":"events","id":"e1"}'
 admin_call_query 'gd: calls counter scope recreated' 200 /get \

@@ -356,6 +356,34 @@ func TestStore_scopeCandidates_TruncatesToLimit(t *testing.T) {
 	}
 }
 
+// scopeCandidates must surface LastWriteTS so operators ranking
+// eviction can distinguish a cold-read scope that is still being
+// actively written to (a write-buffer) from a truly idle one. Without
+// this signal, write-only workloads always rank as "stalest" because
+// they never touch lastAccessTS.
+func TestStore_scopeCandidates_SurfacesLastWriteTS(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	pre := nowUnixMicro()
+	if _, err := s.appendOne(Item{Scope: "s", Payload: json.RawMessage(`"v"`)}); err != nil {
+		t.Fatalf("appendOne: %v", err)
+	}
+	got := s.scopeCandidates(0, 10)
+	if len(got) != 1 {
+		t.Fatalf("len=%d; want 1", len(got))
+	}
+	if got[0].LastWriteTS < pre {
+		t.Errorf("LastWriteTS=%d pre=%d (must be >= pre-call stamp)", got[0].LastWriteTS, pre)
+	}
+	// Internally consistent with /stats: candidate and scopeStats read
+	// from the same underlying field, so they must match.
+	buf, _ := s.getScope("s")
+	if got[0].LastWriteTS != buf.lastWriteTS {
+		t.Errorf("candidate.LastWriteTS=%d buf.lastWriteTS=%d (must mirror)",
+			got[0].LastWriteTS, buf.lastWriteTS)
+	}
+}
+
 // render peels the renderBytes shortcut for JSON-string payloads — a
 // store-level invariant that handleRender used to enforce inline.
 // Pin it on the Store boundary now that the handler is dumb.

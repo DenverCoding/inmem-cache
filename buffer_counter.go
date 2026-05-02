@@ -104,7 +104,9 @@ func (b *scopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 		b.byID = make(map[string]Item)
 	}
 	b.byID[id] = item
+	b.idKeyBytes += int64(len(id))
 	b.bytes += size
+	b.lastWriteTS = item.Ts
 
 	return by, true, nil
 }

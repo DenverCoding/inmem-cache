@@ -19,6 +19,22 @@ import (
 // and map *ScopeFullError / *ScopeCapacityError / *StoreFullError
 // uniformly via writeStoreCapacityError.
 
+// writeAck is the response shape /append and /upsert nest under "item".
+// Mirrors Item's json layout for scope/id/seq/ts so multi_call slots
+// remain self-correlating ("which sub-call succeeded into which scope?")
+// without forcing the client to map results[i] back onto calls[i].
+// Deliberately excludes Payload — the client supplied it on the way in,
+// and echoing it would double the wire cost on a 1 MiB write. The
+// struct's omitempty rules match Item's so a write without an id still
+// produces the same response shape as Item-marshaled-without-Payload
+// would.
+type writeAck struct {
+	Scope string `json:"scope,omitempty"`
+	ID    string `json:"id,omitempty"`
+	Seq   uint64 `json:"seq,omitempty"`
+	Ts    int64  `json:"ts"`
+}
+
 func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 
@@ -51,9 +67,14 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Response nests scope/id/seq/ts under "item" so multi_call slots
+	// stay self-correlating without the caller mapping results[i] onto
+	// calls[i]. Payload is the only echoed field that's worth dropping —
+	// scope/id are tiny strings (<= 256 B each) but a payload echo on a
+	// 1 MiB write would double the wire cost.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
-		{"item", item},
+		{"item", writeAck{Scope: item.Scope, ID: item.ID, Seq: item.Seq, Ts: item.Ts}},
 	}, started)
 }
 
@@ -93,10 +114,13 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Same item-with-no-payload shape as /append; see comment there. Seq
+	// is the pre-existing seq on a replace and the freshly-assigned seq
+	// on a create.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"created", created},
-		{"item", result},
+		{"item", writeAck{Scope: result.Scope, ID: result.ID, Seq: result.Seq, Ts: result.Ts}},
 	}, started)
 }
 

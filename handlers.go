@@ -456,11 +456,12 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	// isolation. Empty secret → /guarded route not registered, public
 	// callers get 404. See guardedflow.md §I.
 	//
-	// Counter scopes (`_counters_count_calls`, `_counters_count_kb`) are
-	// NOT eagerly provisioned here — the first /guarded call creates
-	// them via ensureScope, and they self-heal after a /wipe the same
-	// way. Eager provisioning would clutter `/stats` for operators who
-	// haven't yet seen any /guarded traffic.
+	// Counter scopes (`_counters_count_calls`, `_counters_count_kb_in`,
+	// `_counters_count_kb_out`) are NOT eagerly provisioned here — the
+	// first /guarded call creates them via ensureScope, and they
+	// self-heal after a /wipe the same way. Eager provisioning would
+	// clutter `/stats` for operators who haven't yet seen any
+	// /guarded traffic.
 	if api.serverSecret != "" {
 		mux.HandleFunc("/guarded", api.handleGuarded)
 	}

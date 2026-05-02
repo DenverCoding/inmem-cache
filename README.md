@@ -97,7 +97,7 @@ Two independent ceilings, one in each direction:
 
 ### Phase-4 `/guarded` overhead and counter-scope contention (32 CPU host)
 
-`/guarded` adds non-trivial work on top of a bare `/get`: HMAC-SHA256 of the token, JSON parse + scope rewrite + re-serialize, scope-existence check, sub-call dispatch, response parsing + prefix strip, and two `counterAdd` writes (`_counters_count_calls`, `_counters_count_kb`). The pre-design fear was that the two counter scopes — shared across every tenant — would become a serialisation point at high concurrency: every `/guarded` request takes the same scope-lock for `counterAdd`, so multi-tenant traffic could in principle bottleneck on a write that single-tenant traffic doesn't notice. This bench measures the actual cost on the same harness as the section above, with `wrk` driving four shapes from a sidecar container on the `phase4_default` bridge network (apples-to-apples vs. the wrk numbers above):
+`/guarded` adds non-trivial work on top of a bare `/get`: HMAC-SHA256 of the token, JSON parse + scope rewrite + re-serialize, scope-existence check, sub-call dispatch, response parsing + prefix strip, and three `counterAdd` writes (`_counters_count_calls`, `_counters_count_kb_in`, `_counters_count_kb_out`). The pre-design fear was that the counter scopes — shared across every tenant — would become a serialisation point at high concurrency: every `/guarded` request takes the same scope-lock for `counterAdd`, so multi-tenant traffic could in principle bottleneck on a write that single-tenant traffic doesn't notice. This bench measures the actual cost on the same harness as the section above, with `wrk` driving four shapes from a sidecar container on the `phase4_default` bridge network (apples-to-apples vs. the wrk numbers above):
 
 | test | conc=50 req/s | conc=200 req/s | p50 (200) | sub-calls/s @ conc=200 |
 |------|--------------:|---------------:|----------:|------------------------:|
@@ -114,7 +114,7 @@ Bench setup: 10 tenant scopes pre-provisioned via `/admin /warm` (`_guarded:<cap
 
 2. **Batch amortisation puts `/guarded` *above* the `/get` baseline.** Test 3 runs 12,212 batches/s × 10 sub-calls = **122,123 effective sub-calls/s**, slightly faster than the bare-`/get` baseline (113,360). Inside a batch every sub-call goes through the same handler code as a standalone call but pays no per-sub-call HTTP framing cost — only the outer envelope is parsed and serialised once. Tenants who batch effectively get the multi-call discount on top of `/guarded`'s fixed-cost overhead.
 
-3. **The shared counter scopes are NOT a contention bottleneck.** Test 4 (multi-tenant rotation) is *consistently faster* than test 2 (single tenant) at both concurrency points: 57.7k vs. 50.0k at conc=50, 66.3k vs. 62.8k at conc=200. Spreading reads across 10 tenant scopes parallelises the per-scope `RWMutex` for the read side, while the counter-scope write is short enough (one map update + one atomic int64 add under one lock acquisition) that it disappears into the noise. **Pre-v1.0 design verdict:** `_counters_count_calls` / `_counters_count_kb` stay shared across tenants — splitting them per-`capability_id` would be a premature optimisation that the data does not justify.
+3. **The shared counter scopes are NOT a contention bottleneck.** Test 4 (multi-tenant rotation) is *consistently faster* than test 2 (single tenant) at both concurrency points: 57.7k vs. 50.0k at conc=50, 66.3k vs. 62.8k at conc=200. Spreading reads across 10 tenant scopes parallelises the per-scope `RWMutex` for the read side, while the counter-scope write is short enough (one map update + one atomic int64 add under one lock acquisition) that it disappears into the noise. **Pre-v1.0 design verdict:** `_counters_count_calls`, `_counters_count_kb_in`, and `_counters_count_kb_out` stay shared across tenants — splitting them per-`capability_id` would be a premature optimisation that the data does not justify. (This bench was taken when `/guarded` only wrote two counters; the third counter was added later. The contention conclusion stands: each counter is a separate scope, so the per-counter lock is short-held and uncontended on its own; adding a third short-held lock acquisition does not change the picture.)
 
 ### Bandwidth-bound vs. request-handling-bound — why `/get` exceeds the published `/render` ceiling
 
@@ -628,12 +628,13 @@ Response (the `scope` in the slot's `item` reads `"events"` — the prefix is st
 
 Whitelist excludes `/delete_scope` and `/delete_guarded` (a tenant cannot deprovision their own namespace), `/stats` and `/delete_scope_candidates` (cross-tenant visibility), and every store-wide op.
 
-After each successful request the cache atomically increments two reserved scopes for per-tenant usage tracking:
+After each successful request the cache atomically increments three reserved scopes for per-tenant usage tracking:
 
 - `_counters_count_calls`, item id = `<capability_id>`, `+= len(calls)` — **one unit per sub-call**, not per HTTP request, so a tenant who batches 5 sub-calls into one `/guarded` call counts the same as a tenant making 5 solo calls.
-- `_counters_count_kb`, item id = `<capability_id>`, `+= ⌊response_bytes / 1024⌋` — outer envelope size, skipped when it rounds to `0`.
+- `_counters_count_kb_in`, item id = `<capability_id>`, `+= ⌊request_content_length / 1024⌋` — outer request envelope, captures ingress bandwidth per tenant, skipped when the rounded KiB value is `0` or `Content-Length` is unknown (chunked encoding).
+- `_counters_count_kb_out`, item id = `<capability_id>`, `+= ⌊response_bytes / 1024⌋` — outer response envelope size, skipped when it rounds to `0`.
 
-Both scopes auto-create on first use, survive `/wipe`, and are monotonic (no built-in reset — operator zeroes a tenant via `/admin /upsert` with `payload: 0`). Read one tenant's call count:
+All three scopes auto-create on first use, survive `/wipe`, and are monotonic (no built-in reset — operator zeroes a tenant via `/admin /upsert` with `payload: 0`). Read one tenant's call count:
 
 ```bash
 curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \

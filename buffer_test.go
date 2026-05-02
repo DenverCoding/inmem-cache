@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -1018,6 +1019,318 @@ func TestDeleteByID_ClearsBackingSlot(t *testing.T) {
 	tail := full[2]
 	if tail.ID != "" || tail.Seq != 0 || tail.Payload != nil {
 		t.Fatalf("tail slot not cleared in backing array: %+v", tail)
+	}
+}
+
+// walkApproxSize is the original O(items) formula approxSizeBytesLocked
+// used to compute. Kept as a local-to-test reference so the cached
+// (O(1)) version can be pinned for parity across mutation paths. If
+// the formula in approxSizeBytesLocked ever changes, update this
+// helper in lockstep — the two MUST stay byte-equal.
+func walkApproxSize(b *scopeBuffer) int64 {
+	var total int64
+	total += 64
+	total += int64(len(b.items)) * 32
+	for _, item := range b.items {
+		total += approxItemSize(item)
+	}
+	total += int64(len(b.byID)) * 32
+	for k := range b.byID {
+		total += int64(len(k))
+	}
+	total += int64(len(b.bySeq)) * 16
+	total += int64(len(b.readHeatBuckets)) * 16
+	return total
+}
+
+// approxSizeBytesLocked must equal the walk-based formula after every
+// mutation path. Pinning this is what makes the O(1) rewrite safe:
+// admission control is unchanged, but observability would silently
+// drift if any path forgot to update b.bytes or b.idKeyBytes.
+func TestApproxSizeBytes_MatchesWalkAcrossMutations(t *testing.T) {
+	buf := newscopeBuffer(100)
+
+	check := func(label string) {
+		t.Helper()
+		got := buf.approxSizeBytes()
+		want := walkApproxSize(buf)
+		if got != want {
+			t.Errorf("%s: cached=%d walk=%d (drift; an incremental update path is missing)",
+				label, got, want)
+		}
+	}
+
+	check("empty scope")
+
+	for i := 0; i < 5; i++ {
+		if _, err := buf.appendItem(newItem("s", fmt.Sprintf("id_%d", i),
+			map[string]interface{}{"v": i})); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	check("after 5 appends with non-empty ids")
+
+	if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+		t.Fatalf("append no-id: %v", err)
+	}
+	check("after append with empty id (byID untouched)")
+
+	if _, _, err := buf.upsertByID(newItem("s", "id_2",
+		map[string]interface{}{"v": 999, "extra": "longer payload"})); err != nil {
+		t.Fatalf("upsert replace: %v", err)
+	}
+	check("after upsert replace (ID unchanged, payload grew)")
+
+	if _, err := buf.updateByID("id_3", json.RawMessage(`{"v":3,"x":"larger"}`)); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	check("after updateByID")
+
+	if _, _, err := buf.counterAdd("s", "counter_a", 1); err != nil {
+		t.Fatalf("counter create: %v", err)
+	}
+	check("after counterAdd create (new id)")
+
+	if _, _, err := buf.counterAdd("s", "counter_a", 5); err != nil {
+		t.Fatalf("counter inc: %v", err)
+	}
+	check("after counterAdd increment (key unchanged, value grew)")
+
+	if _, err := buf.deleteByID("id_0"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	check("after deleteByID (id removed from byID)")
+
+	if _, err := buf.deleteUpToSeq(3); err != nil {
+		t.Fatalf("deleteUpToSeq: %v", err)
+	}
+	check("after deleteUpToSeq (bulk delete)")
+
+	if _, err := buf.replaceAll([]Item{
+		newItem("s", "fresh_a", nil),
+		newItem("s", "fresh_b_longer_id", nil),
+		newItem("s", "", nil),
+	}); err != nil {
+		t.Fatalf("replaceAll: %v", err)
+	}
+	check("after replaceAll (commitReplacement)")
+}
+
+// idKeyBytes drift test: a path that adds to byID without bumping the
+// counter would inflate approx_scope_mb relative to the walk; a delete
+// path that forgets the subtraction would deflate it. Track the
+// counter directly across an add-then-delete cycle as a tighter check
+// than the parity test above.
+func TestIDKeyBytes_TracksByIDKeysExactly(t *testing.T) {
+	buf := newscopeBuffer(100)
+
+	if buf.idKeyBytes != 0 {
+		t.Fatalf("fresh scope: idKeyBytes=%d want 0", buf.idKeyBytes)
+	}
+
+	if _, err := buf.appendItem(newItem("s", "abc", nil)); err != nil {
+		t.Fatalf("append abc: %v", err)
+	}
+	if buf.idKeyBytes != 3 {
+		t.Errorf("after append abc: idKeyBytes=%d want 3", buf.idKeyBytes)
+	}
+
+	if _, err := buf.appendItem(newItem("s", "twelve_chars", nil)); err != nil {
+		t.Fatalf("append twelve_chars: %v", err)
+	}
+	if buf.idKeyBytes != 3+12 {
+		t.Errorf("after append twelve_chars: idKeyBytes=%d want 15", buf.idKeyBytes)
+	}
+
+	if _, err := buf.deleteByID("abc"); err != nil {
+		t.Fatalf("delete abc: %v", err)
+	}
+	if buf.idKeyBytes != 12 {
+		t.Errorf("after delete abc: idKeyBytes=%d want 12", buf.idKeyBytes)
+	}
+
+	if _, err := buf.deleteByID("twelve_chars"); err != nil {
+		t.Fatalf("delete twelve_chars: %v", err)
+	}
+	if buf.idKeyBytes != 0 {
+		t.Errorf("after delete all: idKeyBytes=%d want 0", buf.idKeyBytes)
+	}
+}
+
+// --- lastWriteTS --------------------------------------------------------------
+//
+// lastWriteTS advances on every path that mutates the scope (append,
+// upsert, update, counter_add, delete, deleteUpToSeq, replaceAll) and
+// stays put on reads (recordRead). The "preCall <= lastWriteTS" bracket
+// is the resilient assertion shape: clock resolution on Windows can be
+// ~16ms, so a strictly-greater check against createdTS would be flaky;
+// tests instead assert that lastWriteTS sits at or beyond a stamp
+// captured immediately before the write call.
+
+func TestLastWriteTS_FreshScopeEqualsCreatedTS(t *testing.T) {
+	buf := newscopeBuffer(10)
+	if buf.lastWriteTS != buf.createdTS {
+		t.Fatalf("fresh scope: lastWriteTS=%d createdTS=%d (must be equal — both initialised from one nowUnixMicro() call)",
+			buf.lastWriteTS, buf.createdTS)
+	}
+	if buf.lastWriteTS == 0 {
+		t.Fatal("fresh scope: lastWriteTS=0 (must be initialised to a real timestamp, not left zero)")
+	}
+}
+
+func TestLastWriteTS_AdvancesOnAppend(t *testing.T) {
+	buf := newscopeBuffer(10)
+	pre := nowUnixMicro()
+	it, err := buf.appendItem(newItem("s", "", nil))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if buf.lastWriteTS < pre {
+		t.Errorf("lastWriteTS=%d pre=%d (must be >= pre-call stamp)", buf.lastWriteTS, pre)
+	}
+	if buf.lastWriteTS != it.Ts {
+		t.Errorf("lastWriteTS=%d item.Ts=%d (insertNewItemLocked must use one nowUs for both)",
+			buf.lastWriteTS, it.Ts)
+	}
+}
+
+func TestLastWriteTS_AdvancesOnUpsertReplace(t *testing.T) {
+	buf := newscopeBuffer(10)
+	if _, _, err := buf.upsertByID(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("upsert create: %v", err)
+	}
+	beforeReplace := buf.lastWriteTS
+
+	pre := nowUnixMicro()
+	if _, _, err := buf.upsertByID(newItem("s", "a", map[string]interface{}{"v": 2})); err != nil {
+		t.Fatalf("upsert replace: %v", err)
+	}
+	if buf.lastWriteTS < pre {
+		t.Errorf("lastWriteTS=%d pre=%d (replace path must stamp lastWriteTS)", buf.lastWriteTS, pre)
+	}
+	if buf.lastWriteTS < beforeReplace {
+		t.Errorf("lastWriteTS=%d went backwards from %d (replace must not regress the timestamp)",
+			buf.lastWriteTS, beforeReplace)
+	}
+}
+
+func TestLastWriteTS_AdvancesOnUpdate(t *testing.T) {
+	buf := newscopeBuffer(10)
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	pre := nowUnixMicro()
+	if _, err := buf.updateByID("a", json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if buf.lastWriteTS < pre {
+		t.Errorf("lastWriteTS=%d pre=%d (replaceItemAtIndexLocked must stamp lastWriteTS)",
+			buf.lastWriteTS, pre)
+	}
+}
+
+func TestLastWriteTS_AdvancesOnCounterAdd(t *testing.T) {
+	buf := newscopeBuffer(10)
+
+	preCreate := nowUnixMicro()
+	if _, _, err := buf.counterAdd("s", "c", 1); err != nil {
+		t.Fatalf("counter create: %v", err)
+	}
+	if buf.lastWriteTS < preCreate {
+		t.Errorf("after create: lastWriteTS=%d pre=%d (create branch must stamp)",
+			buf.lastWriteTS, preCreate)
+	}
+	afterCreate := buf.lastWriteTS
+
+	preInc := nowUnixMicro()
+	if _, _, err := buf.counterAdd("s", "c", 1); err != nil {
+		t.Fatalf("counter increment: %v", err)
+	}
+	if buf.lastWriteTS < preInc {
+		t.Errorf("after increment: lastWriteTS=%d pre=%d (replace branch via replaceItemAtIndexLocked must stamp)",
+			buf.lastWriteTS, preInc)
+	}
+	if buf.lastWriteTS < afterCreate {
+		t.Errorf("increment regressed lastWriteTS from %d to %d", afterCreate, buf.lastWriteTS)
+	}
+}
+
+func TestLastWriteTS_AdvancesOnDelete(t *testing.T) {
+	buf := newscopeBuffer(10)
+	for i := 0; i < 5; i++ {
+		if _, err := buf.appendItem(newItem("s", "", map[string]interface{}{"i": i})); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	preDelByID := nowUnixMicro()
+	if _, err := buf.deleteBySeq(2); err != nil {
+		t.Fatalf("deleteBySeq: %v", err)
+	}
+	if buf.lastWriteTS < preDelByID {
+		t.Errorf("after deleteBySeq: lastWriteTS=%d pre=%d", buf.lastWriteTS, preDelByID)
+	}
+
+	preDelUpTo := nowUnixMicro()
+	if _, err := buf.deleteUpToSeq(4); err != nil {
+		t.Fatalf("deleteUpToSeq: %v", err)
+	}
+	if buf.lastWriteTS < preDelUpTo {
+		t.Errorf("after deleteUpToSeq: lastWriteTS=%d pre=%d", buf.lastWriteTS, preDelUpTo)
+	}
+}
+
+func TestLastWriteTS_AdvancesOnReplaceAll(t *testing.T) {
+	buf := newscopeBuffer(10)
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	pre := nowUnixMicro()
+	if _, err := buf.replaceAll([]Item{newItem("s", "x", nil), newItem("s", "y", nil)}); err != nil {
+		t.Fatalf("replaceAll: %v", err)
+	}
+	if buf.lastWriteTS < pre {
+		t.Errorf("after replaceAll (commitReplacement): lastWriteTS=%d pre=%d", buf.lastWriteTS, pre)
+	}
+}
+
+// recordRead is a read-path bookkeeping update; it must not advance
+// lastWriteTS. lastAccessTS is the matching read-side counter.
+func TestLastWriteTS_NotAffectedByReads(t *testing.T) {
+	buf := newscopeBuffer(10)
+	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	beforeRead := buf.lastWriteTS
+
+	buf.recordRead(nowUnixMicro())
+
+	if buf.lastWriteTS != beforeRead {
+		t.Errorf("recordRead changed lastWriteTS: before=%d after=%d (reads must not bump write timestamp)",
+			beforeRead, buf.lastWriteTS)
+	}
+}
+
+// stats() must surface lastWriteTS unchanged. Readers of the snapshot
+// rely on this as the authoritative "when was this scope last written"
+// signal — drift here would make /stats lie even though the underlying
+// field is correct.
+func TestStats_SurfacesLastWriteTS(t *testing.T) {
+	buf := newscopeBuffer(10)
+	pre := nowUnixMicro()
+	if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	st := buf.stats(nowUnixMicro())
+	if st.LastWriteTS != buf.lastWriteTS {
+		t.Errorf("stats.LastWriteTS=%d buf.lastWriteTS=%d (snapshot must mirror the field)",
+			st.LastWriteTS, buf.lastWriteTS)
+	}
+	if st.LastWriteTS < pre {
+		t.Errorf("stats.LastWriteTS=%d pre=%d", st.LastWriteTS, pre)
 	}
 }
 

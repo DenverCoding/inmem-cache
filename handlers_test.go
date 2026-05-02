@@ -167,6 +167,13 @@ func TestAppend_Success(t *testing.T) {
 	if _, hasTS := item["ts"]; !hasTS {
 		t.Errorf("response item must carry a cache-assigned 'ts' field: %v", item)
 	}
+	// /append response echoes scope/id/seq/ts under "item", but NOT
+	// payload — the client supplied that on the way in. This pin
+	// catches a regression that would re-introduce the payload echo
+	// (doubling wire cost on large writes).
+	if _, present := item["payload"]; present {
+		t.Errorf("/append response item must not echo payload back: %v", item)
+	}
 }
 
 // Drives a 200-byte scope and 200-byte id end-to-end: over the pre-v0.5.11
@@ -470,6 +477,9 @@ func TestUpsert_Creates(t *testing.T) {
 	item := out["item"].(map[string]interface{})
 	if item["seq"].(float64) != 1 {
 		t.Errorf("seq=%v want 1", item["seq"])
+	}
+	if _, present := item["payload"]; present {
+		t.Errorf("/upsert response item must not echo payload back: %v", item)
 	}
 
 	_, got, _ := doRequest(t, h, "GET", "/get?scope=s&id=a", "")

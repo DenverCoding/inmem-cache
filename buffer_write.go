@@ -100,6 +100,7 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		b.bySeq[updated.Seq] = updated
 		b.byID[item.ID] = updated
 		b.bytes += delta
+		b.lastWriteTS = nowUs
 		return updated, false, nil
 	}
 
@@ -245,8 +246,10 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 			b.byID = make(map[string]Item)
 		}
 		b.byID[item.ID] = item
+		b.idKeyBytes += int64(len(item.ID))
 	}
 	b.bytes += size
+	b.lastWriteTS = nowUs
 
 	return item, nil
 }

@@ -15,25 +15,38 @@ package scopecache
 // scope counts, where Go heap overhead per scope becomes non-trivial
 // relative to item bytes.
 //
-// PRECONDITION: caller holds b.mu.
+// O(1) by construction: every term is either a constant, a length on
+// an existing field, or a counter (b.bytes, b.idKeyBytes) the write
+// paths maintain incrementally. The earlier walk-based version was
+// O(items) per /stats call and dominated /stats latency on scopes
+// with thousands of items.
+//
+// Term breakdown:
+//   - 64                          : *scopeBuffer struct overhead (constant)
+//   - len(b.items) * 32           : Go slice slot overhead per item
+//   - b.bytes                     : Σ approxItemSize(item) — admission-control byte sum
+//   - len(b.byID) * 32            : map bucket overhead per byID entry
+//   - b.idKeyBytes                : Σ len(item.ID) over the byID keys
+//   - len(b.bySeq) * 16           : map bucket overhead per bySeq entry
+//   - ReadHeatWindowDays * 16     : heat-bucket ringbuffer (constant)
+//
+// PRECONDITION: caller holds b.mu (or b.mu.RLock — the formula reads
+// only mu-protected state and the read-heat ringbuffer constant; the
+// atomic Day/Count fields inside heat buckets are not touched here).
 func (b *scopeBuffer) approxSizeBytesLocked() int64 {
-	var total int64
-	total += 64
-	total += int64(len(b.items)) * 32
+	const structOverhead = int64(64)
+	const itemSlotOverhead = int64(32)
+	const byIDBucketOverhead = int64(32)
+	const bySeqBucketOverhead = int64(16)
+	const heatBucketOverhead = int64(ReadHeatWindowDays) * 16
 
-	for _, item := range b.items {
-		total += approxItemSize(item)
-	}
-
-	total += int64(len(b.byID)) * 32
-	for k := range b.byID {
-		total += int64(len(k))
-	}
-
-	total += int64(len(b.bySeq)) * 16
-	total += int64(len(b.readHeatBuckets)) * 16
-
-	return total
+	return structOverhead +
+		int64(len(b.items))*itemSlotOverhead +
+		b.bytes +
+		int64(len(b.byID))*byIDBucketOverhead +
+		b.idKeyBytes +
+		int64(len(b.bySeq))*bySeqBucketOverhead +
+		heatBucketOverhead
 }
 
 func (b *scopeBuffer) approxSizeBytes() int64 {
@@ -51,6 +64,7 @@ type scopeStats struct {
 	LastSeq         uint64
 	ApproxScopeMB   MB
 	CreatedTS       int64
+	LastWriteTS     int64
 	LastAccessTS    int64
 	ReadCountTotal  uint64
 	Last7DReadCount uint64
@@ -71,6 +85,7 @@ func (b *scopeBuffer) stats(now int64) scopeStats {
 		LastSeq:         b.lastSeq,
 		ApproxScopeMB:   MB(b.approxSizeBytesLocked()),
 		CreatedTS:       b.createdTS,
+		LastWriteTS:     b.lastWriteTS,
 		LastAccessTS:    b.lastAccessTS.Load(),
 		ReadCountTotal:  b.readCountTotal.Load(),
 		Last7DReadCount: b.computeLast7DReadCount(now),

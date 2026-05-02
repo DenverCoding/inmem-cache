@@ -35,11 +35,17 @@ import (
 // swapped into a scopeBuffer. Separating "prepare" from "commit" lets callers
 // like /warm and /rebuild validate every scope up-front and only mutate state
 // once they know all scopes will succeed.
+//
+// idKeyBytes is computed during buildReplacementState (which already
+// walks every item) and assigned wholesale at commit time, so the
+// O(1) approxSizeBytesLocked path stays correct after a /warm or
+// /rebuild without forcing the commit to re-walk byID.
 type scopeReplacement struct {
-	items   []Item
-	byID    map[string]Item
-	bySeq   map[uint64]Item
-	lastSeq uint64
+	items      []Item
+	byID       map[string]Item
+	bySeq      map[uint64]Item
+	lastSeq    uint64
+	idKeyBytes int64
 }
 
 // buildReplacementState converts a caller-supplied item list into the
@@ -92,17 +98,20 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 	}
 
 	byID := make(map[string]Item, nonEmptyIDs)
+	var idKeyBytes int64
 	for _, item := range built {
 		if item.ID != "" {
 			byID[item.ID] = item
+			idKeyBytes += int64(len(item.ID))
 		}
 	}
 
 	return scopeReplacement{
-		items:   built,
-		byID:    byID,
-		bySeq:   bySeq,
-		lastSeq: lastSeq,
+		items:      built,
+		byID:       byID,
+		bySeq:      bySeq,
+		lastSeq:    lastSeq,
+		idKeyBytes: idKeyBytes,
 	}, nil
 }
 
@@ -134,10 +143,12 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 		b.store.totalBytes.Add(newBytes - b.bytes)
 	}
 	b.bytes = newBytes
+	b.idKeyBytes = r.idKeyBytes
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
+	b.lastWriteTS = time.Now().UnixMicro()
 }
 
 // commitReplacementPreReserved is the batch-aware commit used by
@@ -170,10 +181,12 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 		}
 	}
 	b.bytes = newBytes
+	b.idKeyBytes = r.idKeyBytes
 	b.items = r.items
 	b.byID = r.byID
 	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
+	b.lastWriteTS = time.Now().UnixMicro()
 }
 
 func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {

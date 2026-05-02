@@ -13,9 +13,19 @@ import (
 // Cache-internal counter scopes used by /guarded for usage tracking.
 // Auto-provisioned by ensureScope at handler init and defensively on
 // each request — see guardedflow.md §M.
+//
+// Three counters per capability_id, all keyed by the tenant's id:
+//   - _counters_count_calls   : number of sub-calls dispatched
+//   - _counters_count_kb_in   : request-body KiB (Content-Length on outer envelope)
+//   - _counters_count_kb_out  : response-body KiB (slot bytes + envelope)
+//
+// _kb_in and _kb_out together let an operator price both ingress and
+// egress per tenant. Increments under 1 KiB are skipped on both kb
+// counters — same anti-spam rule, applied symmetrically.
 const (
 	countersScopeCalls = "_counters_count_calls"
-	countersScopeKB    = "_counters_count_kb"
+	countersScopeKBIn  = "_counters_count_kb_in"
+	countersScopeKBOut = "_counters_count_kb_out"
 
 	// tokensScope is the cache-internal auth-gate. Each active tenant
 	// has one item under this scope, keyed by the tenant's
@@ -183,6 +193,16 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture ingress byte count BEFORE decodeBody wraps the body — once
+	// MaxBytesReader is in place ContentLength stays authoritative (it
+	// reflects the Content-Length header, not what was actually read), but
+	// reading it here keeps the measurement co-located with the request
+	// arriving. ContentLength is -1 for chunked-encoding bodies; in that
+	// case we skip the kb_in increment (same shape as the kb_out skip
+	// for sub-1-KiB responses). Almost every JSON client sends
+	// Content-Length, so this caveat is negligible in practice.
+	ingressBytes := r.ContentLength
+
 	// Step 1: parse body.
 	var req guardedRequest
 	if err := decodeBody(w, r, api.maxMultiCallBytes, &req); err != nil {
@@ -276,13 +296,18 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 	// Step 10: counter increments. Best-effort — failures are silently
 	// ignored (observability counter, not auth). Calls counter advances
 	// by len(calls) so a batch of N sub-calls counts as N units of cache
-	// work, matching how the kb counter (which scales with the outer
-	// envelope's byte size) already behaves. Approximate response bytes
-	// from the slots' bytes used (the outer envelope adds ~256 constant
-	// bytes; the granularity at KiB matters less than at bytes).
-	// See guardedflow.md §M.
-	approxKB := (bodyBytesUsed + multiCallEnvelopeOverhead) / 1024
-	api.guardedIncrementCounters(capabilityID, int64(len(calls)), approxKB)
+	// work, matching how the kb counters (which scale with byte size)
+	// behave. kb_in measures the outer request envelope (Content-Length);
+	// kb_out approximates the response from slot bytes + envelope
+	// overhead (the outer envelope adds ~256 constant bytes; the
+	// granularity at KiB matters less than at bytes). See
+	// guardedflow.md §M.
+	var inKB int64
+	if ingressBytes > 0 {
+		inKB = ingressBytes / 1024
+	}
+	outKB := (bodyBytesUsed + multiCallEnvelopeOverhead) / 1024
+	api.guardedIncrementCounters(capabilityID, int64(len(calls)), inKB, outKB)
 
 	writeJSONWithMeta(w, http.StatusOK, orderedFields{
 		{"ok", true},
@@ -291,20 +316,33 @@ func (api *API) handleGuarded(w http.ResponseWriter, r *http.Request) {
 	}, started)
 }
 
-// guardedIncrementCounters bumps the two cache-internal counter scopes
-// for a /guarded request. Auto-provisions both scopes via ensureScope —
-// self-heals after a /wipe. Failures are silently ignored: this is an
-// observability counter, not auth. See guardedflow.md §M.
-func (api *API) guardedIncrementCounters(capabilityID string, calls, kb int64) {
+// guardedIncrementCounters bumps the three cache-internal counter
+// scopes for a /guarded request. Auto-provisions every scope via
+// ensureScope — self-heals after a /wipe. Failures are silently
+// ignored: these are observability counters, not auth.
+//
+// Each counter is skipped when its delta would round to zero — the
+// kb counters use a 1-KiB granularity so a stream of tiny sub-1-KiB
+// requests cannot inflate them with empty increments. The calls
+// counter has no skip rule (every dispatched sub-call counts).
+//
+// See guardedflow.md §M.
+func (api *API) guardedIncrementCounters(capabilityID string, calls, kbIn, kbOut int64) {
 	if calls > 0 {
 		if callsBuf := api.store.ensureScope(countersScopeCalls); callsBuf != nil {
 			_, _, _ = callsBuf.counterAdd(countersScopeCalls, capabilityID, calls)
 		}
 	}
 
-	if kb > 0 {
-		if kbBuf := api.store.ensureScope(countersScopeKB); kbBuf != nil {
-			_, _, _ = kbBuf.counterAdd(countersScopeKB, capabilityID, kb)
+	if kbIn > 0 {
+		if buf := api.store.ensureScope(countersScopeKBIn); buf != nil {
+			_, _, _ = buf.counterAdd(countersScopeKBIn, capabilityID, kbIn)
+		}
+	}
+
+	if kbOut > 0 {
+		if buf := api.store.ensureScope(countersScopeKBOut); buf != nil {
+			_, _, _ = buf.counterAdd(countersScopeKBOut, capabilityID, kbOut)
 		}
 	}
 }

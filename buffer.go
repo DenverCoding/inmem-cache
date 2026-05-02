@@ -66,8 +66,25 @@ type scopeBuffer struct {
 	// mutated under b.mu; the store-level total is kept in sync via
 	// Store.reserveBytes (single-item write paths) and
 	// scopeBuffer.commitReplacement (bulk /warm and /rebuild).
-	bytes     int64
-	createdTS int64
+	bytes int64
+	// idKeyBytes is the running sum of len(item.ID) over every item
+	// that has a non-empty ID. Lets approxSizeBytesLocked surface a
+	// per-scope memory estimate in O(1) without re-walking byID's
+	// keys on every /stats call. Mutated under b.mu by every path
+	// that mutates b.byID. Observability-only: NOT charged against
+	// the store-byte cap (admission control stays layout-independent —
+	// see the file-level header on buffer_stats.go).
+	idKeyBytes int64
+	createdTS  int64
+	// lastWriteTS is the microsecond timestamp of the most recent write
+	// that touched this scope — append, upsert, update, counter_add,
+	// delete, or a /warm/rebuild commit. Set under b.mu by every write
+	// path; read in stats() under b.mu.RLock. Initialised equal to
+	// createdTS so a freshly-created scope without writes reports a
+	// non-zero value (the creation itself is treated as the most recent
+	// "touch"). Surfaced as last_write_ts on /stats. Distinct from
+	// lastAccessTS — that one tracks reads.
+	lastWriteTS int64
 	// lastAccessTS, readCountTotal, last7DReadCount and the heat-bucket
 	// counts are atomic so the read-hot path (recordRead) does not need
 	// to take b.mu. recordRead used to take b.mu.Lock() — a write lock
@@ -106,8 +123,10 @@ func newscopeBuffer(maxItems int) *scopeBuffer {
 	// replaceItemAtIndexLocked helper lazily initialise these maps
 	// before assigning into them. Reads, deletes, len and range are
 	// nil-safe in Go and need no guard.
+	now := nowUnixMicro()
 	return &scopeBuffer{
-		maxItems:  maxItems,
-		createdTS: nowUnixMicro(),
+		maxItems:    maxItems,
+		createdTS:   now,
+		lastWriteTS: now,
 	}
 }

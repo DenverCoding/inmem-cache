@@ -94,9 +94,13 @@ Rules:
 
 - if `id` is present, duplicate `scope + id` writes must be rejected
 
-Scope-level timing data (`created_ts`, `last_access_ts`) is separate from
-the per-item `ts` and surfaces only in `/stats` and
-`/delete_scope_candidates`.
+Scope-level timing data (`created_ts`, `last_write_ts`, `last_access_ts`)
+is separate from the per-item `ts` and surfaces only in `/stats` and
+`/delete_scope_candidates`. All three are cache-owned microsecond
+timestamps. `last_write_ts` is bumped by every mutation that touches the
+scope (append, upsert, update, counter_add, delete, delete_up_to,
+warm/rebuild commit); a fresh scope reports `last_write_ts == created_ts`.
+`last_access_ts` is bumped by reads (head, tail, get, render).
 
 ---
 
@@ -260,6 +264,7 @@ This endpoint only returns metadata. It does not delete anything.
 
 **Time model.** All timing used by `/delete_scope_candidates` is scope-level and cache-owned:
 - `created_ts` — when the scope was first created in the cache
+- `last_write_ts` — when any item in the scope was last written, updated, or deleted (initialised equal to `created_ts` on a fresh scope so a write-only scope without reads still has a meaningful "last touch")
 - `last_access_ts` — when any item in the scope was last read
 - `last_7d_read_count` — reads against the scope over a rolling 7-day window
 
@@ -311,6 +316,12 @@ Behavior:
 - stamp `ts = now()` (microsecond unix timestamp)
 - reject duplicate `scope + id`
 - reject with `507 Insufficient Storage` if the scope is already at capacity
+
+Response: `{ok, item: {scope, id, seq, ts}, duration_us}`. The cache
+echoes scope/id/seq/ts under `item` so a `/multi_call` slot stays
+self-correlating without the caller mapping `results[i]` back onto
+`calls[i]`. `payload` is intentionally absent — the client supplied it
+on the way in, and a 1 MiB write would otherwise double the wire cost.
 
 ### `POST /warm`
 Input:
@@ -373,7 +384,7 @@ Behavior:
 - reject with `507 Insufficient Storage` if the create path would exceed the per-scope item cap or the store byte cap (replace only pays the payload byte delta)
 - unlike `/append` (which rejects duplicate ids) and `/update` (which soft-misses on absent items), `/upsert` always writes — making it the idempotent, retry-safe write path
 - no `seq` addressing: `seq` is cache-assigned and has no meaning for a not-yet-created item
-- response includes `"created": true` for a fresh item, `false` for a replace, plus the final `item`
+- response is `{ok, created, item: {scope, id, seq, ts}, duration_us}` — `created=true` for a fresh item, `false` for a replace; same no-payload-echo shape as `/append`
 
 ### `POST /counter_add`
 Input:
@@ -612,18 +623,25 @@ with two extra steps:
   string-replace, so a payload that happens to contain the prefix
   literal is left untouched.)
 - **Usage counters.** After each successful `/guarded` request the cache
-  calls `counterAdd` on two reserved scopes:
+  calls `counterAdd` on three reserved scopes:
     - `_counters_count_calls`, item id = `<capability_id>`, value
       `+= len(calls)` — one unit per *sub-call*, not per HTTP request.
       A batch of 5 sub-calls counts the same as 5 solo `/guarded`
       requests, so a tenant who batches their work cannot hide it.
-    - `_counters_count_kb`, item id = `<capability_id>`, value
+    - `_counters_count_kb_in`, item id = `<capability_id>`, value
+      `+= ⌊request_content_length / 1024⌋`, where `request_content_length`
+      is the outer envelope's `Content-Length`. Captures ingress
+      bandwidth per tenant for billing/quota use cases. Increment is
+      skipped when the rounded KiB value is `0` (sub-1-KiB request) or
+      when `Content-Length` is unknown (chunked encoding) — the same
+      `by > 0` rule that guards `_counters_count_kb_out`.
+    - `_counters_count_kb_out`, item id = `<capability_id>`, value
       `+= ⌊response_bytes / 1024⌋`, where `response_bytes` is the
       outer envelope's body size including all slot bodies. The
       increment is skipped entirely when the rounded KiB value is `0`
       so the counter never tries to `counterAdd` with `by: 0`
       (which would `400`).
-  Both counters are monotonic and have no built-in reset endpoint — to
+  All three counters are monotonic and have no built-in reset endpoint — to
   zero a `<capability_id>` the operator runs `/admin /upsert` on the
   counter scope with `payload: 0` (or `/admin /delete_scope` to wipe
   every tenant's counter at once). Whole-batch rejections (missing
@@ -631,10 +649,10 @@ with two extra steps:
   increment nothing — they `return` before the dispatch loop. Counter
   failures inside the
   loop are silently ignored — this is observability, not auth, and
-  must not affect the tenant's response. Both scopes auto-create on
-  first use via `ensureScope` and survive `/wipe` (the next `/guarded`
-  call re-creates them); they are queryable through `/admin /tail` or
-  `/admin /get`.
+  must not affect the tenant's response. All three scopes auto-create
+  on first use via `ensureScope` and survive `/wipe` (the next
+  `/guarded` call re-creates them); they are queryable through
+  `/admin /tail` or `/admin /get`.
 
 Failure modes:
 
@@ -685,14 +703,15 @@ cleans the whole footprint:
 ```json
 POST /admin
 {"calls": [
-  {"path": "/delete",         "body": {"scope":         "_tokens",               "id": "<capability_id>"}},
-  {"path": "/delete",         "body": {"scope":         "_counters_count_calls", "id": "<capability_id>"}},
-  {"path": "/delete",         "body": {"scope":         "_counters_count_kb",    "id": "<capability_id>"}},
+  {"path": "/delete",         "body": {"scope":         "_tokens",                  "id": "<capability_id>"}},
+  {"path": "/delete",         "body": {"scope":         "_counters_count_calls",    "id": "<capability_id>"}},
+  {"path": "/delete",         "body": {"scope":         "_counters_count_kb_in",    "id": "<capability_id>"}},
+  {"path": "/delete",         "body": {"scope":         "_counters_count_kb_out",   "id": "<capability_id>"}},
   {"path": "/delete_guarded", "body": {"capability_id": "<capability_id>"}}
 ]}
 ```
 
-The fourth call (`/delete_guarded`, see §6.2) is the load-bearing one
+The fifth call (`/delete_guarded`, see §6.2) is the load-bearing one
 for storage hygiene: it drops every scope the tenant ever created
 under their own `_guarded:<capability_id>:*` namespace in one
 operation. Without it the token's data sits in the store forever,
@@ -701,7 +720,7 @@ unreachable but still occupying bytes against `MaxStoreBytes`.
 The same pattern applies on **reissuance**: rotating a tenant's token
 produces a new `capability_id`, so the old token's data is unreachable
 to the new token by construction. If the rotation is meant as a hard
-boundary (e.g. after a security incident), run the four-delete batch
+boundary (e.g. after a security incident), run the five-delete batch
 above and the old footprint is gone. If the rotation is meant to be
 transparent to the tenant, the application must additionally migrate
 `_guarded:<old_id>:*` data to `_guarded:<new_id>:*` *before* the
@@ -834,8 +853,9 @@ sub-calls run with an internal admin context-marker on the synthetic
 request, telling the inner handler to skip the prefix check. This is
 how the operator provisions `_guarded:<capability_id>:*` for tenant
 onboarding and how `/guarded` itself increments its
-`_counters_count_calls` / `_counters_count_kb` scopes (which run
-through the same admin-context dispatcher under the hood).
+`_counters_count_calls`, `_counters_count_kb_in`, and
+`_counters_count_kb_out` scopes (which run through the same
+admin-context dispatcher under the hood).
 
 The cache does not interpret the bytes after `_` — `_guarded:`,
 `_counters_*`, and any future internal namespace are conventions the
@@ -1035,18 +1055,20 @@ Response:
     "scope": "thread:900",
     "id": "post_1",
     "seq": 1,
-    "ts": 1745236800123456,
-    "payload": { "text": "hello" }
+    "ts": 1745236800123456
   },
   "duration_us": 35
 }
 ```
 
-`ts` is the cache-assigned microsecond timestamp (see §3); it is set by
-the cache on every write that touches the item. Clients must not supply
-it on the request — every write rejects a non-zero client `ts` with
-400. `/append` without an `id` is also valid; the response item then
-carries `scope`, `seq`, `ts`, and `payload` (no `id`).
+`seq` and `ts` are the cache-assigned values; `scope` and `id` echo
+back what the client sent so a `/multi_call` slot stays self-correlating
+without the caller mapping `results[i]` back onto `calls[i]`. The
+response intentionally does NOT echo back `payload` — the client
+supplied it on the way in, and a 1 MiB write would otherwise double the
+wire cost. Clients that need to read back the stored payload issue a
+follow-up `/get`. `/append` without an `id` is also valid; the response
+omits the `id` field then (the cache does not assign one).
 
 ### 13.3 Head
 
@@ -1334,13 +1356,13 @@ Response (first call — create):
     "scope": "views",
     "id": "article:42",
     "seq": 1,
-    "payload": 1000
+    "ts": 1745236800123456
   },
   "duration_us": 1282
 }
 ```
 
-A second call with the same `scope + id` replaces the payload and returns `"created": false`; the `seq` stays the same.
+A second call with the same `scope + id` replaces the payload and returns `"created": false`; the `seq` stays the same; `ts` is refreshed to the new write's microsecond. Like `/append`, the response echoes scope/id/seq/ts under `item` but does not include `payload`.
 
 ### 13.13 Counter add
 
@@ -1478,6 +1500,7 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
           {
             "scope": "warmscope",
             "created_ts": 1777129877881480,
+            "last_write_ts": 1777129877881480,
             "last_access_ts": 0,
             "last_7d_read_count": 0,
             "item_count": 2,
@@ -1486,6 +1509,7 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
           {
             "scope": "events",
             "created_ts": 1777129877945548,
+            "last_write_ts": 1777129877948210,
             "last_access_ts": 1777129877952071,
             "last_7d_read_count": 1,
             "item_count": 2,
@@ -1557,7 +1581,7 @@ Response (captured against an already-warm scope; see the cold-start note below)
       "status": 200,
       "body": {
         "ok": true,
-        "item": { "scope": "thread:900", "id": "post_1", "seq": 2, "payload": { "text": "hello" } },
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 2, "ts": 1745236800123456 },
         "duration_us": 5
       }
     },
@@ -1587,7 +1611,7 @@ Response (captured against an already-warm scope; see the cold-start note below)
 }
 ```
 
-Each `results[i].body` is **literally** the JSON the standalone endpoint would have returned — `/get` carries its own `hit`/`count`/`approx_response_mb`/`duration_us`, `/delete` carries `hit`/`deleted_count`/`duration_us`, and so on. The outer envelope adds the batch-level `count`, `approx_response_mb`, and `duration_us` (total dispatcher time, including every sub-call).
+Each `results[i].body` is **literally** the JSON the standalone endpoint would have returned — `/append` echoes scope/id/seq/ts under `item` (no payload), `/get` carries `hit`/`count`/`item` (full item including payload)/`approx_response_mb`/`duration_us`, `/delete` carries `hit`/`deleted_count`/`duration_us`, and so on. The outer envelope adds the batch-level `count`, `approx_response_mb`, and `duration_us` (total dispatcher time, including every sub-call).
 
 Sequential dispatch is observable here: the `/get` at index 1 sees the same `seq` and payload that the `/append` at index 0 just produced, and the `/delete` at index 2 reports `deleted_count: 1` because the item it just observed via `/get` is still there.
 
@@ -1604,7 +1628,7 @@ A sub-call that errors does **not** abort the batch. For example, replacing the 
       "status": 200,
       "body": {
         "ok": true,
-        "item": { "scope": "thread:900", "id": "post_1", "seq": 3, "payload": { "text": "hello" } },
+        "item": { "scope": "thread:900", "id": "post_1", "seq": 3, "ts": 1745236800123890 },
         "duration_us": 5
       }
     },
@@ -1678,6 +1702,7 @@ Response (trimmed to two scopes for readability — the real response carries ev
             "last_seq": 2,
             "approx_scope_mb": 0.0004,
             "created_ts": 1777129877833274,
+            "last_write_ts": 1777129877840115,
             "last_access_ts": 1777129877961422,
             "read_count_total": 7,
             "last_7d_read_count": 7
@@ -1687,6 +1712,7 @@ Response (trimmed to two scopes for readability — the real response carries ev
             "last_seq": 2,
             "approx_scope_mb": 0.0005,
             "created_ts": 1777129877945548,
+            "last_write_ts": 1777129877948210,
             "last_access_ts": 1777129877952071,
             "read_count_total": 1,
             "last_7d_read_count": 1
@@ -1739,7 +1765,7 @@ Response:
           "scope": "_tokens",
           "id":    "14071b366a5fa1d421678c6449fff66329dc10618b0e5785893e2db4ea2712d3",
           "seq":   1,
-          "payload": { "user_id": 42, "issued_at": "2026-04-27T..." }
+          "ts":    1745236800123456
         },
         "duration_us": 568
       }
@@ -1828,7 +1854,7 @@ Response (note the `scope` in the slot's `item` reads `"events"`, not
       "status": 200,
       "body": {
         "ok": true,
-        "item": { "scope": "events", "id": "e1", "seq": 2, "payload": { "text": "hello" } },
+        "item": { "scope": "events", "id": "e1", "seq": 2, "ts": 1745236800123890 },
         "duration_us": 8
       }
     }
@@ -1908,17 +1934,23 @@ noted):
 - `calls[i]` with no `scope` in body or query → `calls[i]: missing
   'scope'`.
 
-After each successful `/guarded` request, two reserved scopes get an
+After each successful `/guarded` request, three reserved scopes get an
 atomic counter increment:
 
 - `_counters_count_calls`, item id = `<capability_id>`, value
   `+= len(calls)` — one unit per sub-call, not per HTTP request.
-- `_counters_count_kb`, item id = `<capability_id>`, value
-  `+= ⌊response_bytes / 1024⌋` — outer envelope body size including
-  all slot bodies. Increment skipped when the rounded value is `0`.
+- `_counters_count_kb_in`, item id = `<capability_id>`, value
+  `+= ⌊request_content_length / 1024⌋` — outer request envelope's
+  `Content-Length`. Captures ingress bandwidth per tenant. Increment
+  skipped when the rounded value is `0` (sub-1-KiB request) or when
+  `Content-Length` is unknown (chunked encoding).
+- `_counters_count_kb_out`, item id = `<capability_id>`, value
+  `+= ⌊response_bytes / 1024⌋` — outer response envelope body size
+  including all slot bodies. Increment skipped when the rounded value
+  is `0`.
 
-Both scopes auto-create on first hit and survive `/wipe` (next call
-auto-recreates them). Counters are monotonic — to zero a
+All three scopes auto-create on first hit and survive `/wipe` (next
+call auto-recreates them). Counters are monotonic — to zero a
 `capability_id` the operator runs `/admin /upsert` with `payload: 0`
 (or `/admin /delete_scope` to wipe every tenant's counter at once).
 Counter writes are best-effort: a counter failure is silently swallowed
@@ -1968,11 +2000,51 @@ curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
 ```
 
 `payload: 47` means this `capability_id` has dispatched 47 sub-calls
-through `/guarded` since the counter scope was last reset. Pair with a
-`/get` on `_counters_count_kb` for byte-level usage. Use `/tail` (or
-`/admin /tail` since the scope is reserved) to enumerate every active
-capability_id at once when building a billing report or hunting an
-abusive tenant.
+through `/guarded` since the counter scope was last reset.
+
+A billing or usage dashboard typically wants all three numbers for a
+tenant in one round-trip — calls, ingress KiB, egress KiB. `/admin`
+takes a `/multi_call`-shaped batch, so one request gets all three:
+
+```bash
+curl -s --unix-socket /run/scopecache.sock -X POST http://localhost/admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "calls": [
+      { "path": "/get", "query": { "scope": "_counters_count_calls",  "id": "<capability_id>" }},
+      { "path": "/get", "query": { "scope": "_counters_count_kb_in",  "id": "<capability_id>" }},
+      { "path": "/get", "query": { "scope": "_counters_count_kb_out", "id": "<capability_id>" }}
+    ]
+  }'
+```
+
+```json
+{
+  "ok": true,
+  "count": 3,
+  "results": [
+    { "status": 200, "body": { "ok": true, "hit": true, "count": 1,
+        "item": { "scope": "_counters_count_calls",  "id": "<capability_id>", "seq": 1, "payload": 47    }, "duration_us": 3 }},
+    { "status": 200, "body": { "ok": true, "hit": true, "count": 1,
+        "item": { "scope": "_counters_count_kb_in",  "id": "<capability_id>", "seq": 1, "payload": 1284  }, "duration_us": 3 }},
+    { "status": 200, "body": { "ok": true, "hit": true, "count": 1,
+        "item": { "scope": "_counters_count_kb_out", "id": "<capability_id>", "seq": 1, "payload": 312   }, "duration_us": 3 }}
+  ],
+  "duration_us": 41,
+  "approx_response_mb": 0.0006
+}
+```
+
+This tenant has dispatched 47 sub-calls, uploaded ~1.25 MiB of request
+bodies, and received ~305 KiB of response bodies through `/guarded`
+since the counters were last reset. A `hit: false` slot means the
+counter scope hasn't recorded that dimension for this tenant yet —
+either the tenant has never crossed the 1-KiB threshold for that side,
+or the counter has just been reset.
+
+Use `/tail` (or `/admin /tail` since the scopes are reserved) to
+enumerate every active capability_id at once when building a billing
+report or hunting an abusive tenant.
 
 Scopecache does not enforce a quota itself — there is no "calls/day"
 cap, no `429 Too Many Requests`, no automatic suspension. Counters are

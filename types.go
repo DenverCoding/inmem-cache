@@ -193,6 +193,7 @@ type ScopeReadHeatBucket struct {
 type Candidate struct {
 	Scope           string `json:"scope"`
 	CreatedTS       int64  `json:"created_ts"`
+	LastWriteTS     int64  `json:"last_write_ts"`
 	LastAccessTS    int64  `json:"last_access_ts"`
 	Last7dReadCount uint64 `json:"last_7d_read_count"`
 	ItemCount       int    `json:"item_count"`
