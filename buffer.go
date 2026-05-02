@@ -8,43 +8,43 @@ import (
 // Locking invariants for *scopeBuffer
 // -----------------------------------
 //
-// 1. Lock-acquisition order is strictly TOP-DOWN:
-//    Store-level code may acquire scopeShard.mu BEFORE buf.mu.
-//    Multi-shard ops additionally acquire shard.mu in ascending
-//    shard-index order (see numShards comment in store.go).
+//  1. Lock-acquisition order is strictly TOP-DOWN:
+//     Store-level code may acquire scopeShard.mu BEFORE buf.mu.
+//     Multi-shard ops additionally acquire shard.mu in ascending
+//     shard-index order (see numShards comment in store.go).
 //
-// 2. scopeBuffer methods MUST NOT reach back up to acquire any
-//    Store-level lock — neither scopeShard.mu nor any future
-//    Store-side mutex — while holding b.mu. The only Store-state a
-//    scopeBuffer method may touch with b.mu held is the atomic
-//    counter (b.store.totalBytes.Add / b.store.reserveBytes); those
-//    take no locks. Reverse-direction locking (buf → shard) would
-//    deadlock against deleteScope, replaceScopes, wipe, rebuildAll
-//    and deleteGuardedTenant, all of which take shard.mu first and
-//    then individual buf.mu's.
+//  2. scopeBuffer methods MUST NOT reach back up to acquire any
+//     Store-level lock — neither scopeShard.mu nor any future
+//     Store-side mutex — while holding b.mu. The only Store-state a
+//     scopeBuffer method may touch with b.mu held is the atomic
+//     counter (b.store.totalBytes.Add / b.store.reserveBytes); those
+//     take no locks. Reverse-direction locking (buf → shard) would
+//     deadlock against deleteScope, replaceScopes, wipe, rebuildAll
+//     and deleteGuardedTenant, all of which take shard.mu first and
+//     then individual buf.mu's.
 //
-// 3. Read-path heat-tracking (recordRead) is intentionally lock-free
-//    on b.mu — it uses atomics on the heat-bucket ring buffer. This
-//    is what lets concurrent readers hold b.mu.RLock simultaneously
-//    without serialising on the heat counters. See recordRead's own
-//    comment in buffer_heat.go for the CAS state machine.
+//  3. Read-path heat-tracking (recordRead) is intentionally lock-free
+//     on b.mu — it uses atomics on the heat-bucket ring buffer. This
+//     is what lets concurrent readers hold b.mu.RLock simultaneously
+//     without serialising on the heat counters. See recordRead's own
+//     comment in buffer_heat.go for the CAS state machine.
 //
 // Adding a new scopeBuffer method that violates rule 2 is the most
 // likely future deadlock — flag it in code review.
 //
 // File layout for scopeBuffer methods:
 //
-//   buffer.go          — struct + ctor + this invariant header
-//   buffer_locked.go   — cross-cutting helpers (precomputeRenderBytes,
-//                        indexBySeqLocked, replaceItemAtIndexLocked,
-//                        reservePayloadDeltaLocked)
-//   buffer_heat.go     — lock-free read-heat tracking
-//   buffer_write.go    — appendItem, upsertByID, updateByID, updateBySeq
-//   buffer_counter.go  — counterAdd, parseCounterValue
-//   buffer_delete.go   — deleteByID, deleteBySeq, deleteUpToSeq, deleteIndexLocked
-//   buffer_replace.go  — scopeReplacement type, build / commit pipeline, replaceAll
-//   buffer_read.go     — tailOffset, sinceSeq, getByID, getBySeq
-//   buffer_stats.go    — approxSizeBytes, scopeStats type, stats()
+//	buffer.go          — struct + ctor + this invariant header
+//	buffer_locked.go   — cross-cutting helpers (precomputeRenderBytes,
+//	                     indexBySeqLocked, replaceItemAtIndexLocked,
+//	                     reservePayloadDeltaLocked)
+//	buffer_heat.go     — lock-free read-heat tracking
+//	buffer_write.go    — appendItem, upsertByID, updateByID, updateBySeq
+//	buffer_counter.go  — counterAdd, parseCounterValue
+//	buffer_delete.go   — deleteByID, deleteBySeq, deleteUpToSeq, deleteIndexLocked
+//	buffer_replace.go  — scopeReplacement type, build / commit pipeline, replaceAll
+//	buffer_read.go     — tailOffset, sinceSeq, getByID, getBySeq
+//	buffer_stats.go    — approxSizeBytes, scopeStats type, stats()
 type scopeBuffer struct {
 	mu sync.RWMutex
 	// store is set when the buffer is owned by a Store. When nil (orphan

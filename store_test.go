@@ -569,13 +569,13 @@ func TestStore_appendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 //
 // Two legal outcomes for B (the small writer):
 //
-//   Case 1 — B grabs buf.mu before A's cleanup. B commits its item;
-//            A's cleanup observes len(items) > 0 and aborts. B's err = nil.
+//	Case 1 — B grabs buf.mu before A's cleanup. B commits its item;
+//	         A's cleanup observes len(items) > 0 and aborts. B's err = nil.
 //
-//   Case 2 — A's cleanup grabs buf.mu first, marks detached, releases.
-//            B then grabs buf.mu, sees b.detached, returns *ScopeDetachedError
-//            without reserving bytes (the detach check is the first thing
-//            after the lock acquisition).
+//	Case 2 — A's cleanup grabs buf.mu first, marks detached, releases.
+//	         B then grabs buf.mu, sees b.detached, returns *ScopeDetachedError
+//	         without reserving bytes (the detach check is the first thing
+//	         after the lock acquisition).
 //
 // Anything else from B — *StoreFullError, *ScopeFullError, a raw
 // errors.New — would surface to the handler as the wrong status class and
