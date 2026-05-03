@@ -239,6 +239,178 @@ json_assert 'stats agg: last_write_ts strictly advanced past wipe' \
 # re-create the 100k-scope DoS that motivated the strip.
 json_assert 'stats agg: no scopes key' '(.scopes // null) == null'
 
+# --- /stats freshness contract: every mutation advances last_write_ts ---------
+# Per-operation tightening of the aggregate-counters block above. The
+# block above proved the four atomics agree with the actual store
+# contents at one snapshot; this block walks every state-changing
+# endpoint individually and asserts that:
+#
+#   1. total_items moves by exactly the right delta on every op
+#      (append +1, upsert-create +1, upsert-replace 0, update 0,
+#      delete -1, delete_up_to -N, delete_scope -|scope|, wipe -all)
+#   2. scope_count moves by exactly the right delta
+#   3. last_write_ts strictly advances on every state-changing op —
+#      this is the polling contract: any client that re-queries only
+#      when last_write_ts has changed is guaranteed to see the new
+#      state
+#   4. last_write_ts on /stats equals item.ts for the most recent
+#      successful single-item write (the store-wide max equals the
+#      per-item stamp because the cache uses one nowUs() for both,
+#      see buffer_write.go's insertNewItemLocked)
+#
+# Everything is timestamped via sleep 1 between ops so the
+# strict-greater check is reliable even on hosts where two writes
+# could otherwise land in the same microsecond.
+say '== /stats freshness: every mutation advances last_write_ts =='
+
+call 'fresh: wipe baseline' 200 POST /wipe
+call 'fresh: stats post-wipe' 200 GET /stats
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+json_assert 'fresh: total_items == 0 post-wipe' '.total_items == 0'
+json_assert 'fresh: scope_count == 0 post-wipe' '.scope_count == 0'
+
+# Single /append: /stats.last_write_ts must equal the item.ts that
+# came back from the same call. Both are set from one nowUs() inside
+# insertNewItemLocked, so the store-wide max equals the per-item
+# stamp on a freshly-wiped store with exactly one write.
+sleep 1
+call 'fresh: single /append' 200 POST /append \
+    '{"scope":"fresh","id":"a","payload":1}'
+APPEND_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
+call 'fresh: stats after single /append' 200 GET /stats
+json_assert 'fresh: total_items == 1 after one /append' '.total_items == 1'
+json_assert 'fresh: scope_count == 1 after one /append' '.scope_count == 1'
+json_assert 'fresh: last_write_ts strictly > wipe-stamp' \
+    ".last_write_ts > $FRESH_TS_PREV"
+json_assert 'fresh: last_write_ts == item.ts of the only write' \
+    ".last_write_ts == $APPEND_ITEM_TS"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# 10 more appends: total_items must land at exactly 11 (1 + 10),
+# scope_count stays at 1 (same scope), last_write_ts advances and
+# equals the ts of the 10th item.
+sleep 1
+i=1
+while [ $i -le 10 ]; do
+    quiet_call "fresh: /append #$i" 200 POST /append \
+        "{\"scope\":\"fresh\",\"id\":\"x$i\",\"payload\":$i}"
+    i=$((i+1))
+done
+# Read x10 back so we can compare its ts to /stats.last_write_ts.
+# x10 was the most recent /append, so it carries the max ts in the
+# store and /stats.last_write_ts must equal it (CAS-max contract).
+call 'fresh: read x10 (last appended)' 200 GET '/get?scope=fresh&id=x10'
+LAST_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
+call 'fresh: stats after 10 appends' 200 GET /stats
+json_assert 'fresh: total_items == 11 after 1 + 10 appends' '.total_items == 11'
+json_assert 'fresh: scope_count still 1 (same scope)' '.scope_count == 1'
+json_assert 'fresh: last_write_ts strictly > pre-loop' \
+    ".last_write_ts > $FRESH_TS_PREV"
+json_assert 'fresh: last_write_ts == latest-item.ts' \
+    ".last_write_ts == $LAST_ITEM_TS"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# Second scope: scope_count must move to 2 on the first append, item
+# count by exactly +1.
+sleep 1
+call 'fresh: append into a second scope' 200 POST /append \
+    '{"scope":"fresh2","id":"y1","payload":1}'
+SECOND_SCOPE_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
+call 'fresh: stats after second-scope append' 200 GET /stats
+json_assert 'fresh: total_items == 12 after second-scope append' '.total_items == 12'
+json_assert 'fresh: scope_count == 2 after second-scope append' '.scope_count == 2'
+json_assert 'fresh: last_write_ts == y1.ts (latest write)' \
+    ".last_write_ts == $SECOND_SCOPE_ITEM_TS"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# /update: total_items unchanged, last_write_ts strictly advances.
+# /update is the canonical "modify in place, no count change" path —
+# any regression that leaks an item creation here surfaces as a
+# total_items drift on the very next /stats call. /update's response
+# does not echo the item (only {ok, hit, updated_count}), so the
+# refreshed ts comes from a /get probe.
+sleep 1
+call 'fresh: /update existing item' 200 POST /update \
+    '{"scope":"fresh","id":"x5","payload":555}'
+call 'fresh: read x5 to get refreshed ts' 200 GET '/get?scope=fresh&id=x5'
+UPDATE_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
+call 'fresh: stats after /update' 200 GET /stats
+json_assert 'fresh: total_items unchanged after /update' '.total_items == 12'
+json_assert 'fresh: scope_count unchanged after /update' '.scope_count == 2'
+json_assert 'fresh: last_write_ts strictly > pre-update' \
+    ".last_write_ts > $FRESH_TS_PREV"
+json_assert 'fresh: last_write_ts == updated-item.ts' \
+    ".last_write_ts == $UPDATE_ITEM_TS"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# /upsert replace: same shape as /update (item already exists).
+# total_items unchanged, last_write_ts strictly advances.
+sleep 1
+call 'fresh: /upsert replace existing' 200 POST /upsert \
+    '{"scope":"fresh","id":"x5","payload":5555}'
+UPSERT_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
+call 'fresh: stats after /upsert replace' 200 GET /stats
+json_assert 'fresh: total_items unchanged after /upsert replace' '.total_items == 12'
+json_assert 'fresh: last_write_ts strictly > pre-upsert' \
+    ".last_write_ts > $FRESH_TS_PREV"
+json_assert 'fresh: last_write_ts == replaced-item.ts' \
+    ".last_write_ts == $UPSERT_ITEM_TS"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# /delete one item: total_items -1, scope_count unchanged (scope still
+# has 10 items left in fresh + 1 in fresh2), last_write_ts advances.
+sleep 1
+call 'fresh: /delete one item' 200 POST /delete \
+    '{"scope":"fresh","id":"x1"}'
+call 'fresh: stats after /delete' 200 GET /stats
+json_assert 'fresh: total_items == 11 after /delete (-1)' '.total_items == 11'
+json_assert 'fresh: scope_count still 2 (fresh still has items)' '.scope_count == 2'
+json_assert 'fresh: last_write_ts strictly > pre-delete' \
+    ".last_write_ts > $FRESH_TS_PREV"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# /delete_up_to: trim a defined number of items, last_write_ts advances.
+# Seq layout in scope "fresh" before this op (after the deletes/updates
+# above): a(1), x1 already deleted, x2(3), x3(4), x4(5), x5(6 — value
+# upserted), x6(7), x7(8), x8(9), x9(10), x10(11). Total = 10 items
+# in this scope plus 1 in fresh2 = 11 store-wide.
+# delete_up_to max_seq=4 in scope "fresh" removes seqs 1, 3, 4 (a, x2,
+# x3). x1 is already gone so deleted_count == 3. total_items goes to 8.
+sleep 1
+call 'fresh: /delete_up_to seq=4' 200 POST /delete_up_to \
+    '{"scope":"fresh","max_seq":4}'
+json_assert 'fresh: /delete_up_to deleted_count == 3' '.deleted_count == 3'
+call 'fresh: stats after /delete_up_to' 200 GET /stats
+json_assert 'fresh: total_items == 8 after /delete_up_to (-3)' '.total_items == 8'
+json_assert 'fresh: scope_count still 2' '.scope_count == 2'
+json_assert 'fresh: last_write_ts strictly > pre-trim' \
+    ".last_write_ts > $FRESH_TS_PREV"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# /delete_scope on "fresh": removes the 7 items still there, scope_count
+# goes from 2 to 1, total_items from 8 to 1 (only fresh2's y1 left).
+sleep 1
+call 'fresh: /delete_scope fresh' 200 POST /delete_scope \
+    '{"scope":"fresh"}'
+json_assert 'fresh: /delete_scope deleted_items == 7' '.deleted_items == 7'
+call 'fresh: stats after /delete_scope' 200 GET /stats
+json_assert 'fresh: total_items == 1 after /delete_scope (-7)' '.total_items == 1'
+json_assert 'fresh: scope_count == 1 after /delete_scope (-1)' '.scope_count == 1'
+json_assert 'fresh: last_write_ts strictly > pre-delete-scope' \
+    ".last_write_ts > $FRESH_TS_PREV"
+FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+
+# /wipe with one scope still alive: every counter goes to 0,
+# last_write_ts still advances (wipe is itself a state-changing
+# event, see the post-wipe assertion at the top of /stats agg above).
+sleep 1
+call 'fresh: /wipe (final, after one-scope state)' 200 POST /wipe
+call 'fresh: stats after final /wipe' 200 GET /stats
+json_assert 'fresh: total_items == 0 after /wipe' '.total_items == 0'
+json_assert 'fresh: scope_count == 0 after /wipe' '.scope_count == 0'
+json_assert 'fresh: last_write_ts strictly > pre-wipe' \
+    ".last_write_ts > $FRESH_TS_PREV"
+
 # --- writes: append / upsert / update / counter_add ---------------------------
 say '== writes =='
 call 'append'                           200 POST   /append   '{"scope":"s","id":"a","payload":{"v":1}}'
