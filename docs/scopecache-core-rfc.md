@@ -196,7 +196,8 @@ and is independent of both name length and scope size — the
 underlying Go-map lookup is constant-time on average. In-process
 measurements show roughly 35–40 ns per single-item read on
 commodity hardware (`BenchmarkStore_GetByID` and
-`BenchmarkStore_GetBySeq`).
+`BenchmarkStore_GetBySeq`; 100 scopes × 1,000 items × 512-byte
+payloads, ~57 MiB store).
 
 The `_` prefix is a **social convention** for state managed by
 addons (`_tokens`, `_counters_*`, addon-internal scopes). The core
