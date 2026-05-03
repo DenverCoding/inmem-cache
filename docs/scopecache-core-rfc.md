@@ -199,12 +199,10 @@ commodity hardware (`BenchmarkStore_GetByID` and
 `BenchmarkStore_GetBySeq`; 100 scopes × 1,000 items × 512-byte
 payloads, ~57 MiB store).
 
-The `_` prefix is a **social convention** for state managed by
-addons (`_tokens`, `_counters_*`, addon-internal scopes). The core
-does not enforce it. If an addon wants its state protected from
-public writes, that protection must come from the operator (gating
-which endpoints are publicly reachable) or from the addon itself
-(signed payloads, unguessable scope names) — see §1.4.
+Some addons follow a naming convention where their state-scopes
+start with an underscore (`_tokens`, `_counters_*`, etc.). The
+core does not parse or interpret these prefixes — see §9.2 for
+the protection model.
 
 ---
 
@@ -1313,10 +1311,14 @@ non-goal entirely.
   apache equivalents), Unix-socket filesystem permissions,
   separate listeners per trust level — all lives outside the
   cache.
-- **Reserved-scope enforcement.** The `_*` prefix is a social
-  convention (§2.3), not a core check. Addons that want their
-  state-scopes protected from public writes rely on operator
-  gating, naming convention, or payload-side validation.
+- **Reserved-scope enforcement.** The `_` prefix is a social
+  convention for state managed by addons (`_tokens`,
+  `_counters_*`, addon-internal scopes). The core does not parse
+  scope names or treat any prefix as reserved. If an addon wants
+  its state protected from public writes, that protection comes
+  from the operator (gating which endpoints are publicly
+  reachable) or from the addon itself (signed payloads,
+  unguessable scope names) — see §1.4 for the boundary rule.
 - **Network exposure.** The cache speaks HTTP on whatever the
   adapter mounts it on (Unix socket for the standalone binary,
   Caddy listener for the module). The adapter and the operator
