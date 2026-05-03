@@ -39,13 +39,15 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 				continue
 			}
 			buf.mu.Lock()
-			deletedItems += len(buf.items)
+			itemCount := len(buf.items)
+			deletedItems += itemCount
 			scopeBytes := buf.bytes
 			delete(sh.scopes, scope)
 			// Combined into one Add so observers never see a transient state
 			// with one released and the other still charged. Same shape as
 			// deleteScope: item bytes + per-scope overhead, in lockstep.
 			s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
+			s.totalItems.Add(-int64(itemCount))
 			freedBytes += scopeBytes + scopeBufferOverhead
 			buf.detached = true
 			buf.store = nil
@@ -54,6 +56,7 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 		}
 	}
 
+	s.scopeCount.Add(-int64(deletedScopes))
 	return deletedScopes, deletedItems, freedBytes
 }
 
@@ -90,6 +93,8 @@ func (s *Store) wipe() (int, int, int64) {
 	}
 
 	freedBytes := s.totalBytes.Swap(0)
+	s.totalItems.Store(0)
+	s.scopeCount.Store(0)
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
@@ -202,14 +207,24 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 	// getOrCreateScope here would deadlock on its internal RLock/Lock
 	// pair against our held write lock). Neither step can fail, so either
 	// every scope is replaced or (if an earlier phase aborted) none are.
+	//
+	// scopeCount delta accumulates here for new-scope inserts and is
+	// applied once at the end. totalItems is handled by
+	// commitReplacementPreReserved itself (it computes the per-scope
+	// item delta under b.mu against the post-drift len(b.items)).
+	var newScopes int64
 	for _, p := range plans {
 		sh := s.shardFor(p.scope)
 		buf, ok := sh.scopes[p.scope]
 		if !ok {
 			buf = s.newscopeBuffer()
 			sh.scopes[p.scope] = buf
+			newScopes++
 		}
 		buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
+	}
+	if newScopes > 0 {
+		s.scopeCount.Add(newScopes)
 	}
 
 	return len(plans), nil
@@ -296,6 +311,8 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		s.shards[i].scopes = newShardMaps[i]
 	}
 	s.totalBytes.Store(totalNewBytes)
+	s.totalItems.Store(int64(totalItems))
+	s.scopeCount.Store(int64(totalScopes))
 
 	return totalScopes, totalItems, nil
 }

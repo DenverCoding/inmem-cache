@@ -3,10 +3,8 @@ package scopecache
 import (
 	"errors"
 	"hash/maphash"
-	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // numShards splits the scope map into independently-locked shards.
@@ -65,6 +63,42 @@ type Store struct {
 	// phase-4 finding "max_store_mb underestimates real memory cost at
 	// high scope counts" for the open pre-v1.0 question.
 	totalBytes atomic.Int64
+
+	// totalItems and scopeCount mirror the totalBytes pattern: every
+	// write path that creates or removes an item / scope adjusts the
+	// matching atomic in lockstep with its per-scope mutation. This
+	// makes /stats O(1) — three atomic loads and zero shard walks,
+	// independent of how many scopes the store holds.
+	//
+	// Lockstep discipline (same as totalBytes):
+	//   - item insert paths: insertNewItemLocked + counterAdd create
+	//     branch do totalItems.Add(+1) under b.mu, alongside b.bytes
+	//     accounting.
+	//   - item delete paths: deleteIndexLocked does totalItems.Add(-1);
+	//     deleteUpToSeq does Add(-N) for the batch.
+	//   - bulk replace paths: commitReplacement(PreReserved) compute
+	//     itemDelta = len(r.items) - len(b.items) at commit time and
+	//     Add the delta. No pre-reservation needed (no store-wide item
+	//     cap), so concurrent stale-pointer drift is handled implicitly
+	//     by reading len(b.items) at commit time rather than a snapshot.
+	//   - scope create paths: getOrCreateScopeTrackingCreated and
+	//     ensureScope do scopeCount.Add(+1) inside the shard-write-lock
+	//     critical section, alongside the map insert.
+	//   - scope delete paths: cleanupIfEmptyAndUnused, deleteScope and
+	//     deleteGuardedTenant do scopeCount.Add(-N) and totalItems
+	//     .Add(-itemCount) inside their shard-write-lock section.
+	//   - bulk reset paths: wipe does Store(0) on both; rebuildAll does
+	//     Store(totalItems) / Store(totalScopes) under all-shard write
+	//     lock, same shape as totalBytes.Store(totalNewBytes).
+	//
+	// Forgetting one of these is exactly the same class of bug as
+	// forgetting a totalBytes update — corrupts /stats silently. The
+	// invariant test (TestStore_StatsCounters_Invariant) walks every
+	// shard and asserts totalItems == Σ len(buf.items) and scopeCount
+	// == Σ len(sh.scopes); run it after touching any of the paths
+	// above.
+	totalItems atomic.Int64
+	scopeCount atomic.Int64
 }
 
 func NewStore(c Config) *Store {
@@ -265,6 +299,7 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, boo
 		}
 	}
 	sh.scopes[scope] = preBuf
+	s.scopeCount.Add(1)
 	sh.mu.Unlock()
 	return preBuf, true, nil
 }
@@ -306,6 +341,7 @@ func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 
 	delete(sh.scopes, scope)
 	s.totalBytes.Add(-scopeBufferOverhead)
+	s.scopeCount.Add(-1)
 	buf.detached = true
 	buf.store = nil
 }
@@ -527,6 +563,7 @@ func (s *Store) ensureScope(scope string) *scopeBuffer {
 
 	buf = s.newscopeBuffer()
 	sh.scopes[scope] = buf
+	s.scopeCount.Add(1)
 	return buf
 }
 
@@ -569,6 +606,8 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	// time. Combined into one Add so observers never see a transient
 	// state with one released and the other still charged.
 	s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
+	s.totalItems.Add(-int64(itemCount))
+	s.scopeCount.Add(-1)
 	buf.detached = true
 	buf.store = nil
 	buf.mu.Unlock()
@@ -578,48 +617,40 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 // storeStats is the typed snapshot of the store. stats() returns it so the
 // /stats handler can flatten it into orderedFields for the wire, and so any
 // in-package caller (tests, future adapters) can read fields directly.
+//
+// The snapshot is intentionally aggregate-only — no per-scope map. At
+// 100k+ scopes the per-scope enumeration was the dominant cost of
+// /stats (one buffer.stats() call per scope, each materialising a
+// scopeStats and computing computeLast7DReadCount), and the response
+// would routinely exceed practical client and proxy limits. Per-scope
+// enumeration moves to a separate paginated /scopelist endpoint
+// (see Phase A roadmap).
 type storeStats struct {
 	ScopeCount    int
 	TotalItems    int
 	ApproxStoreMB MB
 	MaxStoreMB    MB
-	Scopes        map[string]scopeStats
 }
 
+// stats returns the store-wide aggregate snapshot in O(1) — three
+// atomic loads plus the static cap. No shard walks, no per-scope
+// fan-out: every counter is maintained incrementally on the write
+// paths (see the totalItems/scopeCount comment block on *Store for
+// the lockstep discipline).
+//
+// Each load is independent, so a concurrent burst of /append + /delete
+// can produce a snapshot where (scope_count, total_items, approx_store_mb)
+// reflect three slightly different instants. That's the same caveat
+// the previous shard-walking version carried (and weaker — it walked
+// shards sequentially, releasing locks between them). /stats has
+// always been an approximation; this version is honest about it
+// without paying the per-scope enumeration cost.
 func (s *Store) stats() storeStats {
-	// Per-shard snapshot: each shard is RLock'd, walked, RUnlock'd in
-	// turn. scope_count and total_items still reflect the same set of
-	// scopes that were captured into Scopes (loop derives them from
-	// the same per-shard walk), so the response is internally
-	// consistent even though it is no longer a global instant — a
-	// concurrent /append on shard 5 may land after we release shard 5
-	// and before we take shard 6, but the response always agrees with
-	// itself. approx_store_mb is read once from the atomic counter so
-	// it can show the post-release total even when the per-scope
-	// walk shows the pre-release set; that mismatch existed pre-
-	// sharding too (totalBytes is read after the lock, by design) and
-	// /stats has always been an approximation.
-	now := nowUnixMicro()
-	byScope := make(map[string]scopeStats)
-	totalItems := 0
-
-	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.RLock()
-		for scope, buf := range sh.scopes {
-			st := buf.stats(now)
-			byScope[scope] = st
-			totalItems += st.ItemCount
-		}
-		sh.mu.RUnlock()
-	}
-
 	return storeStats{
-		ScopeCount:    len(byScope),
-		TotalItems:    totalItems,
+		ScopeCount:    int(s.scopeCount.Load()),
+		TotalItems:    int(s.totalItems.Load()),
 		ApproxStoreMB: MB(s.totalBytes.Load()),
 		MaxStoreMB:    MB(s.maxStoreBytes),
-		Scopes:        byScope,
 	}
 }
 
@@ -634,41 +665,4 @@ func (s *Store) listScopes() map[string]*scopeBuffer {
 		sh.mu.RUnlock()
 	}
 	return out
-}
-
-// scopeCandidates returns the eviction-candidate list used by
-// /delete_scope_candidates: every scope with its heat metadata,
-// optionally filtered to scopes older than `hours`, sorted by
-// last_access_ts ascending (stalest first), then truncated to
-// `limit`. Walks every shard via listScopes — per-scope-consistent
-// but not a global atomic snapshot, same caveat as stats(). Advisory
-// data, not authoritative.
-func (s *Store) scopeCandidates(hours int64, limit int) []Candidate {
-	now := nowUnixMicro()
-	minAgeMicros := hours * int64(time.Hour/time.Microsecond)
-
-	scopes := s.listScopes()
-	list := make([]Candidate, 0, len(scopes))
-	for name, buf := range scopes {
-		st := buf.stats(now)
-		if hours > 0 && now-st.CreatedTS < minAgeMicros {
-			continue
-		}
-		list = append(list, Candidate{
-			Scope:           name,
-			CreatedTS:       st.CreatedTS,
-			LastWriteTS:     st.LastWriteTS,
-			LastAccessTS:    st.LastAccessTS,
-			Last7dReadCount: st.Last7DReadCount,
-			ItemCount:       st.ItemCount,
-			ApproxScopeMB:   st.ApproxScopeMB,
-		})
-	}
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].LastAccessTS < list[j].LastAccessTS
-	})
-	if len(list) > limit {
-		list = list[:limit]
-	}
-	return list
 }

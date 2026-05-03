@@ -773,7 +773,7 @@ func TestWipe_EmptyStore(t *testing.T) {
 }
 
 func TestWipe_ClearsEveryScope(t *testing.T) {
-	h, _ := newTestHandler(10)
+	h, api := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","id":"1","payload":{"v":1}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","id":"2","payload":{"v":2}}`)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"b","id":"1","payload":{"v":1}}`)
@@ -792,14 +792,16 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 		t.Errorf("freed_mb=%v want >0", out["freed_mb"])
 	}
 
-	// Both scopes must now be gone.
+	// Both scopes must now be gone — /stats no longer surfaces a per-scope
+	// map (moved to /scopelist), so we verify via the aggregate counter
+	// plus a direct store walk to make the "no scope named a or b" check
+	// explicit.
+	_, out, _ = doAdminRequest(t, h, "/stats", "")
+	if got := mustFloat(t, out, "scope_count"); got != 0 {
+		t.Errorf("scope_count=%v want 0 after /wipe", got)
+	}
 	for _, scope := range []string{"a", "b"} {
-		_, out, _ := doAdminRequest(t, h, "/stats", "")
-		scopes, ok := out["scopes"].(map[string]interface{})
-		if !ok {
-			t.Fatalf("stats has no scopes map: %+v", out)
-		}
-		if _, present := scopes[scope]; present {
+		if _, ok := api.store.getScope(scope); ok {
 			t.Errorf("scope %q still present after /wipe", scope)
 		}
 	}
@@ -1217,8 +1219,17 @@ func TestStats_Structure(t *testing.T) {
 	if mustFloat(t, out, "total_items") != 1 {
 		t.Errorf("total_items=%v want 1", out["total_items"])
 	}
-	if _, ok := out["scopes"].(map[string]interface{}); !ok {
-		t.Error("scopes not a map")
+	if _, present := out["approx_store_mb"]; !present {
+		t.Error("approx_store_mb missing")
+	}
+	if _, present := out["max_store_mb"]; !present {
+		t.Error("max_store_mb missing")
+	}
+	// Regression guard: /stats is intentionally aggregate-only since the
+	// 100k-scope DoS observation. Per-scope enumeration belongs to the
+	// (future) /scopelist endpoint.
+	if _, present := out["scopes"]; present {
+		t.Errorf("scopes key must NOT appear on /stats response (moved to /scopelist): %v", out["scopes"])
 	}
 }
 
@@ -1349,48 +1360,62 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 		t.Errorf("total_items=%v want 218", got)
 	}
 
-	scopes, ok := stats["scopes"].(map[string]interface{})
+	// Per-scope assertions read directly from *scopeBuffer — /stats is
+	// aggregate-only since the 100k-scope DoS observation; per-scope
+	// detail moves to the (future) /scopelist endpoint, but the
+	// underlying buffer fields are still the source of truth for these
+	// invariants and we want them pinned here.
+	xBuf, ok := api.store.getScope("x")
 	if !ok {
-		t.Fatalf("stats.scopes not a map: %v", stats["scopes"])
+		t.Fatalf("scope x missing from store")
 	}
+	xBuf.mu.RLock()
+	xItemCount := len(xBuf.items)
+	xLastSeq := xBuf.lastSeq
+	xBuf.mu.RUnlock()
+	xLast7D := xBuf.last7DReadCount.Load()
+	xLastAccess := xBuf.lastAccessTS.Load()
 
-	xStats, ok := scopes["x"].(map[string]interface{})
-	if !ok {
-		t.Fatalf("stats.scopes.x missing: %v", scopes)
+	if xItemCount != 69 {
+		t.Errorf("x.item_count=%d want 69", xItemCount)
 	}
-	if got := mustFloat(t, xStats, "item_count"); got != 69 {
-		t.Errorf("x.item_count=%v want 69", got)
+	if xLastSeq != 100 {
+		t.Errorf("x.last_seq=%d want 100 (delete_up_to must not rewind lastSeq)", xLastSeq)
 	}
-	if got := mustFloat(t, xStats, "last_seq"); got != 100 {
-		t.Errorf("x.last_seq=%v want 100 (delete_up_to must not rewind lastSeq)", got)
-	}
-	if got := mustFloat(t, xStats, "last_7d_read_count"); got < 1 {
-		t.Errorf("x.last_7d_read_count=%v want >= 1 after /head", got)
+	if xLast7D < 1 {
+		t.Errorf("x.last_7d_read_count=%d want >= 1 after /head", xLast7D)
 	}
 	// /head on x was the last touch, so its last_access_ts must sit inside
 	// the window we bracketed around that call.
-	if got := int64(mustFloat(t, xStats, "last_access_ts")); got < preHeadX || got > postHeadX {
-		t.Errorf("x.last_access_ts=%d not in bracket [%d, %d] around /head", got, preHeadX, postHeadX)
+	if xLastAccess < preHeadX || xLastAccess > postHeadX {
+		t.Errorf("x.last_access_ts=%d not in bracket [%d, %d] around /head", xLastAccess, preHeadX, postHeadX)
 	}
 
-	yStats, ok := scopes["y"].(map[string]interface{})
+	yBuf, ok := api.store.getScope("y")
 	if !ok {
-		t.Fatalf("stats.scopes.y missing: %v", scopes)
+		t.Fatalf("scope y missing from store")
 	}
-	if got := mustFloat(t, yStats, "item_count"); got != 149 {
-		t.Errorf("y.item_count=%v want 149", got)
+	yBuf.mu.RLock()
+	yItemCount := len(yBuf.items)
+	yLastSeq := yBuf.lastSeq
+	yBuf.mu.RUnlock()
+	yLast7D := yBuf.last7DReadCount.Load()
+	yLastAccess := yBuf.lastAccessTS.Load()
+
+	if yItemCount != 149 {
+		t.Errorf("y.item_count=%d want 149", yItemCount)
 	}
-	if got := mustFloat(t, yStats, "last_seq"); got != 150 {
-		t.Errorf("y.last_seq=%v want 150", got)
+	if yLastSeq != 150 {
+		t.Errorf("y.last_seq=%d want 150", yLastSeq)
 	}
 	// /tail + /get byID both hit y — at least 2 reads, same calendar day → single bucket.
-	if got := mustFloat(t, yStats, "last_7d_read_count"); got < 2 {
-		t.Errorf("y.last_7d_read_count=%v want >= 2 after /tail + /get", got)
+	if yLast7D < 2 {
+		t.Errorf("y.last_7d_read_count=%d want >= 2 after /tail + /get", yLast7D)
 	}
 	// /get byID was the last read on y, so last_access_ts must sit inside
 	// that call's bracket.
-	if got := int64(mustFloat(t, yStats, "last_access_ts")); got < preGetY || got > postGetY {
-		t.Errorf("y.last_access_ts=%d not in bracket [%d, %d] around /get", got, preGetY, postGetY)
+	if yLastAccess < preGetY || yLastAccess > postGetY {
+		t.Errorf("y.last_access_ts=%d not in bracket [%d, %d] around /get", yLastAccess, preGetY, postGetY)
 	}
 
 	// --- Internal accounting invariants ---
@@ -1426,6 +1451,11 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	if got := api.store.totalBytes.Load(); got != sumBufBytes+scopeOverhead {
 		t.Errorf("totalBytes=%d but Σ buf.bytes + overhead=%d", got, sumBufBytes+scopeOverhead)
 	}
+
+	// 3. Same shape, item count + scope count: proves the totalItems and
+	//    scopeCount atomics that drive the O(1) /stats stayed lockstep
+	//    with the per-scope state through every mutation in this test.
+	assertStatsCountersInvariant(t, api.store, "after mixed workload")
 }
 
 // --- integration: parallel race workload -------------------------------------
@@ -1616,4 +1646,10 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 	if int64(totalReadCount) != readsHit {
 		t.Errorf("Σ readCountTotal=%d != tallied readsHit=%d", totalReadCount, readsHit)
 	}
+
+	// Stats counters must agree with the post-race ground truth — same
+	// invariant as in the single-threaded mixed-workload test, but here
+	// it also exercises every concurrent write/delete path against the
+	// atomic counters.
+	assertStatsCountersInvariant(t, api.store, "after parallel race workload")
 }

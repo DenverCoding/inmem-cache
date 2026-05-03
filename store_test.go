@@ -295,62 +295,6 @@ func TestStore_render_MissingScope(t *testing.T) {
 	}
 }
 
-// scopeCandidates is the walk-filter-sort-truncate pipeline that
-// /delete_scope_candidates surfaces. The HTTP-level tests cover the
-// happy path; this pin is for the empty-store contract and the
-// limit-truncation invariant — both are easy to silently break by a
-// future "always allocate len(scopes)" or "skip the truncate when
-// limit > 0" change.
-func TestStore_scopeCandidates_EmptyStore(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	got := s.scopeCandidates(0, 100)
-	if len(got) != 0 {
-		t.Errorf("scopeCandidates on empty store=%v; want empty slice", got)
-	}
-}
-
-func TestStore_scopeCandidates_TruncatesToLimit(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	for i := 0; i < 5; i++ {
-		_, err := s.appendOne(Item{Scope: fmt.Sprintf("s%d", i), Payload: json.RawMessage(`"v"`)})
-		if err != nil {
-			t.Fatalf("appendOne %d: %v", i, err)
-		}
-	}
-	got := s.scopeCandidates(0, 3)
-	if len(got) != 3 {
-		t.Errorf("len=%d; want 3 (truncated)", len(got))
-	}
-}
-
-// scopeCandidates must surface LastWriteTS so operators ranking
-// eviction can distinguish a cold-read scope that is still being
-// actively written to (a write-buffer) from a truly idle one. Without
-// this signal, write-only workloads always rank as "stalest" because
-// they never touch lastAccessTS.
-func TestStore_scopeCandidates_SurfacesLastWriteTS(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-
-	pre := nowUnixMicro()
-	if _, err := s.appendOne(Item{Scope: "s", Payload: json.RawMessage(`"v"`)}); err != nil {
-		t.Fatalf("appendOne: %v", err)
-	}
-	got := s.scopeCandidates(0, 10)
-	if len(got) != 1 {
-		t.Fatalf("len=%d; want 1", len(got))
-	}
-	if got[0].LastWriteTS < pre {
-		t.Errorf("LastWriteTS=%d pre=%d (must be >= pre-call stamp)", got[0].LastWriteTS, pre)
-	}
-	// Internally consistent with /stats: candidate and scopeStats read
-	// from the same underlying field, so they must match.
-	buf, _ := s.getScope("s")
-	if got[0].LastWriteTS != buf.lastWriteTS {
-		t.Errorf("candidate.LastWriteTS=%d buf.lastWriteTS=%d (must mirror)",
-			got[0].LastWriteTS, buf.lastWriteTS)
-	}
-}
-
 // render peels the renderBytes shortcut for JSON-string payloads — a
 // store-level invariant that handleRender used to enforce inline.
 // Pin it on the Store boundary now that the handler is dumb.
@@ -1033,5 +977,221 @@ func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
 	if got := s.totalBytes.Load(); got != expected {
 		t.Fatalf("totalBytes=%d but live scopes hold %d bytes + %d overhead = %d (ghost bytes from race)",
 			got, liveBytes, int64(len(live))*scopeBufferOverhead, expected)
+	}
+}
+
+// --- /stats counter invariants -----------------------------------------------
+
+// assertStatsCountersInvariant walks every shard and verifies the two
+// invariants that make the O(1) /stats shape correct:
+//
+//   - s.totalItems == Σ len(buf.items) over every live scope buffer
+//   - s.scopeCount == Σ len(sh.scopes) over every shard
+//
+// Forgetting to update one of these counters from a write/delete/bulk
+// path silently corrupts /stats output without affecting any cache
+// behaviour — exactly the class of bug a routine assertion catches and
+// a hand-test never finds. Call this after any sequence of mutations.
+//
+// Takes per-scope read locks during the walk; safe to call from tests
+// that have other goroutines mutating the store, but any concurrent
+// mutation observed mid-walk is the caller's tolerance to weigh.
+func assertStatsCountersInvariant(t *testing.T, s *Store, ctx string) {
+	t.Helper()
+
+	var sumItems int64
+	var sumScopes int64
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		sumScopes += int64(len(sh.scopes))
+		for _, buf := range sh.scopes {
+			buf.mu.RLock()
+			sumItems += int64(len(buf.items))
+			buf.mu.RUnlock()
+		}
+		sh.mu.RUnlock()
+	}
+
+	if got := s.totalItems.Load(); got != sumItems {
+		t.Errorf("[%s] totalItems=%d but Σ len(buf.items)=%d (counter drift)", ctx, got, sumItems)
+	}
+	if got := s.scopeCount.Load(); got != sumScopes {
+		t.Errorf("[%s] scopeCount=%d but Σ len(sh.scopes)=%d (counter drift)", ctx, got, sumScopes)
+	}
+}
+
+// TestStore_StatsCounters_Invariant_AcrossPaths drives every write/delete/
+// bulk path that mutates totalItems or scopeCount and re-asserts the
+// invariant after each step. If a future change forgets to update one
+// counter on one path, the assertion fails with the path's name in the
+// context string — much friendlier than chasing a "scope_count=42 but
+// got=43" report from production.
+func TestStore_StatsCounters_Invariant_AcrossPaths(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	assertStatsCountersInvariant(t, s, "fresh store")
+
+	// appendOne — single-item write into a freshly created scope.
+	if _, err := s.appendOne(Item{Scope: "a", ID: "1", Payload: json.RawMessage(`"v"`)}); err != nil {
+		t.Fatalf("appendOne: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after appendOne (new scope)")
+
+	if _, err := s.appendOne(Item{Scope: "a", ID: "2", Payload: json.RawMessage(`"v"`)}); err != nil {
+		t.Fatalf("appendOne 2: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after appendOne (existing scope)")
+
+	// upsertOne create branch.
+	if _, _, err := s.upsertOne(Item{Scope: "a", ID: "3", Payload: json.RawMessage(`"v"`)}); err != nil {
+		t.Fatalf("upsertOne create: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after upsertOne (create)")
+
+	// upsertOne replace branch — must NOT change totalItems.
+	if _, _, err := s.upsertOne(Item{Scope: "a", ID: "3", Payload: json.RawMessage(`"v2"`)}); err != nil {
+		t.Fatalf("upsertOne replace: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after upsertOne (replace)")
+
+	// counterAddOne create branch.
+	if _, _, err := s.counterAddOne("a", "ctr", 5); err != nil {
+		t.Fatalf("counterAddOne create: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after counterAddOne (create)")
+
+	// counterAddOne increment branch — must NOT change totalItems.
+	if _, _, err := s.counterAddOne("a", "ctr", 3); err != nil {
+		t.Fatalf("counterAddOne increment: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after counterAddOne (increment)")
+
+	// updateOne — must NOT change totalItems.
+	if _, err := s.updateOne(Item{Scope: "a", ID: "1", Payload: json.RawMessage(`"new"`)}); err != nil {
+		t.Fatalf("updateOne: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after updateOne")
+
+	// deleteOne by id — drops one item.
+	if _, err := s.deleteOne("a", "1", 0); err != nil {
+		t.Fatalf("deleteOne: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after deleteOne")
+
+	// Build up a second scope so deleteUpTo has multiple items to drop.
+	for i := 0; i < 5; i++ {
+		if _, err := s.appendOne(Item{Scope: "b", Payload: json.RawMessage(`"v"`)}); err != nil {
+			t.Fatalf("appendOne b: %v", err)
+		}
+	}
+	assertStatsCountersInvariant(t, s, "after building scope b")
+
+	// deleteUpTo — drops the first 3 items in b. lastSeq is 5; cut at 3.
+	if n, err := s.deleteUpTo("b", 3); err != nil || n != 3 {
+		t.Fatalf("deleteUpTo n=%d err=%v want n=3", n, err)
+	}
+	assertStatsCountersInvariant(t, s, "after deleteUpTo")
+
+	// deleteScope — drops scope b entirely (2 items + 1 scope).
+	if n, ok := s.deleteScope("b"); !ok || n != 2 {
+		t.Fatalf("deleteScope n=%d ok=%v want n=2 ok=true", n, ok)
+	}
+	assertStatsCountersInvariant(t, s, "after deleteScope")
+
+	// ensureScope — pure scope-create, no items.
+	_ = s.ensureScope("_ctrl")
+	assertStatsCountersInvariant(t, s, "after ensureScope")
+
+	// replaceScopes (the path /warm uses) — replaces existing scope a
+	// AND creates a brand new scope c. Item delta on a goes from
+	// (whatever's left) to 1; c goes from 0 to 2.
+	grouped := map[string][]Item{
+		"a": {{Scope: "a", Payload: json.RawMessage(`"warmed"`)}},
+		"c": {
+			{Scope: "c", Payload: json.RawMessage(`"v1"`)},
+			{Scope: "c", Payload: json.RawMessage(`"v2"`)},
+		},
+	}
+	if _, err := s.replaceScopes(grouped); err != nil {
+		t.Fatalf("replaceScopes: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after replaceScopes")
+
+	// rebuildAll — wipes everything and rebuilds.
+	rebuild := map[string][]Item{
+		"x": {
+			{Scope: "x", Payload: json.RawMessage(`"v"`)},
+			{Scope: "x", Payload: json.RawMessage(`"v"`)},
+		},
+		"y": {{Scope: "y", Payload: json.RawMessage(`"v"`)}},
+	}
+	if _, _, err := s.rebuildAll(rebuild); err != nil {
+		t.Fatalf("rebuildAll: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after rebuildAll")
+	if got := s.totalItems.Load(); got != 3 {
+		t.Errorf("after rebuildAll: totalItems=%d want 3", got)
+	}
+	if got := s.scopeCount.Load(); got != 2 {
+		t.Errorf("after rebuildAll: scopeCount=%d want 2", got)
+	}
+
+	// wipe — both counters back to zero.
+	_, _, _ = s.wipe()
+	assertStatsCountersInvariant(t, s, "after wipe")
+	if got := s.totalItems.Load(); got != 0 {
+		t.Errorf("after wipe: totalItems=%d want 0", got)
+	}
+	if got := s.scopeCount.Load(); got != 0 {
+		t.Errorf("after wipe: scopeCount=%d want 0", got)
+	}
+}
+
+// TestStore_StatsCounters_Invariant_DoSCleanup ensures the
+// cleanupIfEmptyAndUnused rollback path keeps scopeCount in sync. The
+// flow: appendOne creates a new scope, the per-item byte reservation
+// fails, and the empty scope is rolled back. scopeCount must end at 0.
+func TestStore_StatsCounters_Invariant_DoSCleanup(t *testing.T) {
+	// MaxItemBytes large enough to allow scope creation but small enough
+	// that the item itself fails on the per-item cap. Actually easier:
+	// fill the store cap with overhead first, then try one more append.
+	s := NewStore(Config{
+		ScopeMaxItems: 10,
+		MaxStoreBytes: scopeBufferOverhead + 100, // room for one scope + a tiny item
+		MaxItemBytes:  1 << 20,
+	})
+	assertStatsCountersInvariant(t, s, "fresh DoS-bounded store")
+
+	// First append fits within cap.
+	if _, err := s.appendOne(Item{Scope: "first", Payload: json.RawMessage(`"v"`)}); err != nil {
+		t.Fatalf("first appendOne: %v", err)
+	}
+	assertStatsCountersInvariant(t, s, "after first appendOne")
+	scopeCountBefore := s.scopeCount.Load()
+	totalItemsBefore := s.totalItems.Load()
+
+	// Second append into a NEW scope: scope-overhead reservation may
+	// succeed or fail depending on remaining cap; either way the
+	// invariant must hold after the call returns.
+	_, err := s.appendOne(Item{
+		Scope:   "second",
+		Payload: json.RawMessage(`"this payload is large enough to push the store over the cap easily"`),
+	})
+	assertStatsCountersInvariant(t, s, "after second appendOne (likely DoS-rejected)")
+
+	if err == nil {
+		// Append unexpectedly succeeded — fine, just verify counters
+		// agree with new state.
+		t.Logf("second appendOne succeeded (cap had room): scopeCount=%d totalItems=%d",
+			s.scopeCount.Load(), s.totalItems.Load())
+	} else {
+		// Rejected: the rollback must have restored scopeCount and
+		// totalItems to their pre-call values.
+		if got := s.scopeCount.Load(); got != scopeCountBefore {
+			t.Errorf("scopeCount drifted after rejected append: %d -> %d", scopeCountBefore, got)
+		}
+		if got := s.totalItems.Load(); got != totalItemsBefore {
+			t.Errorf("totalItems drifted after rejected append: %d -> %d", totalItemsBefore, got)
+		}
 	}
 }

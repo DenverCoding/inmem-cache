@@ -1063,9 +1063,10 @@ curl -s 'http://localhost:8080/tail?scope=events&limit=10'
 
 #### `GET /stats`
 
-Return a store-wide snapshot: scope count, total item count,
-approximate stored bytes, and per-scope counts and metadata
-(including read-heat — see §8).
+Return a **store-wide aggregate snapshot**: scope count, total item
+count, approximate stored bytes, and the configured byte cap. No
+per-scope enumeration — that lives on `/scopelist` (paginated, with
+sort and prefix filters; see roadmap).
 
 **Query parameters**
 
@@ -1080,37 +1081,38 @@ None.
   "total_items": 5400,
   "approx_store_mb": 12.3456,
   "max_store_mb": 100.0,
-  "scopes": {
-    "events": {
-      "item_count": 100,
-      "last_seq": 100,
-      "approx_scope_mb": 0.0123,
-      "created_ts": 1700000000000000,
-      "last_write_ts": 1700000000000000,
-      "last_access_ts": 1700000000000000,
-      "read_count_total": 4242,
-      "last_7d_read_count": 1337
-    }
-  },
-  "duration_us": 42
+  "duration_us": 0
 }
 ```
 
-`scopes` is keyed by scope name; outer-map keys serialise in
-alphabetical order. Per-scope fields emit in the order shown.
+**Cost**
+
+`/stats` is **O(1)**: three atomic loads (`scope_count`, `total_items`,
+`approx_store_mb`) plus the static `max_store_mb`. Cost is independent
+of the number of scopes in the store. The three counters are
+maintained incrementally on every write/delete/bulk path.
+
+The previous shape included a per-scope `scopes` map keyed by scope
+name. At 100k+ scopes that response routinely blew past practical
+client and proxy response-size limits, and the per-scope enumeration
+(one buffer.stats() materialisation per scope, plus
+`computeLast7DReadCount`) dominated `/stats` latency. Per-scope
+listing moved to a dedicated paginated endpoint to keep `/stats`
+cheap regardless of cache size.
 
 **Side effects**
 
-`/stats` enumerates every scope name in the store. In multi-tenant
-deployments where addons keep state in `_*` scopes, those names
-will surface here. The cache draws no line; gating `/stats` at the
-transport layer is the operator's responsibility (see §1.3).
+None. `/stats` is read-only and aggregate-only — no scope names
+appear in the response, so it does not leak the per-tenant
+identifier surface (`_*` scopes etc.) that the per-scope map
+previously did. Operators may still wish to gate `/stats` for other
+reasons (capacity-disclosure, side-channel timing); see §1.3.
 
 **Example**
 
 ```bash
 curl -s 'http://localhost:8080/stats'
-# → {"ok":true,"scope_count":12,"total_items":5400,...}
+# → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"max_store_mb":100.0,"duration_us":0}
 ```
 
 ---
@@ -1202,20 +1204,18 @@ are internally consistent at the moment of the read.
 
 `/stats` is an **advisory snapshot**, not a transaction:
 
-- Each scope is read under its own lock, so per-scope values are
-  internally consistent.
-- The response as a whole is not a global atomic snapshot — writes
-  committing in other scopes between per-scope reads are visible
-  in the same response.
-- Store-wide totals (`approx_store_mb`, `total_items`) come from
-  the atomic byte counter and may briefly skew against the sum of
-  per-scope values under concurrent writes. The
-  `Σ scope.bytes == total_bytes` invariant holds at quiesce, not
-  at every observation.
+- Every field comes from an independent atomic load. The three
+  counters (`scope_count`, `total_items`, `approx_store_mb`) are
+  maintained incrementally on every write/delete/bulk path, but
+  they are not loaded under a shared lock — concurrent writes
+  between the three loads can produce a snapshot where the fields
+  reflect three slightly different instants.
+- The `Σ scope.bytes == total_bytes` and `Σ len(scope.items) ==
+  total_items` invariants hold at quiesce, not at every observation.
 
 Operators using `/stats` to drive decisions (capacity planning,
-eviction-candidate selection) should treat its output as
-approximate rather than transactional.
+admission-control headroom) should treat its output as approximate
+rather than transactional.
 
 ---
 
@@ -1227,8 +1227,11 @@ without polling every scope.
 
 ### 8.1 Tracked fields
 
-Every scope carries the following read-heat metadata, surfaced via
-`/stats` (per-scope sub-object):
+Every scope carries the following read-heat metadata. The fields
+are maintained on the per-scope buffer; `/stats` is aggregate-only
+and does not surface them. They are exposed via `/scopelist`
+(per-scope detail with paginated enumeration) and via the in-process
+Go API (Phase B).
 
 | field                | type    | meaning                                            |
 |----------------------|---------|----------------------------------------------------|
@@ -1251,8 +1254,8 @@ counters on a successful hit:
 - `GET /head`
 - `GET /tail`
 
-Misses (no scope, no item, empty result) do **not** count. `/stats`
-itself is observability and does not count.
+Misses (no scope, no item, empty result) do **not** count.
+Observability endpoints (`/stats`, `/scopelist`) do not count.
 
 ### 8.3 Concurrency
 
@@ -1266,19 +1269,19 @@ so concurrent readers do not serialise on heat updates.
 Heat tracking can be turned off via the `DisableReadHeat`
 configuration knob (env-var `SCOPECACHE_DISABLE_READ_HEAT` on the
 standalone binary; `disable_read_heat` directive in the Caddy
-module). With heat tracking off the four counters above remain
-zero in `/stats`. Disabling saves the per-read `time.Now()` call
-plus the atomic CAS work — useful when the operator does not need
+module). With heat tracking off the per-scope heat counters remain
+zero. Disabling saves the per-read `time.Now()` call plus the
+atomic CAS work — useful when the operator does not need
 heat-driven eviction.
 
 ### 8.5 Read-heat as a building block
 
 Read-heat is exposed as a primitive. The cache itself never uses
 it to decide anything; eviction decisions live in addons (or in
-operator-side logic that polls `/stats`). For example, an addon
+operator-side logic that polls `/scopelist`). For example, an addon
 that ranks scopes for eviction by ascending `last_access_ts`
-builds its query on top of `/stats` rather than asking the core
-to sort.
+builds its query on top of `/scopelist`'s per-scope detail rather
+than asking the core to sort.
 
 ---
 
@@ -1303,7 +1306,8 @@ non-goal entirely.
 - **Write-only ingestion shapes.** Cache-assigned IDs, fire-and-
   forget append patterns, payload-cap variations — addon territory.
 - **Eviction-hint queries.** Sorting scopes by read-heat to
-  recommend which to drop — addon, built on `/stats` and §8 data.
+  recommend which to drop — addon, built on `/scopelist` and §8
+  data.
 
 ### 9.2 Not in core: operator policy
 

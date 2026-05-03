@@ -141,6 +141,14 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 
 	if b.store != nil {
 		b.store.totalBytes.Add(newBytes - b.bytes)
+		// itemDelta uses the CURRENT len(b.items) under b.mu, not a
+		// pre-snapshot, so a stale-pointer concurrent /append that
+		// landed between the caller's snapshot and this commit is
+		// folded into the delta naturally — its +1 to totalItems is
+		// undone here because its item is being discarded by the
+		// swap. No drift parameter needed (unlike newBytes - oldSnapshot
+		// for bytes, which is pre-reserved in the PreReserved variant).
+		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
 	}
 	b.bytes = newBytes
 	b.idKeyBytes = r.idKeyBytes
@@ -179,6 +187,11 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 		if drift != 0 {
 			b.store.totalBytes.Add(-drift)
 		}
+		// totalItems has no pre-reservation, so we don't need an item
+		// snapshot to subtract: len(b.items) at commit time captures
+		// any stale-pointer concurrent /append's contribution. Same
+		// reasoning as commitReplacement above; see that comment.
+		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
 	}
 	b.bytes = newBytes
 	b.idKeyBytes = r.idKeyBytes

@@ -249,6 +249,9 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 		b.idKeyBytes += int64(len(item.ID))
 	}
 	b.bytes += size
+	if b.store != nil {
+		b.store.totalItems.Add(1)
+	}
 	b.lastWriteTS = nowUs
 
 	return item, nil

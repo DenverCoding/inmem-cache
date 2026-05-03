@@ -263,11 +263,56 @@ admin_call 'wipe initial'               200 /wipe
 # --- help / stats / unknown routes --------------------------------------------
 say '== introspection =='
 call 'help'                             200 GET    /help
-admin_call 'stats empty'                200 /stats
-call 'public /stats blocked'            404 GET    /stats
-call 'public /delete_scope_candidates blocked' 404 GET /delete_scope_candidates
+call 'stats empty'                      200 GET    /stats
 call 'unknown route'                    404 GET    /nope
 call 'wrong method on /help'            405 POST   /help
+
+# --- /stats aggregate counters ------------------------------------------------
+# /stats is aggregate-only since the 100k-scope DoS observation: three
+# atomic counters (scope_count, total_items, approx_store_mb) plus the
+# static cap, no per-scope map. This block proves the three counters
+# stay in lockstep with the actual store contents across a deterministic
+# wipe → appends sequence:
+#
+#   - 5 appends to scope "stat_a" (no id, no upsert, no replace)
+#   - 3 appends to scope "stat_b" — 1 plain, 2 upserts on the same id so
+#     net items added = 2 (idempotency check).
+#
+# Expected post-state: scope_count=2, total_items=7, and approx_store_mb
+# strictly between 0 and the configured cap. A regression on any
+# write/delete path that forgets to update one of the atomics shows up
+# here as a clean numeric mismatch — no per-scope walk needed.
+say '== /stats aggregate counters =='
+call 'stats agg: wipe'                  200 POST   /wipe
+call 'stats agg: stats after wipe'      200 GET    /stats
+json_assert 'stats agg: scope_count == 0 after wipe' '.scope_count == 0'
+json_assert 'stats agg: total_items == 0 after wipe' '.total_items == 0'
+json_assert 'stats agg: approx_store_mb == 0 after wipe' '.approx_store_mb == 0'
+
+i=1; while [ $i -le 5 ]; do
+    quiet_call "stats agg: append stat_a #$i" 200 POST /append \
+        "{\"scope\":\"stat_a\",\"payload\":$i}"
+    i=$((i+1))
+done
+
+# Plain append into stat_b — net +1 item.
+quiet_call 'stats agg: append stat_b plain' 200 POST /append \
+    '{"scope":"stat_b","payload":"first"}'
+# Two upserts on the SAME id — net +1 item (idempotent on the second call).
+quiet_call 'stats agg: upsert stat_b id=u1 (create)' 200 POST /upsert \
+    '{"scope":"stat_b","id":"u1","payload":"v1"}'
+quiet_call 'stats agg: upsert stat_b id=u1 (replace)' 200 POST /upsert \
+    '{"scope":"stat_b","id":"u1","payload":"v2"}'
+
+call 'stats agg: stats after appends'   200 GET    /stats
+json_assert 'stats agg: scope_count == 2' '.scope_count == 2'
+json_assert 'stats agg: total_items == 7' '.total_items == 7'
+json_assert 'stats agg: approx_store_mb > 0' '.approx_store_mb > 0'
+json_assert 'stats agg: approx_store_mb < max_store_mb' '.approx_store_mb < .max_store_mb'
+# Regression guard: /stats must NOT carry per-scope detail (moved to
+# /scopelist). Re-introducing it would silently re-create the 100k-scope
+# DoS that motivated this strip.
+json_assert 'stats agg: no scopes key' '(.scopes // null) == null'
 
 # --- writes: append / upsert / update / counter_add ---------------------------
 say '== writes =='
@@ -383,22 +428,16 @@ call 'trim: head after trim'            200 GET    '/head?scope=tmath'
 # about whether t1..t6 are also still there.
 json_assert 'trim: items[].id == [t7,t8,t9,t10]' '[.items[].id] == ["t7","t8","t9","t10"]'
 
-# append count: 10 appends to a fresh scope; /stats must report item_count:10
-i=1; while [ $i -le 10 ]; do
-    quiet_call "appn /append #$i" 200 POST /append "{\"scope\":\"appn\",\"id\":\"a$i\",\"payload\":$i}"
-    i=$((i+1))
-done
-admin_call 'append count: stats'        200 /stats
-json_assert 'stats: appn has 10 items' '.scopes.appn.item_count == 10'
-
 # upsert idempotency: 5 upserts on the same id must leave exactly 1 item,
-# and the surviving payload must be the last one written (4).
+# and the surviving payload must be the last one written (4). The
+# previous version also probed /stats for `.scopes.uidem.item_count == 1`,
+# but /stats is now aggregate-only — per-scope detail moved to the
+# (future) /scopelist endpoint, so the per-scope item count is verified
+# by reading the surviving item back via /get.
 i=0; while [ $i -lt 5 ]; do
     quiet_call "uidem /upsert #$i" 200 POST /upsert "{\"scope\":\"uidem\",\"id\":\"only\",\"payload\":$i}"
     i=$((i+1))
 done
-admin_call 'upsert idem: stats'         200 /stats
-json_assert 'stats: uidem has 1 item after 5 upserts' '.scopes.uidem.item_count == 1'
 call 'upsert idem: final value'         200 GET    '/get?scope=uidem&id=only'
 json_assert 'upsert idem: final payload is 4' '.item.payload == 4'
 
@@ -661,12 +700,11 @@ call 'admin: public /delete_scope 404'   404 POST   /delete_scope '{"scope":"x"}
 # auth-gate: register a tenant's capability_id in _tokens.
 admin_call 'admin: register tenant in _tokens' 200 /upsert '{"scope":"_tokens","id":"capX","payload":{"issued_at":"test"}}'
 
-# /admin /stats sees the _tokens scope.
-admin_call 'admin: stats sees _tokens' 200 /stats
-case $LAST_BODY in
-    *'_tokens'*) okmsg 'admin: _tokens scope visible in stats' ;;
-    *) bad "admin stats body missing _tokens: $LAST_BODY" ;;
-esac
+# NOTE: the previous test probed /stats for the literal string "_tokens"
+# to confirm /admin saw the reserved scope. /stats is aggregate-only
+# now (no per-scope name surface), so this assertion is dropped. When
+# /scopelist lands, an equivalent reserved-scope-visibility check
+# belongs there.
 
 # /admin's whitelist excludes self-reference, /multi_call, /guarded,
 # /help, and /render (raw bytes don't fit a JSON results array).

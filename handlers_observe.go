@@ -7,17 +7,19 @@ import (
 
 // Observability + meta handlers:
 //
-//   - /stats — store-wide snapshot
+//   - /stats — store-wide aggregate snapshot
 //   - /help  — text/plain pointer to the canonical RFC
 //
 // /help is the only handler in the file that returns text/plain rather
 // than JSON — it is documentation the cache hands out about itself, not
 // observability data.
 //
-// /stats enumerates every scope name in the store. In multi-tenant
-// deployments where addons keep state in `_*` scopes, `/stats` will
-// surface those names; the operator gates `/stats` at the transport
-// layer when that matters. The cache itself draws no line.
+// /stats is intentionally aggregate-only: scope_count, total_items and
+// approx_store_mb. The previous shape included a per-scope map keyed
+// by scope name; at 100k+ scopes that response routinely blew past
+// practical client and proxy limits, and the per-scope enumeration
+// dominated /stats latency. Per-scope listing moves to a separate
+// paginated /scopelist endpoint (see Phase A roadmap).
 
 func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
@@ -29,36 +31,18 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	st := api.store.stats()
 
-	// Build the scopes map with each entry as orderedFields so per-scope
-	// fields emit in a logical order (counts first, timestamps, then reads).
-	// The outer map keys are scope names and will sort alphabetically, which
-	// is appropriate for an arbitrary identifier set.
-	scopes := make(map[string]orderedFields, len(st.Scopes))
-	for name, sc := range st.Scopes {
-		scopes[name] = orderedFields{
-			{"item_count", sc.ItemCount},
-			{"last_seq", sc.LastSeq},
-			{"approx_scope_mb", sc.ApproxScopeMB},
-			{"created_ts", sc.CreatedTS},
-			{"last_write_ts", sc.LastWriteTS},
-			{"last_access_ts", sc.LastAccessTS},
-			{"read_count_total", sc.ReadCountTotal},
-			{"last_7d_read_count", sc.Last7DReadCount},
-		}
-	}
-
-	// /stats is a state endpoint: scope/item counts and current byte usage.
-	// Static config (DefaultLimit, MaxLimit, per-item/per-scope caps) lives
-	// in /help, not here. max_store_mb is the one cap that *does* appear —
-	// it pairs with approx_store_mb so a client can compute headroom in a
-	// single call. duration_us is appended by the helper.
+	// /stats is a state endpoint: aggregate scope/item counts and
+	// current byte usage. Static config (DefaultLimit, MaxLimit,
+	// per-item/per-scope caps) lives in /help, not here. max_store_mb
+	// is the one cap that *does* appear — it pairs with approx_store_mb
+	// so a client can compute headroom in a single call. duration_us is
+	// appended by the helper.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"scope_count", st.ScopeCount},
 		{"total_items", st.TotalItems},
 		{"approx_store_mb", st.ApproxStoreMB},
 		{"max_store_mb", st.MaxStoreMB},
-		{"scopes", scopes},
 	}, started)
 }
 

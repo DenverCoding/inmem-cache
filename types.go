@@ -88,8 +88,8 @@ func (c Config) WithDefaults() Config {
 
 // MB is an int64 byte count that serializes to JSON as a number in MiB with
 // 4 decimals (e.g. 79845 bytes → 0.0762). One display unit across every
-// user-facing surface (/stats, /delete_scope_candidates, 507 responses) keeps clients from
-// juggling units. The underlying byte value is preserved for arithmetic.
+// user-facing surface (/stats, 507 responses) keeps clients from juggling
+// units. The underlying byte value is preserved for arithmetic.
 type MB int64
 
 func (m MB) MarshalJSON() ([]byte, error) {
@@ -174,16 +174,6 @@ type ItemsRequest struct {
 type ScopeReadHeatBucket struct {
 	Day   atomic.Int64
 	Count atomic.Uint64
-}
-
-type Candidate struct {
-	Scope           string `json:"scope"`
-	CreatedTS       int64  `json:"created_ts"`
-	LastWriteTS     int64  `json:"last_write_ts"`
-	LastAccessTS    int64  `json:"last_access_ts"`
-	Last7dReadCount uint64 `json:"last_7d_read_count"`
-	ItemCount       int    `json:"item_count"`
-	ApproxScopeMB   MB     `json:"approx_scope_mb"`
 }
 
 // ScopeCapacityOffender is one entry in a 507 response body: which scope
