@@ -227,7 +227,14 @@ call 'stats agg: stats after appends'   200 GET    /stats
 json_assert 'stats agg: scope_count == 2' '.scope_count == 2'
 json_assert 'stats agg: total_items == 7' '.total_items == 7'
 json_assert 'stats agg: approx_store_mb > 0' '.approx_store_mb > 0'
-json_assert 'stats agg: approx_store_mb < max_store_mb' '.approx_store_mb < .max_store_mb'
+# Configured caps no longer appear on /stats (they're static config —
+# /help, not /stats). 100 MiB is the harness's default store cap; any
+# real-load value comfortably under that proves we're not silently
+# blowing past the budget while reporting "ok".
+json_assert 'stats agg: approx_store_mb well under harness 100 MiB cap' '.approx_store_mb < 100'
+# Regression guard: max_store_mb MUST NOT reappear on /stats — pre-1.0
+# convergence moved configured caps off the per-call state response.
+json_assert 'stats agg: no max_store_mb (config -> /help)' '(.max_store_mb // null) == null'
 # last_write_ts must have strictly advanced past the post-wipe value —
 # every successful write/upsert above bumps the freshness tick via
 # CAS-max. This is the polling-pattern contract: clients refetching

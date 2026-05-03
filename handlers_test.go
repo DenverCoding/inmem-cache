@@ -1186,8 +1186,11 @@ func TestStats_Structure(t *testing.T) {
 	if _, present := out["approx_store_mb"]; !present {
 		t.Error("approx_store_mb missing")
 	}
-	if _, present := out["max_store_mb"]; !present {
-		t.Error("max_store_mb missing")
+	// Regression guard: /stats is a pure state endpoint. Configured
+	// caps (max_store_mb, scope_max_items, etc.) are static config
+	// and belong on /help — they MUST NOT reappear on /stats.
+	if _, present := out["max_store_mb"]; present {
+		t.Errorf("max_store_mb must NOT appear on /stats (config belongs on /help): %v", out["max_store_mb"])
 	}
 	// Regression guard: /stats is intentionally aggregate-only since the
 	// 100k-scope DoS observation. Per-scope enumeration belongs to the

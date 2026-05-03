@@ -247,17 +247,19 @@ which is the per-counter "last activity" timestamp.
 
 ### 2.5 Store-wide metadata
 
-Five store-wide fields are surfaced via the `/stats` endpoint
+Four store-wide fields are surfaced via the `/stats` endpoint
 (§6.5). Each is maintained incrementally on the write/delete/bulk
-paths so `/stats` can answer in O(1) — four atomic loads plus the
-static cap, independent of how many scopes the store holds.
+paths so `/stats` can answer in O(1) — four atomic loads,
+independent of how many scopes the store holds. Configured caps
+(`Config.MaxStoreBytes`, `Config.ScopeMaxItems`, `Config.MaxItemBytes`)
+are static config and live on `/help`, not `/stats` — they do not
+change between calls and re-emitting them on every poll is pure noise.
 
 | field             | purpose                                                                  |
 |-------------------|--------------------------------------------------------------------------|
 | `scope_count`     | live scope count (atomic; updated on scope create / delete / wipe / rebuild) |
 | `total_items`     | Σ `len(scope.items)` across all live scopes (atomic; updated on every write/delete) |
 | `approx_store_mb` | running byte-budget reservation in MiB (atomic; updated on every write that reserves or releases bytes) |
-| `max_store_mb`    | configured store-wide byte cap in MiB (constant — `Config.MaxStoreBytes`) |
 | `last_write_ts`   | microsecond timestamp of the most recent state-changing event anywhere in the cache (atomic, monotonic via CAS-max). 0 means no writes since process start. Bumped by every per-scope `lastWriteTS` update plus the destructive store-level paths (`/delete_scope`, `/wipe`, `/rebuild`) that don't go through a per-scope bump. |
 
 The four atomics (`scope_count`, `total_items`, `approx_store_mb`,
@@ -1164,7 +1166,6 @@ None.
   "scope_count": 12,
   "total_items": 5400,
   "approx_store_mb": 12.3456,
-  "max_store_mb": 100.0,
   "last_write_ts": 1700000000123456,
   "duration_us": 0
 }
@@ -1173,10 +1174,11 @@ None.
 **Cost**
 
 `/stats` is **O(1)**: four atomic loads (`scope_count`, `total_items`,
-`approx_store_mb`, `last_write_ts`) plus the static `max_store_mb`.
-Cost is independent of the number of scopes in the store. The four
-counters are maintained incrementally on every write/delete/bulk
-path. See §2.5 for the polling pattern that `last_write_ts` enables.
+`approx_store_mb`, `last_write_ts`). Cost is independent of the
+number of scopes in the store. Each counter is maintained incrementally
+on every write/delete/bulk path. See §2.5 for the polling pattern that
+`last_write_ts` enables. Configured caps are NOT echoed here — they
+are static config and live on `/help`.
 
 The previous shape included a per-scope `scopes` map keyed by scope
 name. At 100k+ scopes that response routinely blew past practical
@@ -1197,7 +1199,7 @@ reasons (capacity-disclosure, side-channel timing); see §1.3.
 
 ```bash
 curl -s 'http://localhost:8080/stats'
-# → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"max_store_mb":100.0,"last_write_ts":1700000000123456,"duration_us":0}
+# → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"last_write_ts":1700000000123456,"duration_us":0}
 ```
 
 ---

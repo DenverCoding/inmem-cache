@@ -60,8 +60,8 @@ type Store struct {
 	// own comment); counting per-item Go heap overhead would be
 	// honest-er to real memory pressure but at the cost of making the
 	// cap arithmetic depend on internal data-structure layout. See
-	// phase-4 finding "max_store_mb underestimates real memory cost at
-	// high scope counts" for the open pre-v1.0 question.
+	// phase-4 finding "approx_store_mb under-reports real memory cost
+	// at high scope counts" for the open pre-v1.0 question.
 	totalBytes atomic.Int64
 
 	// totalItems and scopeCount mirror the totalBytes pattern: every
@@ -682,15 +682,16 @@ type storeStats struct {
 	ScopeCount    int
 	TotalItems    int
 	ApproxStoreMB MB
-	MaxStoreMB    MB
 	LastWriteTS   int64
 }
 
-// stats returns the store-wide aggregate snapshot in O(1) — three
-// atomic loads plus the static cap. No shard walks, no per-scope
-// fan-out: every counter is maintained incrementally on the write
-// paths (see the totalItems/scopeCount comment block on *Store for
-// the lockstep discipline).
+// stats returns the store-wide aggregate snapshot in O(1) — four
+// atomic loads. No shard walks, no per-scope fan-out: every counter
+// is maintained incrementally on the write paths (see the
+// totalItems/scopeCount comment block on *Store for the lockstep
+// discipline). Configured caps (MaxStoreBytes, etc.) are NOT echoed
+// here — they are static config and belong on /help (or a future
+// dedicated /config endpoint), not in a per-call state response.
 //
 // Each load is independent, so a concurrent burst of /append + /delete
 // can produce a snapshot where (scope_count, total_items, approx_store_mb)
@@ -704,7 +705,6 @@ func (s *Store) stats() storeStats {
 		ScopeCount:    int(s.scopeCount.Load()),
 		TotalItems:    int(s.totalItems.Load()),
 		ApproxStoreMB: MB(s.totalBytes.Load()),
-		MaxStoreMB:    MB(s.maxStoreBytes),
 		LastWriteTS:   s.lastWriteTS.Load(),
 	}
 }
