@@ -51,6 +51,11 @@ equivalent webserver → application → Redis → response path serving
 the same bytes — even when the application path is FrankenPHP in
 worker mode.
 
+When scopecache runs as a Caddy module it lives in the same Go
+process as Caddy itself — no extra hop over a Unix socket, no
+serialisation between processes. That in-process call is where the
+largest performance gain comes from.
+
 ### 1.3 What scopecache is not
 
 The core does not implement:
