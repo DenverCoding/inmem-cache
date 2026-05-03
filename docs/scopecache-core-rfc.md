@@ -508,7 +508,8 @@ curl -s -X POST http://localhost:8080/append \
 #### `POST /upsert`
 
 Insert a new item, or replace an existing one with the same
-`scope`+`id`. Always succeeds (within capacity); the response
+`scope`+`id`. On replace, `seq` is preserved and `ts` is
+refreshed. Always succeeds (within capacity); the response
 distinguishes create from replace via `created`.
 
 **Request body**
