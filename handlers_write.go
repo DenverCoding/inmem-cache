@@ -53,9 +53,6 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
-	if rejectReservedScope(r, w, started, item.Scope) {
-		return
-	}
 
 	origScope := item.Scope
 	item, err := api.store.appendOne(item)
@@ -98,9 +95,6 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateUpsertItem(item, api.store.maxItemBytes); err != nil {
 		badRequest(w, started, err.Error())
-		return
-	}
-	if rejectReservedScope(r, w, started, item.Scope) {
 		return
 	}
 
@@ -146,9 +140,6 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 	by, err := validateCounterAddRequest(req)
 	if err != nil {
 		badRequest(w, started, err.Error())
-		return
-	}
-	if rejectReservedScope(r, w, started, req.Scope) {
 		return
 	}
 
@@ -200,9 +191,6 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateUpdateItem(item, api.store.maxItemBytes); err != nil {
 		badRequest(w, started, err.Error())
-		return
-	}
-	if rejectReservedScope(r, w, started, item.Scope) {
 		return
 	}
 

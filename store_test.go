@@ -58,12 +58,6 @@ func TestNewStore_ZeroConfigUsesDefaults(t *testing.T) {
 	if api.maxResponseBytes != int64(MaxResponseMiB)<<20 {
 		t.Errorf("api.maxResponseBytes=%d want %d", api.maxResponseBytes, int64(MaxResponseMiB)<<20)
 	}
-	if api.maxMultiCallBytes != int64(MaxMultiCallMiB)<<20 {
-		t.Errorf("api.maxMultiCallBytes=%d want %d", api.maxMultiCallBytes, int64(MaxMultiCallMiB)<<20)
-	}
-	if api.maxMultiCallCount != MaxMultiCallCount {
-		t.Errorf("api.maxMultiCallCount=%d want %d", api.maxMultiCallCount, MaxMultiCallCount)
-	}
 }
 
 // Config.WithDefaults treats <= 0 as "use default" (matching the
@@ -109,48 +103,21 @@ func TestConfig_WithDefaults(t *testing.T) {
 }
 
 // APIConfig.WithDefaults mirrors Config.WithDefaults: numeric zeros fall
-// back to compile-time defaults; string/slice/bool zeros stay unchanged
-// because their zero-values are documented kill-switches (empty
-// ServerSecret disables /guarded, empty InboxScopes disables /inbox).
+// back to compile-time defaults; bool zeros stay unchanged because their
+// zero-value is documented (false DisableReadHeat = heat tracked).
 func TestAPIConfig_WithDefaults(t *testing.T) {
 	t.Run("zero fields fall back to defaults", func(t *testing.T) {
 		got := APIConfig{}.WithDefaults()
 		if got.MaxResponseBytes != int64(MaxResponseMiB)<<20 {
 			t.Errorf("MaxResponseBytes=%d", got.MaxResponseBytes)
 		}
-		if got.MaxMultiCallBytes != int64(MaxMultiCallMiB)<<20 {
-			t.Errorf("MaxMultiCallBytes=%d", got.MaxMultiCallBytes)
-		}
-		if got.MaxMultiCallCount != MaxMultiCallCount {
-			t.Errorf("MaxMultiCallCount=%d", got.MaxMultiCallCount)
-		}
-		if got.MaxInboxBytes != int64(MaxInboxKiB)<<10 {
-			t.Errorf("MaxInboxBytes=%d", got.MaxInboxBytes)
-		}
 	})
 
 	t.Run("positive fields preserved", func(t *testing.T) {
-		in := APIConfig{
-			MaxResponseBytes:  13,
-			MaxMultiCallBytes: 17,
-			MaxMultiCallCount: 19,
-			MaxInboxBytes:     23,
-			ServerSecret:      "real-secret",
-		}
+		in := APIConfig{MaxResponseBytes: 13}
 		got := in.WithDefaults()
-		if got.MaxResponseBytes != in.MaxResponseBytes ||
-			got.MaxMultiCallBytes != in.MaxMultiCallBytes ||
-			got.MaxMultiCallCount != in.MaxMultiCallCount ||
-			got.MaxInboxBytes != in.MaxInboxBytes ||
-			got.ServerSecret != in.ServerSecret {
+		if got.MaxResponseBytes != in.MaxResponseBytes {
 			t.Errorf("positive APIConfig mutated: got %+v want %+v", got, in)
-		}
-	})
-
-	t.Run("empty server_secret stays empty (kill-switch)", func(t *testing.T) {
-		got := APIConfig{ServerSecret: ""}.WithDefaults()
-		if got.ServerSecret != "" {
-			t.Errorf("ServerSecret got %q want empty", got.ServerSecret)
 		}
 	})
 }

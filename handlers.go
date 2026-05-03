@@ -2,7 +2,6 @@ package scopecache
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,8 +12,6 @@ import (
 
 // handlers.go is the shared HTTP-layer infrastructure for *API:
 //
-//   - admin-context plumbing (adminCtxKey + helpers)
-//   - reserved-scope guard (rejectReservedScope)
 //   - error-class mapping (writeStoreCapacityError + the 4xx/5xx
 //     responder family: badRequest, conflict, scopeFull, storeFull,
 //     methodNotAllowed)
@@ -30,49 +27,7 @@ import (
 //   handlers_read.go     — /head, /tail, /get, /render
 //   handlers_delete.go   — /delete, /delete_up_to, /delete_scope, /wipe
 //   handlers_bulk.go     — /warm, /rebuild
-//   handlers_observe.go  — /stats, /delete_scope_candidates, /help
-//   handlers_admin.go    — /admin (operator-elevated dispatcher)
-//   handlers_guarded.go         — /guarded (HMAC-tenant gateway)
-//   handlers_delete_guarded.go  — admin-only tenant revocation
-//   handlers_guarded_strip.go   — guarded scope-prefix stripping
-//   handlers_inbox.go    — /inbox (shared write-only ingestion)
-//   handlers_multi_call.go — /multi_call (public sub-call dispatcher)
-//   handlers_response_cap.go — cappedResponseWriter for /multi_call
-
-// adminCtxKey marks a synthetic sub-request as originating from /admin's
-// dispatcher. Public-mux handlers check this via isAdminContext to
-// decide whether to enforce the reserved-prefix block on incoming
-// scopes — admin can write to `_guarded:*` and `_counters_*`, public
-// callers cannot. See guardedflow.md §B, §K.
-type adminCtxKey struct{}
-
-func withAdminContext(r *http.Request) *http.Request {
-	return r.WithContext(contextWithAdmin(r.Context()))
-}
-
-func contextWithAdmin(ctx context.Context) context.Context {
-	return context.WithValue(ctx, adminCtxKey{}, true)
-}
-
-func isAdminContext(ctx context.Context) bool {
-	v, _ := ctx.Value(adminCtxKey{}).(bool)
-	return v
-}
-
-// rejectReservedScope rejects requests whose scope begins with the
-// reserved '_' prefix UNLESS the request was dispatched via /admin.
-// Helper called at the top of every scope-bearing public handler.
-// Returns true when the handler should write a 400 and stop.
-func rejectReservedScope(r *http.Request, w http.ResponseWriter, started time.Time, scope string) bool {
-	if isAdminContext(r.Context()) {
-		return false
-	}
-	if hasReservedPrefix(scope) {
-		badRequest(w, started, "the 'scope' field must not begin with '_' (reserved prefix)")
-		return true
-	}
-	return false
-}
+//   handlers_observe.go  — /stats, /help
 
 // writeStoreCapacityError centralises the per-handler error-handling
 // for the three capacity-class errors the store can return on a write
@@ -321,6 +276,25 @@ func storeFull(w http.ResponseWriter, started time.Time, e *StoreFullError) {
 	}, started)
 }
 
+// responseTooLarge writes the 507 envelope used by the cap-protected
+// read endpoints (/head, /tail) when the marshalled body would exceed
+// the per-response cap. Body shape mirrors the other 507 helpers
+// (storeFull, scopeFull): {ok, error, approx_response_mb,
+// max_response_mb, duration_us}.
+//
+// Side effects already applied by the handler are NOT rolled back. This
+// matches every other 507 in the cache: 2xx is not durability, and 507
+// does not roll back. In practice the cap-protected endpoints are
+// read-only, so there is nothing to roll back.
+func responseTooLarge(w http.ResponseWriter, started time.Time, written, cap int64) {
+	writeJSONWithDuration(w, http.StatusInsufficientStorage, orderedFields{
+		{"ok", false},
+		{"error", "the response would exceed the maximum allowed size"},
+		{"approx_response_mb", MB(written)},
+		{"max_response_mb", MB(cap)},
+	}, started)
+}
+
 func methodNotAllowed(w http.ResponseWriter, started time.Time) {
 	writeJSONWithDuration(w, http.StatusMethodNotAllowed, orderedFields{
 		{"ok", false},
@@ -349,9 +323,6 @@ func parseLookupTarget(r *http.Request, endpoint string) (lookupTarget, error) {
 
 	if err := validateScope(scope, endpoint); err != nil {
 		return lookupTarget{}, err
-	}
-	if !isAdminContext(r.Context()) && hasReservedPrefix(scope) {
-		return lookupTarget{}, errors.New("the 'scope' field must not begin with '_' (reserved prefix)")
 	}
 
 	hasID := id != ""
@@ -392,9 +363,6 @@ func parseScopeLimit(r *http.Request, endpoint string) (scopeLimit, error) {
 	if err := validateScope(scope, endpoint); err != nil {
 		return scopeLimit{}, err
 	}
-	if !isAdminContext(r.Context()) && hasReservedPrefix(scope) {
-		return scopeLimit{}, errors.New("the 'scope' field must not begin with '_' (reserved prefix)")
-	}
 	limit, err := normalizeLimit(query.Get("limit"))
 	if err != nil {
 		return scopeLimit{}, err
@@ -403,73 +371,27 @@ func parseScopeLimit(r *http.Request, endpoint string) (scopeLimit, error) {
 }
 
 func (api *API) RegisterRoutes(mux *http.ServeMux) {
+	// Single-item write paths.
 	mux.HandleFunc("/append", api.handleAppend)
 	mux.HandleFunc("/update", api.handleUpdate)
 	mux.HandleFunc("/upsert", api.handleUpsert)
 	mux.HandleFunc("/counter_add", api.handleCounterAdd)
 	mux.HandleFunc("/delete", api.handleDelete)
 	mux.HandleFunc("/delete_up_to", api.handleDeleteUpTo)
-	// /head and /tail enforce the per-response cap inside their
-	// shared writer (writeJSONWithMetaCap, called from writeItemsHit) —
-	// no outer middleware needed. Earlier versions wrapped these with
-	// a capResponse middleware that buffered the full handler output a
-	// second time; folding the cap check into the marshal removed that
-	// duplicate buffering.
+	// Single-item / multi-item read paths.
+	// /head and /tail enforce the per-response cap inside their shared
+	// writer (writeJSONWithMetaCap, called from writeItemsHit) — no
+	// outer middleware needed.
 	mux.HandleFunc("/head", api.handleHead)
 	mux.HandleFunc("/tail", api.handleTail)
 	mux.HandleFunc("/get", api.handleGet)
 	mux.HandleFunc("/render", api.handleRender)
+	// Bulk and store-wide write paths.
+	mux.HandleFunc("/wipe", api.handleWipe)
+	mux.HandleFunc("/warm", api.handleWarm)
+	mux.HandleFunc("/rebuild", api.handleRebuild)
+	mux.HandleFunc("/delete_scope", api.handleDeleteScope)
+	// Observability.
+	mux.HandleFunc("/stats", api.handleStats)
 	mux.HandleFunc("/help", api.handleHelp)
-	// /stats and /delete_scope_candidates are admin-only — they enumerate
-	// every scope name in the store, which in a multi-tenant deployment
-	// would leak `_tokens`, `_guarded:<capID>:*`, `_counters_*` and the
-	// per-scope item-counts/heat-stats those carry. Reachable only as
-	// sub-calls through /admin (their handler functions stay on *API for
-	// the dispatcher).
-	// /multi_call, /admin and /guarded are NOT wrapped with capResponse:
-	// they manage the per-response cap themselves via preflightResponseCap
-	// (rejects batches the cap can't fit) plus the per-slot trim mechanism
-	// (replaces oversized slot bodies with response_truncated markers).
-	// Wrapping them again would buffer the whole envelope twice and turn
-	// the pre-flight 507's specific error message into the wrapper's
-	// generic "response would exceed maximum" — losing the actionable
-	// guidance to either raise the cap or reduce the call count.
-	mux.HandleFunc("/multi_call", api.handleMultiCall)
-	// Admin-elevated endpoint. /wipe, /warm, /rebuild, /delete_scope,
-	// /stats, /delete_scope_candidates are reachable only via /admin
-	// (their handler functions still exist; they're removed from the
-	// public mux). See guardedflow.md §J, §K.
-	//
-	// Gated on Config.EnableAdmin because /admin has no body-level auth
-	// and trusts the transport layer entirely. Default-deny on the
-	// Caddy module (a misconfigured public proxy is a real risk; the
-	// operator must opt in AND add a route guard); default-allow on the
-	// standalone binary (Unix-socket permissions are the gating layer).
-	// Without the flag the route is not registered, public callers
-	// get 404 — same shape as /guarded and /inbox.
-	if api.enableAdmin {
-		mux.HandleFunc("/admin", api.handleAdmin)
-	}
-	// Tenant-facing /guarded gateway. Registered only when the operator
-	// configured a server secret — without one, HMAC computation would
-	// produce identical capability_ids for every token, defeating
-	// isolation. Empty secret → /guarded route not registered, public
-	// callers get 404. See guardedflow.md §I.
-	//
-	// Counter scopes (`_counters_count_calls`, `_counters_count_kb_in`,
-	// `_counters_count_kb_out`) are NOT eagerly provisioned here — the
-	// first /guarded call creates them via ensureScope, and they
-	// self-heal after a /wipe the same way. Eager provisioning would
-	// clutter `/stats` for operators who haven't yet seen any
-	// /guarded traffic.
-	if api.serverSecret != "" {
-		mux.HandleFunc("/guarded", api.handleGuarded)
-	}
-	// Shared write-only ingestion endpoint. Requires both a server
-	// secret (for HMAC-derived capability_id) AND at least one
-	// configured inbox scope. Either missing → route not registered,
-	// public callers receive 404. See handlers_inbox.go.
-	if api.serverSecret != "" && len(api.inboxScopes) > 0 {
-		mux.HandleFunc("/inbox", api.handleInbox)
-	}
 }

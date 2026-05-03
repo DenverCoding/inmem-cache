@@ -2,17 +2,6 @@ services:
   scopecache:
     build: .
     container_name: scopecache
-    environment:
-      # Enable /guarded by setting a server-secret. Empty/unset would
-      # disable /guarded (route returns 404). For the e2e harness we use
-      # a fixed deterministic value so PHP-side and shell-side HMAC
-      # computations match. See guardedflow.md §I.
-      SCOPECACHE_SERVER_SECRET: ${SCOPECACHE_SERVER_SECRET:-test-secret}
-      # Enable /inbox with two operator-allowed shared scope names.
-      # Newline-separated; empty/unset disables /inbox entirely.
-      SCOPECACHE_INBOX_SCOPES: |-
-        _inbox
-        audit_log
     volumes:
       - scopecache-sock:/run
 
@@ -22,8 +11,6 @@ services:
       dockerfile: Dockerfile.caddyscope
     container_name: caddyscope
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
-    environment:
-      SCOPECACHE_SERVER_SECRET: ${SCOPECACHE_SERVER_SECRET:-test-secret}
     ports:
       - "8081:8080"
     volumes:

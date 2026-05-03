@@ -5,17 +5,16 @@ import (
 	"time"
 )
 
-// Delete handlers on the public mux + admin-only:
+// Delete handlers on the public mux:
 //
-//   - /delete         — single-item delete by scope+id or scope+seq (public)
-//   - /delete_up_to   — drain seq prefix in one shot (public, write-buffer pattern)
-//   - /delete_scope   — remove a whole scope (admin-only via /admin)
-//   - /wipe           — clear every scope, every item (admin-only via /admin)
+//   - /delete         — single-item delete by scope+id or scope+seq
+//   - /delete_up_to   — drain seq prefix in one shot (write-buffer pattern)
+//   - /delete_scope   — remove a whole scope
+//   - /wipe           — clear every scope, every item, every byte
 //
-// The four are grouped here by destructive-semantics rather than by mux:
-// /delete and /delete_up_to live on the public mux for normal client
-// pruning; /delete_scope and /wipe are reachable only via /admin's
-// dispatcher because they enumerate / nuke beyond a single item.
+// All four live on the public mux. There is no in-core admin-tier or
+// reserved-scope check; access is the operator's responsibility (gated
+// at the proxy/socket layer or by an addon access-policy).
 
 func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
@@ -33,9 +32,6 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateDeleteRequest(req); err != nil {
 		badRequest(w, started, err.Error())
-		return
-	}
-	if rejectReservedScope(r, w, started, req.Scope) {
 		return
 	}
 
@@ -75,9 +71,6 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, started, err.Error())
 		return
 	}
-	if rejectReservedScope(r, w, started, req.Scope) {
-		return
-	}
 
 	deleted, err := api.store.deleteUpTo(req.Scope, req.MaxSeq)
 	if err != nil {
@@ -109,9 +102,6 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateDeleteScopeRequest(req); err != nil {
 		badRequest(w, started, err.Error())
-		return
-	}
-	if rejectReservedScope(r, w, started, req.Scope) {
 		return
 	}
 

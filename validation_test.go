@@ -246,28 +246,6 @@ func TestValidateWriteItem_ScopeAndIDShapeRules(t *testing.T) {
 	}
 }
 
-// hasReservedPrefix flags scopes starting with '_'. Used by the handler-
-// level rejectReservedScope check (see handlers.go); validateScope itself
-// stays focused on shape (length, whitespace, control chars) so /admin
-// can bypass the reserved-prefix block via request context. Endpoint-
-// level enforcement is exercised in admin_test.go and the per-endpoint
-// public-handler tests.
-func TestHasReservedPrefix(t *testing.T) {
-	reserved := []string{"_", "_anything", "_guarded", "_guarded:abc:thread", "_counters_count_calls", "_token"}
-	for _, scope := range reserved {
-		if !hasReservedPrefix(scope) {
-			t.Errorf("hasReservedPrefix(%q) = false, want true", scope)
-		}
-	}
-
-	notReserved := []string{"name_with_underscore", "a_", "abc_def_ghi", "thread:1_2_3", "regular", ""}
-	for _, scope := range notReserved {
-		if hasReservedPrefix(scope) {
-			t.Errorf("hasReservedPrefix(%q) = true, want false", scope)
-		}
-	}
-}
-
 // Anchors the scope/id length cap to 256 bytes. The cap was raised
 // from 128 to 256 in v0.5.11 to make room for namespace prefixes —
 // notably the `_guarded:<64 hex>:` rewrite, which leaves only

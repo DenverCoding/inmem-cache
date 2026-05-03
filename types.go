@@ -8,27 +8,14 @@ import (
 )
 
 const (
-	DefaultLimit      = 1000    // read response size when client omits ?limit
-	MaxLimit          = 10000   // hard ceiling on ?limit; higher values are clamped, not rejected
-	ScopeMaxItems     = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
-	MaxStoreMiB       = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
-	MaxItemBytes      = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
-	MaxResponseMiB    = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head). Overridable via SCOPECACHE_MAX_RESPONSE_MB
-	MaxMultiCallMiB   = 16      // per-request body cap default for /multi_call in MiB. Overridable via SCOPECACHE_MAX_MULTI_CALL_MB
-	MaxMultiCallCount = 10      // max sub-calls per /multi_call batch by default. Overridable via SCOPECACHE_MAX_MULTI_CALL_COUNT
-	// MaxInboxKiB is the per-call payload cap default for /inbox in KiB.
-	// Tighter than the generic per-item cap on purpose: /inbox is
-	// fire-and-forget tenant ingestion (no read-back, drained by the
-	// operator in batches), so a single rogue tenant pushing 1 MiB items
-	// fills the operator's /admin /tail response cap fast. 64 KiB
-	// comfortably fits rich event payloads (signups with form data,
-	// audit events with context, nested notifications) while rejecting
-	// accidental blob uploads. Overridable via SCOPECACHE_MAX_INBOX_KB
-	// (integer KiB — KiB-granular because the meaningful range is
-	// sub-MiB; all other byte-knobs are MiB).
-	MaxInboxKiB   = 64
-	MaxScopeBytes = 256
-	MaxIDBytes    = 256
+	DefaultLimit   = 1000    // read response size when client omits ?limit
+	MaxLimit       = 10000   // hard ceiling on ?limit; higher values are clamped, not rejected
+	ScopeMaxItems  = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
+	MaxStoreMiB    = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
+	MaxItemBytes   = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
+	MaxResponseMiB = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head). Overridable via SCOPECACHE_MAX_RESPONSE_MB
+	MaxScopeBytes  = 256
+	MaxIDBytes     = 256
 
 	// SingleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
@@ -61,8 +48,7 @@ const (
 // to NewStore. Keeping the shape in one place means new cache knobs land
 // in a single file instead of rippling through every adapter's call site.
 //
-// HTTP/transport-layer knobs (response sizing, /multi_call composition,
-// /guarded auth, /inbox allowlist, /admin gate, read-heat opt-out) live
+// HTTP/transport-layer knobs (response sizing, read-heat opt-out) live
 // on APIConfig in api.go and are passed to NewAPI separately. The split
 // matches the boundary rule in CLAUDE.md: the core stays
 // transport-agnostic; HTTP concerns are an adapter-layer concept.

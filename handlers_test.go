@@ -18,7 +18,7 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
 	api := NewAPI(
 		NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
-		APIConfig{MaxResponseBytes: 25 << 20, MaxMultiCallBytes: 16 << 20, MaxMultiCallCount: 10, ServerSecret: "test-secret", EnableAdmin: true},
+		APIConfig{MaxResponseBytes: 25 << 20},
 	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
@@ -46,49 +46,20 @@ func doRequest(t *testing.T, h http.Handler, method, path, body string) (int, ma
 	return rec.Code, out, raw
 }
 
-// doAdminRequest wraps a single sub-call in /admin's envelope, dispatches
-// it, and returns the slot's status + body so existing tests can keep
-// asserting against the standalone-endpoint shape. Used wherever a test
-// previously called /wipe, /warm, /rebuild, or /delete_scope directly —
-// these are now reachable only via /admin (see guardedflow.md §J, §K).
+// doAdminRequest is a thin compatibility shim left over from when /wipe,
+// /warm, /rebuild, /delete_scope, /stats lived behind /admin's envelope.
+// Those endpoints are now public on the mux (no admin gate, no envelope —
+// see core-and-addons.md), so this helper just dispatches directly with
+// the right HTTP method. Kept rather than renamed so existing test
+// callers stay unchanged during the refactor; new tests should call
+// doRequest directly.
 func doAdminRequest(t *testing.T, h http.Handler, path, body string) (int, map[string]interface{}, string) {
 	t.Helper()
-
-	call := map[string]interface{}{"path": path}
-	if body != "" {
-		var parsed interface{}
-		if err := json.Unmarshal([]byte(body), &parsed); err != nil {
-			t.Fatalf("doAdminRequest: parse sub-call body: %v (body=%s)", err, body)
-		}
-		call["body"] = parsed
+	method := http.MethodPost
+	if path == "/stats" {
+		method = http.MethodGet
 	}
-	adminBody, _ := json.Marshal(map[string]interface{}{
-		"calls": []interface{}{call},
-	})
-
-	code, out, raw := doRequest(t, h, "POST", "/admin", string(adminBody))
-	if code != 200 {
-		// /admin itself rejected the request (e.g. malformed envelope).
-		return code, out, raw
-	}
-
-	results, ok := out["results"].([]interface{})
-	if !ok || len(results) == 0 {
-		t.Fatalf("doAdminRequest: missing or empty results: %+v", out)
-	}
-	slot, ok := results[0].(map[string]interface{})
-	if !ok {
-		t.Fatalf("doAdminRequest: slot[0] not object: %v", results[0])
-	}
-
-	slotStatus := 0
-	if v, ok := slot["status"].(float64); ok {
-		slotStatus = int(v)
-	}
-	slotBody, _ := slot["body"].(map[string]interface{})
-
-	rawSlotBody, _ := json.Marshal(slot["body"])
-	return slotStatus, slotBody, string(rawSlotBody)
+	return doRequest(t, h, method, path, body)
 }
 
 func mustBool(t *testing.T, m map[string]interface{}, key string) bool {
@@ -854,22 +825,6 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 	}
 }
 
-// /wipe is no longer registered on the public mux — it's reachable only
-// via /admin. Direct calls to /wipe (any method) return 404. See
-// guardedflow.md §J.
-func TestWipe_NotPublic(t *testing.T) {
-	h, _ := newTestHandler(10)
-
-	code, _, _ := doRequest(t, h, "GET", "/wipe", "")
-	if code != 404 {
-		t.Fatalf("GET /wipe code=%d want 404", code)
-	}
-	code, _, _ = doRequest(t, h, "POST", "/wipe", "")
-	if code != 404 {
-		t.Fatalf("POST /wipe code=%d want 404", code)
-	}
-}
-
 // /wipe accepts a POST with no body. A non-empty body is simply ignored;
 // it has no effect on the operation.
 func TestWipe_IgnoresBody(t *testing.T) {
@@ -1264,55 +1219,6 @@ func TestStats_Structure(t *testing.T) {
 	}
 	if _, ok := out["scopes"].(map[string]interface{}); !ok {
 		t.Error("scopes not a map")
-	}
-}
-
-// --- /delete_scope_candidates ------------------------------------------------
-
-func TestDeleteScopeCandidates_Basic(t *testing.T) {
-	h, _ := newTestHandler(10)
-	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"a","payload":{"v":1}}`)
-	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"b","payload":{"v":1}}`)
-
-	_, out, _ := doAdminRequest(t, h, "/delete_scope_candidates", "")
-	if mustFloat(t, out, "count") != 2 {
-		t.Errorf("count=%v want 2", out["count"])
-	}
-}
-
-// /stats and /delete_scope_candidates enumerate every scope in the
-// store, so they leak reserved scope names (`_tokens`,
-// `_guarded:<capID>:*`, `_counters_*`) and per-scope heat metadata to
-// any caller that can reach the public mux. Both are admin-only since
-// v0.5.17 — public callers must get 404, the routes are not registered
-// at all, and operators reach them through /admin's wider whitelist.
-func TestStats_NotOnPublicMux(t *testing.T) {
-	h, _ := newTestHandler(10)
-
-	code, _, _ := doRequest(t, h, "GET", "/stats", "")
-	if code != http.StatusNotFound {
-		t.Errorf("public GET /stats: code=%d want 404", code)
-	}
-
-	// Through /admin still works.
-	_, body, raw := doAdminRequest(t, h, "/stats", "")
-	if _, ok := body["scopes"].(map[string]interface{}); !ok {
-		t.Errorf("admin /stats body missing scopes map: %s", raw)
-	}
-}
-
-func TestDeleteScopeCandidates_NotOnPublicMux(t *testing.T) {
-	h, _ := newTestHandler(10)
-
-	code, _, _ := doRequest(t, h, "GET", "/delete_scope_candidates", "")
-	if code != http.StatusNotFound {
-		t.Errorf("public GET /delete_scope_candidates: code=%d want 404", code)
-	}
-
-	// Through /admin still works.
-	_, body, raw := doAdminRequest(t, h, "/delete_scope_candidates", "")
-	if _, ok := body["candidates"]; !ok {
-		t.Errorf("admin /delete_scope_candidates body missing candidates: %s", raw)
 	}
 }
 

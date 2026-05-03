@@ -9,15 +9,14 @@
 //
 // Cross-cutting concerns that require request context — auth, identity,
 // per-tenant scope-prefix enforcement, rate-limit hooks — belong in this
-// adapter layer (see CLAUDE.md "boundary rule"). They are not wired up yet;
-// this file is the skeleton they will hang off of.
+// adapter layer (see CLAUDE.md "boundary rule") or in addon sub-packages
+// built on top of the public *API surface.
 package caddymodule
 
 import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/VeloxCoding/scopecache"
 	"github.com/caddyserver/caddy/v2"
@@ -42,51 +41,15 @@ type Handler struct {
 	MaxStoreMB int `json:"max_store_mb,omitempty"`
 	// MaxItemMB caps a single item's approxItemSize in MiB. 0 = use scopecache.MaxItemBytes.
 	MaxItemMB int `json:"max_item_mb,omitempty"`
-	// MaxResponseMB caps the byte size of /head, /tail and /ts_range responses
+	// MaxResponseMB caps the byte size of /head and /tail responses
 	// in MiB. 0 = use scopecache.MaxResponseMiB.
 	MaxResponseMB int `json:"max_response_mb,omitempty"`
-	// MaxMultiCallMB caps the input body size of /multi_call in MiB.
-	// 0 = use scopecache.MaxMultiCallMiB.
-	MaxMultiCallMB int `json:"max_multi_call_mb,omitempty"`
-	// MaxMultiCallCount caps the number of sub-calls per /multi_call batch.
-	// 0 = use scopecache.MaxMultiCallCount.
-	MaxMultiCallCount int `json:"max_multi_call_count,omitempty"`
-	// MaxInboxKB caps the per-call payload size on /inbox in KiB.
-	// 0 = use scopecache.MaxInboxKiB (64 KiB). KiB-granular (not MiB
-	// like the other byte caps) because /inbox payloads are tenant-
-	// pushed events, not blob storage; the meaningful range is sub-MiB.
-	// Tighter than MaxItemMB by design — see scopecache.Config.MaxInboxBytes.
-	MaxInboxKB int `json:"max_inbox_kb,omitempty"`
-	// ServerSecret is the HMAC key for /guarded. Empty (or unset) disables
-	// /guarded entirely — the route is not registered, public callers
-	// receive 404. When non-empty, both scopecache and the application
-	// using it (PHP/workers computing capability_ids) must see the same
-	// value. See guardedflow.md §I.
-	ServerSecret string `json:"server_secret,omitempty"`
-	// InboxScopes lists scope names /inbox is allowed to write to.
-	// Empty/unset disables /inbox entirely (route not registered);
-	// /inbox also requires ServerSecret. Repeatable in Caddyfile via
-	// the `inbox_scope <name>` directive.
-	InboxScopes []string `json:"inbox_scopes,omitempty"`
-	// EnableAdmin gates the /admin endpoint. Defaults to false on the
-	// Caddy module — /admin has no body-level auth and the typical
-	// Caddyfile mounts the scopecache handler at the root of a public
-	// listener. An exposed /admin lets any caller wipe the cache, so
-	// the module errs on the side of "off". The operator must set
-	// `enable_admin yes` AND add a route guard (e.g. `@operator
-	// client_ip 10.0.0.0/8` matched on /admin) to expose admin
-	// operations safely. The standalone binary, which listens on a
-	// permission-gated Unix socket, defaults this to true. See the
-	// EnableAdmin field on scopecache.Config for the rationale.
-	EnableAdmin bool `json:"enable_admin,omitempty"`
 	// DisableReadHeat turns off per-scope read-heat tracking on the
-	// hot read path (/get, /render, /head, /tail, /ts_range). Default
-	// false — heat is tracked, /delete_scope_candidates ranks
-	// correctly. Set to true to skip recordRead and the time.Now()
-	// that feeds it; saves ~2× on the hottest paths at the cost of
-	// always-zero last_access_ts / last_7d_read_count /
-	// read_count_total in /stats. See DisableReadHeat on
-	// scopecache.Config.
+	// hot read path (/get, /render, /head, /tail). Default false —
+	// heat is tracked. Set to true to skip recordRead and the
+	// time.Now() that feeds it; saves ~2× on the hottest paths at
+	// the cost of always-zero last_access_ts / last_7d_read_count /
+	// read_count_total in /stats.
 	DisableReadHeat bool `json:"disable_read_heat,omitempty"`
 
 	api *scopecache.API
@@ -106,9 +69,7 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision builds the core Store + API and registers its routes on an
 // internal mux. Called once per module instance at Caddy start / config
 // reload. Zero-valued numeric directives fall back to the core's
-// compile-time defaults via Config.WithDefaults inside NewStore — this
-// adapter just translates the JSON / Caddyfile shape to a Config and
-// hands it over.
+// compile-time defaults via Config.WithDefaults inside NewStore.
 func (h *Handler) Provision(_ caddy.Context) error {
 	if err := h.validateConfig(); err != nil {
 		return err
@@ -119,14 +80,8 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		MaxItemBytes:  int64(h.MaxItemMB) << 20,
 	})
 	h.api = scopecache.NewAPI(store, scopecache.APIConfig{
-		MaxResponseBytes:  int64(h.MaxResponseMB) << 20,
-		MaxMultiCallBytes: int64(h.MaxMultiCallMB) << 20,
-		MaxMultiCallCount: h.MaxMultiCallCount,
-		MaxInboxBytes:     int64(h.MaxInboxKB) << 10,
-		ServerSecret:      h.ServerSecret,
-		InboxScopes:       h.InboxScopes,
-		EnableAdmin:       h.EnableAdmin,
-		DisableReadHeat:   h.DisableReadHeat,
+		MaxResponseBytes: int64(h.MaxResponseMB) << 20,
+		DisableReadHeat:  h.DisableReadHeat,
 	})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
@@ -150,29 +105,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 // inside Provision. Example:
 //
 //	scopecache {
-//	    scope_max_items        100000
-//	    max_store_mb           100
-//	    max_item_mb            1
-//	    max_response_mb        25
-//	    max_multi_call_mb      16
-//	    max_multi_call_count   10
-//	    max_inbox_kb           64
-//	    server_secret          {$SCOPECACHE_SERVER_SECRET}
-//	    inbox_scope            _inbox
-//	    inbox_scope            audit_log
-//	    enable_admin           yes
-//	    disable_read_heat      no
+//	    scope_max_items     100000
+//	    max_store_mb        100
+//	    max_item_mb         1
+//	    max_response_mb     25
+//	    disable_read_heat   no
 //	}
 //
-// Numeric capacity knobs are integer; `server_secret` is a string that
-// can be either a literal value or — recommended — a `{$VAR}`
-// substitution of an env-var. `inbox_scope` is repeatable: each
-// occurrence appends one allowed scope name to the /inbox allowlist.
-// `enable_admin` and `disable_read_heat` are booleans (yes/no, true/false, on/off, 1/0);
-// default is "no" — an unrecognised /admin behind a public Caddyfile
-// is the most common deployment footgun, so the operator must opt in
-// and is expected to also add a route guard (e.g. an `@operator`
-// matcher) on the /admin path.
+// Numeric capacity knobs are integer; `disable_read_heat` is a boolean
+// (yes/no, true/false, on/off, 1/0).
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -185,30 +126,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			value := d.Val()
 
-			// String-valued directives.
-			switch key {
-			case "server_secret":
-				h.ServerSecret = value
-				continue
-			case "inbox_scope":
-				// Repeatable — each call appends one name. Empty value
-				// is silently dropped (matches env-helper behaviour).
-				if value != "" {
-					h.InboxScopes = append(h.InboxScopes, value)
-				}
-				continue
-			case "enable_admin":
-				switch strings.ToLower(value) {
-				case "yes", "true", "on", "1":
-					h.EnableAdmin = true
-				case "no", "false", "off", "0":
-					h.EnableAdmin = false
-				default:
-					return d.Errf("enable_admin: %q is not a boolean (use yes/no, true/false, on/off, or 1/0)", value)
-				}
-				continue
-			case "disable_read_heat":
-				switch strings.ToLower(value) {
+			// Boolean-valued directives.
+			if key == "disable_read_heat" {
+				switch value {
 				case "yes", "true", "on", "1":
 					h.DisableReadHeat = true
 				case "no", "false", "off", "0":
@@ -233,12 +153,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.MaxItemMB = n
 			case "max_response_mb":
 				h.MaxResponseMB = n
-			case "max_multi_call_mb":
-				h.MaxMultiCallMB = n
-			case "max_multi_call_count":
-				h.MaxMultiCallCount = n
-			case "max_inbox_kb":
-				h.MaxInboxKB = n
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}
@@ -248,12 +162,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // validateConfig rejects values the standalone binary's env-var parsers
-// would have ignored with a warning (negative integers) and config
-// shapes that almost certainly indicate operator error (whitespace-only
-// server_secret, typically the result of `{$VAR}` substituting an env
-// var that was set but contained nothing useful). Empty server_secret
-// stays a documented kill-switch — only AFTER trim != "" but BEFORE
-// trim == "" gets rejected.
+// would have ignored with a warning (negative integers).
 func (h *Handler) validateConfig() error {
 	for _, e := range []struct {
 		key   string
@@ -263,16 +172,10 @@ func (h *Handler) validateConfig() error {
 		{"max_store_mb", h.MaxStoreMB},
 		{"max_item_mb", h.MaxItemMB},
 		{"max_response_mb", h.MaxResponseMB},
-		{"max_multi_call_mb", h.MaxMultiCallMB},
-		{"max_multi_call_count", h.MaxMultiCallCount},
-		{"max_inbox_kb", h.MaxInboxKB},
 	} {
 		if e.value < 0 {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)
 		}
-	}
-	if h.ServerSecret != "" && strings.TrimSpace(h.ServerSecret) == "" {
-		return fmt.Errorf("server_secret is set but contains only whitespace; either set a real value or remove the directive (empty disables /guarded)")
 	}
 	return nil
 }

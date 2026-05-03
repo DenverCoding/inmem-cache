@@ -7,52 +7,17 @@ import (
 
 // Observability + meta handlers:
 //
-//   - /stats                      — store-wide snapshot (admin-only)
-//   - /delete_scope_candidates    — heat-ranked eviction hints (admin-only)
-//   - /help                       — text/plain rules and endpoint reference
-//
-// /stats and /delete_scope_candidates are admin-only because they
-// enumerate every scope name in the store, which in a multi-tenant
-// deployment leaks `_tokens`, `_guarded:<capID>:*`, `_counters_*` and
-// the per-scope item-counts/heat-stats those carry. Reachable only as
-// sub-calls through /admin's dispatcher.
+//   - /stats — store-wide snapshot
+//   - /help  — text/plain pointer to the canonical RFC
 //
 // /help is the only handler in the file that returns text/plain rather
 // than JSON — it is documentation the cache hands out about itself, not
 // observability data.
-
-// Per-scope stats are read under each buffer's own lock, not store-wide:
-// the response is per-scope consistent but not a global atomic snapshot,
-// which is acceptable because this endpoint is advisory.
-func (api *API) handleDeleteScopeCandidates(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, started)
-		return
-	}
-
-	limit, err := normalizeLimit(r.URL.Query().Get("limit"))
-	if err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
-	hours, err := normalizeHours(r.URL.Query().Get("hours"))
-	if err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
-	list := api.store.scopeCandidates(hours, limit)
-
-	writeJSONWithDuration(w, http.StatusOK, orderedFields{
-		{"ok", true},
-		{"count", len(list)},
-		{"hours", hours},
-		{"candidates", list},
-	}, started)
-}
+//
+// /stats enumerates every scope name in the store. In multi-tenant
+// deployments where addons keep state in `_*` scopes, `/stats` will
+// surface those names; the operator gates `/stats` at the transport
+// layer when that matters. The cache itself draws no line.
 
 func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()

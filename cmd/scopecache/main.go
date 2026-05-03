@@ -63,9 +63,7 @@ func socketPathFromEnv() string {
 }
 
 // maxStoreBytesFromEnv returns SCOPECACHE_MAX_STORE_MB (in MiB, converted to bytes)
-// if set to a positive integer, otherwise the compile-time default. Same
-// lenient policy as scopeMaxItemsFromEnv: malformed or non-positive values log
-// a warning and the server keeps running on the default.
+// if set to a positive integer, otherwise the compile-time default.
 func maxStoreBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_STORE_MB")
 	if raw == "" {
@@ -80,10 +78,7 @@ func maxStoreBytesFromEnv() int64 {
 }
 
 // maxItemBytesFromEnv returns SCOPECACHE_MAX_ITEM_MB (in MiB, converted to bytes)
-// if set to a positive integer, otherwise the compile-time default. Operators
-// raise this when the use-case stores larger blobs (rendered HTML, large JSON
-// documents); the single-item HTTP body cap scales with it automatically via
-// singleRequestBytesFor.
+// if set to a positive integer, otherwise the compile-time default.
 func maxItemBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_ITEM_MB")
 	if raw == "" {
@@ -99,11 +94,9 @@ func maxItemBytesFromEnv() int64 {
 
 // maxResponseBytesFromEnv returns SCOPECACHE_MAX_RESPONSE_MB (in MiB,
 // converted to bytes) if set to a positive integer, otherwise the
-// compile-time default. Caps the byte size of /head, /tail, and /ts_range
+// compile-time default. Caps the byte size of /head and /tail
 // responses; values past the cap are rejected with 507 Insufficient
-// Storage rather than streamed truncated. Same lenient policy as the
-// other env helpers: malformed or non-positive values log a warning and
-// the server keeps running on the default.
+// Storage rather than streamed truncated.
 func maxResponseBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_RESPONSE_MB")
 	if raw == "" {
@@ -117,46 +110,12 @@ func maxResponseBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
-// maxMultiCallBytesFromEnv returns SCOPECACHE_MAX_MULTI_CALL_MB (in MiB,
-// converted to bytes) if set to a positive integer, otherwise the
-// compile-time default. Caps the input body size of /multi_call; the
-// outer response is bounded separately by SCOPECACHE_MAX_RESPONSE_MB.
-func maxMultiCallBytesFromEnv() int64 {
-	raw := os.Getenv("SCOPECACHE_MAX_MULTI_CALL_MB")
-	if raw == "" {
-		return int64(scopecache.MaxMultiCallMiB) << 20
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		log.Printf("SCOPECACHE_MAX_MULTI_CALL_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxMultiCallMiB)
-		return int64(scopecache.MaxMultiCallMiB) << 20
-	}
-	return int64(n) << 20
-}
-
-// maxMultiCallCountFromEnv returns SCOPECACHE_MAX_MULTI_CALL_COUNT if set to
-// a positive integer, otherwise the compile-time default. Caps the number of
-// sub-calls per /multi_call batch.
-func maxMultiCallCountFromEnv() int {
-	raw := os.Getenv("SCOPECACHE_MAX_MULTI_CALL_COUNT")
-	if raw == "" {
-		return scopecache.MaxMultiCallCount
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		log.Printf("SCOPECACHE_MAX_MULTI_CALL_COUNT=%q is not a positive integer; using default %d", raw, scopecache.MaxMultiCallCount)
-		return scopecache.MaxMultiCallCount
-	}
-	return n
-}
-
 // disableReadHeatFromEnv reads SCOPECACHE_DISABLE_READ_HEAT. Default
-// is false — heat tracking is on, so /delete_scope_candidates ranks
-// scopes correctly. Set "1", "true", "yes", or "on" (case-insensitive)
-// to skip recordRead on the hot read path; saves the time.Now() call
-// plus the heat counters' atomic adds, at the cost of always-zero
-// last_access_ts / last_7d_read_count / read_count_total in /stats.
-// Useful for deployments that don't use /delete_scope_candidates.
+// is false — heat tracking is on. Set "1", "true", "yes", or "on"
+// (case-insensitive) to skip recordRead on the hot read path; saves
+// the time.Now() call plus the heat counters' atomic adds, at the
+// cost of always-zero last_access_ts / last_7d_read_count /
+// read_count_total in /stats.
 func disableReadHeatFromEnv() bool {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SCOPECACHE_DISABLE_READ_HEAT")))
 	switch raw {
@@ -165,63 +124,6 @@ func disableReadHeatFromEnv() bool {
 	default:
 		return false
 	}
-}
-
-// enableAdminFromEnv reads SCOPECACHE_ENABLE_ADMIN. Default is true:
-// the standalone binary listens on a Unix socket, which the operator
-// gates with filesystem permissions (`chmod 0660 /run/scopecache.sock`,
-// owner = the operator account). The Caddy module defaults this to
-// false because a public reverse-proxy without an explicit /admin
-// route guard is the common deployment footgun. Recognised "off"
-// values: "0", "false", "no", "off" (case-insensitive). Anything else
-// (including unset) leaves the default in place.
-func enableAdminFromEnv() bool {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SCOPECACHE_ENABLE_ADMIN")))
-	switch raw {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
-	}
-}
-
-// maxInboxBytesFromEnv returns SCOPECACHE_MAX_INBOX_KB (in KiB,
-// converted to bytes) if set to a positive integer, otherwise the
-// compile-time default. KiB-granular (not MiB like the other byte
-// knobs) because the meaningful range is sub-MiB — /inbox is meant
-// for small fire-and-forget event payloads, not blob uploads. Same
-// lenient policy as the other env helpers: malformed or non-positive
-// values log a warning and the server keeps running on the default.
-func maxInboxBytesFromEnv() int64 {
-	raw := os.Getenv("SCOPECACHE_MAX_INBOX_KB")
-	if raw == "" {
-		return int64(scopecache.MaxInboxKiB) << 10
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		log.Printf("SCOPECACHE_MAX_INBOX_KB=%q is not a positive integer; using default %d KiB", raw, scopecache.MaxInboxKiB)
-		return int64(scopecache.MaxInboxKiB) << 10
-	}
-	return int64(n) << 10
-}
-
-// inboxScopesFromEnv returns SCOPECACHE_INBOX_SCOPES split on
-// newlines (the robust separator — scope names may contain ":" or
-// "," but not "\n"). Empty value, missing var, or all-whitespace
-// content yields nil, which leaves /inbox unregistered.
-func inboxScopesFromEnv() []string {
-	raw := os.Getenv("SCOPECACHE_INBOX_SCOPES")
-	if raw == "" {
-		return nil
-	}
-	var out []string
-	for _, s := range strings.Split(raw, "\n") {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 const shutdownGracePeriod = 5 * time.Second
@@ -277,38 +179,18 @@ func main() {
 		MaxItemBytes:  maxItemBytesFromEnv(),
 	}
 	apiCfg := scopecache.APIConfig{
-		MaxResponseBytes:  maxResponseBytesFromEnv(),
-		MaxMultiCallBytes: maxMultiCallBytesFromEnv(),
-		MaxMultiCallCount: maxMultiCallCountFromEnv(),
-		ServerSecret:      os.Getenv("SCOPECACHE_SERVER_SECRET"),
-		InboxScopes:       inboxScopesFromEnv(),
-		MaxInboxBytes:     maxInboxBytesFromEnv(),
-		EnableAdmin:       enableAdminFromEnv(),
-		DisableReadHeat:   disableReadHeatFromEnv(),
+		MaxResponseBytes: maxResponseBytesFromEnv(),
+		DisableReadHeat:  disableReadHeatFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store, apiCfg)
 
-	adminStatus := "DISABLED (SCOPECACHE_ENABLE_ADMIN=off)"
-	if apiCfg.EnableAdmin {
-		adminStatus = "enabled (gated by Unix-socket permissions)"
-	}
-	guardedStatus := "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
-	if apiCfg.ServerSecret != "" {
-		guardedStatus = "enabled"
-	}
-	inboxStatus := "DISABLED (SCOPECACHE_INBOX_SCOPES unset)"
-	if apiCfg.ServerSecret == "" {
-		inboxStatus = "DISABLED (SCOPECACHE_SERVER_SECRET unset)"
-	} else if len(apiCfg.InboxScopes) > 0 {
-		inboxStatus = "enabled, scopes=" + strings.Join(apiCfg.InboxScopes, ",")
-	}
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response, %d MiB per /multi_call body, %d sub-calls per /multi_call batch, %d KiB per /inbox payload", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, apiCfg.MaxResponseBytes>>20, apiCfg.MaxMultiCallBytes>>20, apiCfg.MaxMultiCallCount, apiCfg.MaxInboxBytes>>10)
 	heatStatus := "enabled"
 	if apiCfg.DisableReadHeat {
-		heatStatus = "DISABLED (SCOPECACHE_DISABLE_READ_HEAT=on; /delete_scope_candidates won't have ranking data)"
+		heatStatus = "DISABLED (SCOPECACHE_DISABLE_READ_HEAT=on)"
 	}
-	log.Printf("scopecache features: /admin %s; /guarded %s; /inbox %s; read-heat %s", adminStatus, guardedStatus, inboxStatus, heatStatus)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, apiCfg.MaxResponseBytes>>20)
+	log.Printf("scopecache features: read-heat %s", heatStatus)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

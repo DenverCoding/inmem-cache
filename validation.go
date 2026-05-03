@@ -44,15 +44,6 @@ func validateScope(scope, endpoint string) error {
 	return checkKeyField("scope", scope, MaxScopeBytes)
 }
 
-// hasReservedPrefix returns true when scope begins with '_', the reserved
-// prefix used internally by /guarded (`_guarded:<HMAC>:*`) and the
-// cache's own counter scopes (`_counters_*`). Public endpoints reject
-// reserved scopes via rejectReservedScope; only /admin (raw access) and
-// /guarded (after rewrite) reach them. See guardedflow.md §B.
-func hasReservedPrefix(scope string) bool {
-	return len(scope) > 0 && scope[0] == '_'
-}
-
 // validateID validates an id when one is provided. An empty id is legal
 // (id is optional on writes); callers that require an id should use
 // requireID instead.
