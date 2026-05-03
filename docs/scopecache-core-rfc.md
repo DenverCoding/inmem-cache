@@ -1,11 +1,11 @@
 # scopecache — Core RFC
 
-> **Status: in progress.** Pass 1 (§1–§3) has landed. Passes 2–4
-> follow. Until the document is complete,
-> [scopecache-rfc-old.md](scopecache-rfc-old.md) remains the most
-> complete reference for the cache's contract — but with the
-> understanding that its §6.3, §6.4, §13.17, and §13.19–§13.23
-> describe endpoints that have left the core in v0.7.17.
+> **Status: pre-v1.0 draft.** All sections (§1–§9) are in place.
+> Wording, structure, and detail levels remain open for revision.
+> [scopecache-rfc-old.md](scopecache-rfc-old.md) is kept as a
+> historical reference for the v0.7.16-era multi-tenant gateway
+> design; addon-specific RFCs will land alongside this document as
+> the addon sub-packages ship.
 
 ---
 
@@ -1109,3 +1109,197 @@ scopecache — see instructions at https://github.com/VeloxCoding/scopecache/blo
 curl -s 'http://localhost:8080/help'
 # → scopecache — see instructions at https://...
 ```
+
+---
+
+## 7. Operational model
+
+### 7.1 Locking
+
+The cache uses three concentric layers of locks:
+
+- **Shard locks** — the scope registry is split into independently
+  locked shards. Scope creation and lookup take only the relevant
+  shard's lock, so unrelated scopes parallelise across shards.
+- **Per-scope locks** — every scope has its own `sync.RWMutex`.
+  Single-item writes take the shard lock to look up the scope,
+  then operate at scope level under the scope's mutex. Concurrent
+  writes to the same scope serialise on this mutex; writes to
+  different scopes do not.
+- **Multi-shard locks** — store-wide mutations (`/wipe`,
+  `/rebuild`, multi-scope `/warm`) acquire shard locks in
+  ascending shard-index order to prevent deadlock between
+  concurrent multi-shard operations.
+
+The byte-budget counter (used by `MaxStoreBytes` admission) is a
+single atomic value, modified via compare-and-swap. Writes reserve
+their net byte delta on this counter before taking the per-scope
+lock, so an over-cap write fails fast without acquiring the scope
+mutex.
+
+### 7.2 Durability contract
+
+A `200 OK` response from any write endpoint confirms the write was
+applied to the cache at the moment of commit. It is **not** a
+persistence guarantee:
+
+- The cache is in-memory only. Process restart clears everything.
+- A concurrent `/rebuild` or `/wipe` replaces or clears the entire
+  store and erases writes that committed moments earlier. This is
+  intentional: both endpoints express "the source of truth says
+  this is the new state," and the cache is explicitly subordinate
+  to that source.
+- `/delete_scope` and `/delete_up_to` erase earlier writes within
+  their scope by design. Appends that committed just before a
+  delete can vanish from the cache (but not from the source of
+  truth, which is where they came from).
+- The orphan-detach mechanism (returning `409` when a scope is
+  unlinked mid-write) protects the store's internal accounting —
+  the byte counter cannot be corrupted by a write committing into
+  a buffer unlinked by a concurrent swap — but it does not, and
+  cannot, retroactively preserve the write itself.
+
+Clients MUST be idempotent against cache loss (items re-fetchable
+or re-derivable from the source of truth) and MUST NOT treat a
+`200 OK` as a durable acknowledgement.
+
+### 7.3 Read consistency
+
+Read endpoints answer under per-scope read locks: the contents of
+any single scope returned by `/get`, `/head`, `/tail`, or `/render`
+are internally consistent at the moment of the read.
+
+`/stats` is an **advisory snapshot**, not a transaction:
+
+- Each scope is read under its own lock, so per-scope values are
+  internally consistent.
+- The response as a whole is not a global atomic snapshot — writes
+  committing in other scopes between per-scope reads are visible
+  in the same response.
+- Store-wide totals (`approx_store_mb`, `total_items`) come from
+  the atomic byte counter and may briefly skew against the sum of
+  per-scope values under concurrent writes. The
+  `Σ scope.bytes == total_bytes` invariant holds at quiesce, not
+  at every observation.
+
+Operators using `/stats` to drive decisions (capacity planning,
+eviction-candidate selection) should treat its output as
+approximate rather than transactional.
+
+---
+
+## 8. Read-heat tracking
+
+The cache maintains lightweight per-scope read-heat metadata so
+addons (and operators) can identify cold scopes for eviction
+without polling every scope.
+
+### 8.1 Tracked fields
+
+Every scope carries the following read-heat metadata, surfaced via
+`/stats` (per-scope sub-object):
+
+| field                | type    | meaning                                            |
+|----------------------|---------|----------------------------------------------------|
+| `last_access_ts`     | int64   | microsecond timestamp of the most recent read      |
+| `read_count_total`   | uint64  | lifetime read count (since process start or last reset) |
+| `last_7d_read_count` | uint64  | rolling 7-day read count                           |
+
+`last_7d_read_count` is computed via a per-scope ring buffer of
+day-bucket counters. The bucket for the current day is updated on
+each read; buckets older than 7 days are recycled lazily on the
+next read into that scope.
+
+### 8.2 What counts as a read
+
+The following endpoints stamp `last_access_ts` and increment the
+counters on a successful hit:
+
+- `GET /get`
+- `GET /render`
+- `GET /head`
+- `GET /tail`
+
+Misses (no scope, no item, empty result) do **not** count. `/stats`
+itself is observability and does not count.
+
+### 8.3 Concurrency
+
+Read-heat updates are lock-free: timestamps and counters are
+modified via compare-and-swap on atomic 64-bit values. The hot
+read path does not take the scope's write lock to update heat,
+so concurrent readers do not serialise on heat updates.
+
+### 8.4 Disabling read-heat
+
+Heat tracking can be turned off via the `DisableReadHeat`
+configuration knob (env-var `SCOPECACHE_DISABLE_READ_HEAT` on the
+standalone binary; `disable_read_heat` directive in the Caddy
+module). With heat tracking off the four counters above remain
+zero in `/stats`. Disabling saves the per-read `time.Now()` call
+plus the atomic CAS work — useful when the operator does not need
+heat-driven eviction.
+
+### 8.5 Read-heat as a building block
+
+Read-heat is exposed as a primitive. The cache itself never uses
+it to decide anything; eviction decisions live in addons (or in
+operator-side logic that polls `/stats`). For example, an addon
+that ranks scopes for eviction by ascending `last_access_ts`
+builds its query on top of `/stats` rather than asking the core
+to sort.
+
+---
+
+## 9. Out of scope
+
+The following are **deliberately not** core features. Anything
+listed here either lives in operator policy (gating, networking,
+deployment), in addon sub-packages (per-addon RFCs), or is a
+non-goal entirely.
+
+### 9.1 Not in core: deferred to addons
+
+- **Authentication and authorization.** Tokens, signatures, mTLS,
+  bearer headers, capability checks — none of this is core. Addons
+  (e.g. a tenant-gateway addon, an operator-elevated dispatcher
+  addon) add request-context-aware auth on top of the public Go
+  API.
+- **Multi-tenancy.** Per-tenant scope isolation, prefix rewrites,
+  scope-name conventions tied to tenant identity. Live in addons.
+- **Batch dispatch.** Combining N sub-calls into one HTTP roundtrip
+  (`/multi_call`-shaped). Lives in an addon.
+- **Write-only ingestion shapes.** Cache-assigned IDs, fire-and-
+  forget append patterns, payload-cap variations — addon territory.
+- **Eviction-hint queries.** Sorting scopes by read-heat to
+  recommend which to drop — addon, built on `/stats` and §8 data.
+
+### 9.2 Not in core: operator policy
+
+- **Access control.** Which clients reach which endpoints is a
+  transport-layer decision. Caddyfile route guards, Unix-socket
+  filesystem permissions, separate listeners per trust level —
+  all lives outside the cache.
+- **Reserved-scope enforcement.** The `_*` prefix is a social
+  convention (§2.3), not a core check. Addons that want their
+  state-scopes protected from public writes rely on operator
+  gating, naming convention, or payload-side validation.
+- **Network exposure.** The cache speaks HTTP on whatever the
+  adapter mounts it on (Unix socket for the standalone binary,
+  Caddy listener for the module). The adapter and the operator
+  jointly decide what's reachable from where.
+
+### 9.3 Not in core: non-goals
+
+- **Persistence.** The cache is in-memory only. Process restart
+  clears everything; rebuild from the source of truth.
+- **TTL or background eviction.** No scheduler, no LRU, no LFU,
+  no time-based expiration. Whatever you write stays until you
+  delete it.
+- **Payload-content filters.** No queries against payload contents,
+  no indexes on payload fields, no joins. Anything beyond
+  `scope`/`id`/`seq` belongs in the source-of-truth or in an
+  application layer above the cache.
+- **Cross-instance replication or coordination.** Each scopecache
+  process is independent. Multi-instance deployments coordinate at
+  the source-of-truth layer, not in the cache.
