@@ -1291,8 +1291,10 @@ non-goal entirely.
 
 ### 9.3 Not in core: non-goals
 
-- **Persistence.** The cache is in-memory only. Process restart
-  clears everything; rebuild from the source of truth.
+- **Persistence.** The core is in-memory only. Process restart
+  clears everything; rebuild from the source of truth. Addons
+  could be built to periodically drain to disk, a database, or a
+  remote store — but that lives outside the core.
 - **TTL or background eviction.** No scheduler, no LRU, no LFU,
   no time-based expiration. Whatever you write stays until you
   delete it.
