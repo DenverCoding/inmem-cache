@@ -115,7 +115,7 @@ The result is a clean separation of concerns:
 
 This separation is what allows the core to remain stable under
 heavy testing and benchmarking while addons can evolve, be added,
-or be removed without risk to the cache itself.
+or be removed without risk to the core itself.
 
 ### 1.6 Status
 
