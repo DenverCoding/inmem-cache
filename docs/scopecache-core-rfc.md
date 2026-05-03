@@ -390,3 +390,722 @@ and observability, `POST` for writes and bulk operations). Calling
 an endpoint with the wrong method returns `405 Method Not Allowed`
 with the standard error envelope. The exact method per endpoint is
 listed in §6.
+
+---
+
+## 6. Endpoints
+
+scopecache exposes the following endpoints, grouped by purpose:
+
+| group                       | endpoints                                                  |
+|-----------------------------|------------------------------------------------------------|
+| §6.1 Single-item writes     | `/append`, `/upsert`, `/update`, `/counter_add`            |
+| §6.2 Deletes                | `/delete`, `/delete_up_to`, `/delete_scope`, `/wipe`       |
+| §6.3 Bulk                   | `/warm`, `/rebuild`                                         |
+| §6.4 Reads                  | `/get`, `/render`, `/head`, `/tail`                         |
+| §6.5 Observability          | `/stats`, `/help`                                           |
+
+### Conventions used in this section
+
+To keep per-endpoint sections compact, the following errors are
+implicit on every endpoint and are not repeated:
+
+- **`405 Method Not Allowed`** — wrong HTTP method (§5.5).
+- **`400 Bad Request`** — request-shape errors from §4 (missing
+  required field, oversized item, malformed JSON, client-supplied
+  `seq` or `ts`, etc.).
+
+In addition, the following errors are implicit on every **write**
+endpoint (§6.1, §6.2, §6.3):
+
+- **`409 Conflict`** — `scope was deleted while the request was in
+  flight; please retry`. Fires when a concurrent `/wipe`,
+  `/delete_scope`, or `/rebuild` detached the scope between the
+  handler's lookup and its mutation.
+- **`507 Insufficient Storage`** — per-scope or store-wide capacity
+  exceeded (§3.1, §3.3).
+
+Each endpoint section lists only the errors that are specific to
+it (typically: the body fields it requires, and any
+endpoint-specific 4xx that does not fit the universal patterns
+above).
+
+### 6.1 Single-item writes
+
+#### `POST /append`
+
+Insert a new item into a scope. Rejects on duplicate `id`-in-scope.
+
+**Request body**
+
+| field     | type           | required | notes                                |
+|-----------|----------------|----------|--------------------------------------|
+| `scope`   | string         | yes      | shape per §4.1                       |
+| `id`      | string         | no       | shape per §4.1; cache assigns if absent |
+| `payload` | any JSON value | yes      | not literal `null`                   |
+
+**Response (200)**
+
+```json
+{
+  "ok": true,
+  "item": {"scope": "events", "id": "e1", "seq": 1, "ts": 1700000000000000},
+  "duration_us": 42
+}
+```
+
+The `item` object echoes the stored `scope`, `id`, `seq`, and `ts`.
+Payload bytes are not echoed (they doubled the wire cost on the
+write path that just delivered them).
+
+**Endpoint-specific errors**
+
+| status | error                                  | when                          |
+|--------|----------------------------------------|-------------------------------|
+| 409    | `the 'id' is already in use`           | duplicate `id` within `scope` |
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/append \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"events","id":"e1","payload":{"v":1}}'
+# → {"ok":true,"item":{"scope":"events","id":"e1","seq":1,"ts":...},"duration_us":42}
+```
+
+---
+
+#### `POST /upsert`
+
+Insert a new item, or replace an existing one with the same
+`scope`+`id`. Always succeeds (within capacity); the response
+distinguishes create from replace via `created`.
+
+**Request body**
+
+| field     | type           | required | notes                                |
+|-----------|----------------|----------|--------------------------------------|
+| `scope`   | string         | yes      | shape per §4.1                       |
+| `id`      | string         | yes      | shape per §4.1                       |
+| `payload` | any JSON value | yes      | not literal `null`                   |
+
+**Response (200)**
+
+```json
+{
+  "ok": true,
+  "created": false,
+  "item": {"scope": "events", "id": "e1", "seq": 5, "ts": 1700000000000000},
+  "duration_us": 42
+}
+```
+
+`created` is `true` when the item did not exist before this call,
+`false` when an existing item was replaced. On replace, `seq`
+keeps its original value; on create, `seq` is freshly assigned.
+`ts` is always refreshed.
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/upsert \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"events","id":"e1","payload":{"v":2}}'
+# → {"ok":true,"created":false,"item":{"scope":"events","id":"e1","seq":5,"ts":...},"duration_us":42}
+```
+
+---
+
+#### `POST /update`
+
+Modify the payload of an existing item, addressed by `scope`+`id`
+or `scope`+`seq`. Soft-misses on a non-existent item (returns 200
+with `hit: false`).
+
+**Request body**
+
+| field     | type           | required               | notes                                |
+|-----------|----------------|------------------------|--------------------------------------|
+| `scope`   | string         | yes                    | shape per §4.1                       |
+| `id`      | string         | exactly one of id/seq  | shape per §4.1 when present          |
+| `seq`     | uint64         | exactly one of id/seq  | parsed as unsigned integer           |
+| `payload` | any JSON value | yes                    | not literal `null`                   |
+
+**Response (200)**
+
+```json
+{"ok": true, "hit": true, "updated_count": 1, "duration_us": 42}
+```
+
+- `hit` — whether an item was found and updated (`updated_count > 0`).
+- `updated_count` — number of items modified (always 0 or 1 since
+  `id`/`seq` is unique-in-scope).
+
+**Side effects**
+
+`ts` is refreshed on a hit. `seq` is preserved. If the new payload
+is larger than the old one and would push the store past
+`MaxStoreBytes`, the request is rejected with 507 and no change is
+applied.
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/update \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"events","id":"e1","payload":{"v":3}}'
+# → {"ok":true,"hit":true,"updated_count":1,"duration_us":42}
+```
+
+---
+
+#### `POST /counter_add`
+
+Atomically increment (or create) a numeric counter at `scope`+`id`
+by `by`. The only endpoint that reads or mutates a payload as a
+typed value — every other write path treats payloads as opaque
+bytes.
+
+**Request body**
+
+| field   | type    | required | notes                                                      |
+|---------|---------|----------|------------------------------------------------------------|
+| `scope` | string  | yes      | shape per §4.1                                             |
+| `id`    | string  | yes      | shape per §4.1                                             |
+| `by`    | int64   | yes      | non-zero; within ±(2^53 − 1)                               |
+
+**Response (200)**
+
+```json
+{"ok": true, "created": false, "value": 7, "duration_us": 42}
+```
+
+- `created` — `true` when the counter did not exist (item created
+  with payload `by`); `false` when an existing counter was
+  incremented.
+- `value` — the post-increment counter value.
+
+**Endpoint-specific errors**
+
+| status | error                                                      | when                                              |
+|--------|------------------------------------------------------------|---------------------------------------------------|
+| 400    | `the counter operation would exceed the allowed range of ±(2^53-1)` | result would overflow the JS-safe integer range |
+| 409    | `payload is not a JSON integer` (or similar)               | existing item's payload is not a valid integer    |
+
+**Side effects**
+
+The payload is read, parsed as an integer, incremented by `by`, and
+written back as a JSON integer. The counter's underlying byte size
+may change (e.g. `99` → `100` is one byte longer); the per-item and
+store-wide caps are evaluated against the new size.
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/counter_add \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"hits","id":"page-42","by":1}'
+# → {"ok":true,"created":false,"value":7,"duration_us":42}
+```
+
+### 6.2 Deletes
+
+#### `POST /delete`
+
+Delete a single item by `scope`+`id` or `scope`+`seq`. Soft-misses
+on a non-existent item.
+
+**Request body**
+
+| field   | type   | required              | notes                       |
+|---------|--------|-----------------------|-----------------------------|
+| `scope` | string | yes                   | shape per §4.1              |
+| `id`    | string | exactly one of id/seq | shape per §4.1 when present |
+| `seq`   | uint64 | exactly one of id/seq | parsed as unsigned integer  |
+
+**Response (200)**
+
+```json
+{"ok": true, "hit": true, "deleted_count": 1, "duration_us": 42}
+```
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"events","id":"e1"}'
+# → {"ok":true,"hit":true,"deleted_count":1,"duration_us":42}
+```
+
+---
+
+#### `POST /delete_up_to`
+
+Drain a `seq`-prefix from a scope: removes every item with
+`seq ≤ max_seq`. The write-buffer drain primitive — pair with
+`/tail` to read items, then `/delete_up_to` with the last drained
+`seq` to release the buffer.
+
+**Request body**
+
+| field      | type   | required | notes                          |
+|------------|--------|----------|--------------------------------|
+| `scope`    | string | yes      | shape per §4.1                 |
+| `max_seq`  | uint64 | yes      | must be > 0                    |
+
+**Response (200)**
+
+```json
+{"ok": true, "hit": true, "deleted_count": 100, "duration_us": 42}
+```
+
+`deleted_count` is the number of items actually removed (may be 0
+if no items had `seq ≤ max_seq`).
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/delete_up_to \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"events","max_seq":100}'
+# → {"ok":true,"hit":true,"deleted_count":100,"duration_us":42}
+```
+
+---
+
+#### `POST /delete_scope`
+
+Remove a whole scope, including its buffer and all its items.
+Soft-misses on a non-existent scope.
+
+**Request body**
+
+| field   | type   | required | notes          |
+|---------|--------|----------|----------------|
+| `scope` | string | yes      | shape per §4.1 |
+
+**Response (200)**
+
+```json
+{"ok": true, "hit": true, "deleted_scope": true, "deleted_items": 42, "duration_us": 42}
+```
+
+- `hit` / `deleted_scope` — `true` when the scope existed and was
+  removed; `false` when the scope did not exist.
+- `deleted_items` — the number of items the scope held at deletion
+  time.
+
+**Side effects**
+
+In-flight writes against the scope detach (return 409 to their
+callers); the scope's bytes are released back to the store-wide
+budget.
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/delete_scope \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"events"}'
+# → {"ok":true,"hit":true,"deleted_scope":true,"deleted_items":42,"duration_us":42}
+```
+
+---
+
+#### `POST /wipe`
+
+Clear every scope, every item, and every byte reservation in one
+call. The store-wide complement of `/delete_scope` — a single
+operation rather than N per-scope calls.
+
+**Request body**
+
+None. A non-empty body is silently ignored. The cache caps the body
+at 1 KiB to prevent memory abuse.
+
+**Response (200)**
+
+```json
+{"ok": true, "deleted_scopes": 12, "deleted_items": 5400, "freed_mb": 12.3456, "duration_us": 42}
+```
+
+**Side effects**
+
+In-flight writes against any scope detach (409). After the call,
+`approx_store_mb` reads as 0 in `/stats`.
+
+This is **not** an eviction policy: the cache never wipes itself.
+`/wipe` exists so operators can clear-and-rebuild atomically rather
+than coordinating N delete calls.
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/wipe
+# → {"ok":true,"deleted_scopes":12,"deleted_items":5400,"freed_mb":12.3456,"duration_us":42}
+```
+
+### 6.3 Bulk
+
+#### `POST /warm`
+
+Atomically replace the contents of one or more scopes with the
+items in the request body. Scopes not mentioned in the body are
+left alone. Old contents are released in the same call (the
+freed bytes can be reused by the new contents within the same
+capacity check).
+
+**Request body**
+
+```json
+{"items": [{"scope":"...","id":"...","payload":...}, ...]}
+```
+
+Each item validates against the same rules as `/append` (§4.1).
+Items are grouped by `scope` server-side; every scope mentioned in
+the batch is replaced as a unit.
+
+**Response (200)**
+
+```json
+{"ok": true, "count": 100, "replaced_scopes": 3, "duration_us": 42}
+```
+
+- `count` — total number of items written.
+- `replaced_scopes` — number of distinct scopes touched by the
+  replacement.
+
+**Side effects**
+
+The request body cap for `/warm` is much larger than for
+single-item writes — large enough that a fully-loaded store can
+always be expressed as one bulk call. In-flight writes against any
+replaced scope detach (409).
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/warm \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"scope":"events","id":"e1","payload":{"v":1}}]}'
+# → {"ok":true,"count":1,"replaced_scopes":1,"duration_us":42}
+```
+
+---
+
+#### `POST /rebuild`
+
+Atomically replace the entire store. Every scope and every item is
+discarded; the request body becomes the new state. Equivalent to
+`/wipe` immediately followed by `/warm` for every scope, but in a
+single atomic operation.
+
+**Request body**
+
+```json
+{"items": [{"scope":"...","id":"...","payload":...}, ...]}
+```
+
+**Endpoint-specific errors**
+
+| status | error                                              | when                  |
+|--------|----------------------------------------------------|-----------------------|
+| 400    | `the 'items' array must not be empty for the '/rebuild' endpoint` | empty `items[]`       |
+
+An empty `items[]` is rejected explicitly because it would silently
+wipe the store — almost always a client bug. Operators that really
+want to clear the store should call `/wipe`.
+
+**Response (200)**
+
+```json
+{"ok": true, "count": 100, "rebuilt_scopes": 3, "rebuilt_items": 100, "duration_us": 42}
+```
+
+**Example**
+
+```bash
+curl -s -X POST http://localhost:8080/rebuild \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"scope":"events","id":"e1","payload":{"v":1}}]}'
+# → {"ok":true,"count":1,"rebuilt_scopes":1,"rebuilt_items":1,"duration_us":42}
+```
+
+### 6.4 Reads
+
+#### `GET /get`
+
+Look up a single item by `scope`+`id` or `scope`+`seq`. Returns
+200 in both the hit and miss case; the response carries `hit:
+true|false`. See §5.3 for why misses are not 404.
+
+**Query parameters**
+
+| parameter | type   | required              |
+|-----------|--------|-----------------------|
+| `scope`   | string | yes                   |
+| `id`      | string | exactly one of id/seq |
+| `seq`     | uint64 | exactly one of id/seq |
+
+**Response (200, hit)**
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 1,
+  "item": {"scope":"events","id":"e1","seq":1,"ts":1700000000000000,"payload":{"v":1}},
+  "duration_us": 42,
+  "approx_response_mb": 0.0001
+}
+```
+
+**Response (200, miss)**
+
+```json
+{"ok": true, "hit": false, "count": 0, "item": null, "duration_us": 42, "approx_response_mb": 0.0001}
+```
+
+**Side effects**
+
+A successful hit increments the per-scope read-heat counters
+(§8) unless `DisableReadHeat` is set.
+
+**Example**
+
+```bash
+curl -s 'http://localhost:8080/get?scope=events&id=e1'
+# → {"ok":true,"hit":true,"count":1,"item":{...},"duration_us":42,"approx_response_mb":0.0001}
+```
+
+---
+
+#### `GET /render`
+
+Serve a single item's payload as raw bytes, with no JSON envelope.
+Designed for fronting proxies (Caddy, nginx, apache) to pipe cached
+HTML, JSON, XML, or text fragments straight to the client without
+an application layer in between.
+
+**Query parameters**
+
+Same as `/get`: `scope`, plus exactly one of `id` or `seq`.
+
+**Response (200, hit)**
+
+- `Content-Type: application/octet-stream` (override at the proxy)
+- Body: raw payload bytes, with one layer of JSON-string decoding
+  if the stored payload is a JSON string. Other JSON values
+  (object, array, number, boolean) are written verbatim.
+
+**Response (404, miss)**
+
+- `Content-Type: application/octet-stream`
+- Empty body. `/render` is the **only** endpoint that uses 404 for
+  a not-found resource — the use case (proxy-fronted byte
+  streaming) does not benefit from a JSON envelope, so a status
+  code is the lowest-friction signal.
+
+**Side effects**
+
+A successful hit increments the per-scope read-heat counters (§8).
+
+**Example**
+
+```bash
+curl -i 'http://localhost:8080/render?scope=html&id=page-1'
+# HTTP/1.1 200 OK
+# Content-Type: application/octet-stream
+#
+# <html>...</html>
+```
+
+---
+
+#### `GET /head`
+
+Return the oldest items in a scope, optionally cursoring past a
+given `after_seq`. Returns 200 in both the hit and miss case
+(empty scope or unknown scope yields `hit: false`).
+
+**Query parameters**
+
+| parameter   | type   | default | notes                                       |
+|-------------|--------|---------|---------------------------------------------|
+| `scope`     | string | —       | required, shape per §4.1                    |
+| `limit`     | int    | 1000    | clamped to ≤ 10000                          |
+| `after_seq` | uint64 | 0       | return items with `seq > after_seq`         |
+
+`offset` is **not** supported on `/head` — use `after_seq` for
+cursor-based forward paging (stable under `/delete_up_to`), or
+`/tail` for position-based paging.
+
+**Response (200, hit)**
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 10,
+  "truncated": false,
+  "items": [{"scope":"events","id":"e1","seq":1,"ts":...,"payload":{"v":1}}, ...],
+  "duration_us": 42,
+  "approx_response_mb": 0.0042
+}
+```
+
+`truncated` is `true` when more items exist beyond the returned
+`limit` window.
+
+**Response (200, miss)** — empty scope or unknown scope:
+
+```json
+{"ok": true, "hit": false, "count": 0, "truncated": false, "items": [], "duration_us": 42, "approx_response_mb": 0.0001}
+```
+
+**Endpoint-specific errors**
+
+| status | error                                                     | when                       |
+|--------|-----------------------------------------------------------|----------------------------|
+| 507    | `the response would exceed the maximum allowed size`      | response > `MaxResponseBytes` |
+
+**Side effects**
+
+A successful hit increments the per-scope read-heat counters (§8).
+
+**Example**
+
+```bash
+curl -s 'http://localhost:8080/head?scope=events&limit=10'
+# → {"ok":true,"hit":true,"count":10,"truncated":false,"items":[...],"duration_us":42,...}
+```
+
+---
+
+#### `GET /tail`
+
+Return the newest items in a scope, optionally offset back from the
+tail. Returns 200 in both the hit and miss case.
+
+**Query parameters**
+
+| parameter | type   | default | notes                                       |
+|-----------|--------|---------|---------------------------------------------|
+| `scope`   | string | —       | required, shape per §4.1                    |
+| `limit`   | int    | 1000    | clamped to ≤ 10000                          |
+| `offset`  | int    | 0       | skip this many items from the tail before reading |
+
+**Response (200, hit)**
+
+```json
+{
+  "ok": true,
+  "hit": true,
+  "count": 10,
+  "offset": 0,
+  "truncated": true,
+  "items": [...],
+  "duration_us": 42,
+  "approx_response_mb": 0.0042
+}
+```
+
+**Endpoint-specific errors**
+
+| status | error                                                     | when                       |
+|--------|-----------------------------------------------------------|----------------------------|
+| 507    | `the response would exceed the maximum allowed size`      | response > `MaxResponseBytes` |
+
+**Side effects**
+
+A successful hit increments the per-scope read-heat counters (§8).
+
+**Example**
+
+```bash
+curl -s 'http://localhost:8080/tail?scope=events&limit=10'
+# → {"ok":true,"hit":true,"count":10,"offset":0,"truncated":true,"items":[...],"duration_us":42,...}
+```
+
+### 6.5 Observability
+
+#### `GET /stats`
+
+Return a store-wide snapshot: scope count, total item count,
+approximate stored bytes, and per-scope counts and metadata
+(including read-heat — see §8).
+
+**Query parameters**
+
+None.
+
+**Response (200)**
+
+```json
+{
+  "ok": true,
+  "scope_count": 12,
+  "total_items": 5400,
+  "approx_store_mb": 12.3456,
+  "max_store_mb": 100.0,
+  "scopes": {
+    "events": {
+      "item_count": 100,
+      "last_seq": 100,
+      "approx_scope_mb": 0.0123,
+      "created_ts": 1700000000000000,
+      "last_write_ts": 1700000000000000,
+      "last_access_ts": 1700000000000000,
+      "read_count_total": 4242,
+      "last_7d_read_count": 1337
+    }
+  },
+  "duration_us": 42
+}
+```
+
+`scopes` is keyed by scope name; outer-map keys serialise in
+alphabetical order. Per-scope fields emit in the order shown.
+
+**Side effects**
+
+`/stats` enumerates every scope name in the store. In multi-tenant
+deployments where addons keep state in `_*` scopes, those names
+will surface here. The cache draws no line; gating `/stats` at the
+transport layer is the operator's responsibility (see §1.3).
+
+**Example**
+
+```bash
+curl -s 'http://localhost:8080/stats'
+# → {"ok":true,"scope_count":12,"total_items":5400,...}
+```
+
+---
+
+#### `GET /help`
+
+Return a one-line plain-text pointer to the canonical RFC. Intended
+as a low-maintenance self-documentation hook; rich endpoint listings
+live in this RFC, not in `/help`.
+
+**Query parameters**
+
+None.
+
+**Response (200)**
+
+- `Content-Type: text/plain; charset=utf-8`
+- Body: a single line of text, currently:
+
+```
+scopecache — see instructions at https://github.com/VeloxCoding/scopecache/blob/main/docs/scopecache-core-rfc.md
+```
+
+**Example**
+
+```bash
+curl -s 'http://localhost:8080/help'
+# → scopecache — see instructions at https://...
+```
