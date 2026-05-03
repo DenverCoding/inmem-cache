@@ -885,10 +885,9 @@ fi
 
 # /stats final invariant: aggregate-only since the 100k-scope DoS
 # observation (see /stats agg block above). scope_count and total_items
-# must agree with the arithmetic above; per-scope item_count + last_seq
-# are no longer surfaced by /stats and were verified above via the three
-# /head probes (count + items[-1].seq fall out of those assertions).
-# When /scopelist lands the per-scope numbers can be re-checked here.
+# must agree with the arithmetic above; per-scope detail (item_count,
+# last_seq, …) lives on /scopelist and is verified in the dedicated
+# block right below.
 say '== mega: stats final state =='
 call 'mega: stats final' 200 GET /stats
 json_assert 'mega: /stats aggregate counters exact' '
@@ -896,6 +895,108 @@ json_assert 'mega: /stats aggregate counters exact' '
     .scope_count == 3 and
     .total_items == 94
 '
+
+# --- /scopelist: per-scope counterpart of /stats ------------------------------
+# /scopelist surfaces the seven §2.4 primitives the cache maintains per
+# scope. Verifies wire shape, alphabetical ordering, prefix filtering,
+# and cursor pagination. The mega state from the block above gives a
+# small, deterministic three-scope set:
+#
+#   mega_data  — 49 items, last_seq=56 (deletes + delete_up_to leave a
+#                last_seq > item_count; this is the §2.4 contract that
+#                last_seq never rewinds)
+#   mega_extra — 43 items, last_seq=54
+#   mega_other — 2 items, last_seq=2 (untouched, last_seq == item_count)
+#
+# Per-row numbers cross-checked against the mega state machine above.
+say '== /scopelist: per-scope detail =='
+
+# Default page returns every scope, alphabetically.
+call 'scopelist: default' 200 GET /scopelist
+json_assert 'scopelist: ok=true count=3 truncated=false' '
+    .ok == true and .count == 3 and .truncated == false and
+    (.scopes | length) == 3
+'
+json_assert 'scopelist: alphabetical order' '
+    (.scopes | map(.scope)) == ["mega_data","mega_extra","mega_other"]
+'
+# Every row must carry the seven primitives + scope name. Just check
+# they're present (numeric ranges are checked below per row).
+json_assert 'scopelist: row carries 8 keys' '
+    .scopes[0]
+    | (has("scope") and has("item_count") and has("last_seq")
+       and has("approx_scope_mb") and has("created_ts")
+       and has("last_write_ts") and has("last_access_ts")
+       and has("read_count_total"))
+'
+
+# Per-row numeric agreement with the mega state.
+json_assert 'scopelist: mega_data row exact (49 items, last_seq=56)' '
+    .scopes | map(select(.scope == "mega_data")) | .[0]
+    | (.item_count == 49 and .last_seq == 56)
+'
+json_assert 'scopelist: mega_extra row exact (43 items, last_seq=54)' '
+    .scopes | map(select(.scope == "mega_extra")) | .[0]
+    | (.item_count == 43 and .last_seq == 54)
+'
+json_assert 'scopelist: mega_other row exact (2 items, last_seq=2)' '
+    .scopes | map(select(.scope == "mega_other")) | .[0]
+    | (.item_count == 2 and .last_seq == 2)
+'
+# §2.4 contract: last_seq never rewinds under deletes / delete_up_to.
+# mega_data and mega_extra both have last_seq > item_count proving the
+# high-water mark survived their delete + delete_up_to operations.
+json_assert 'scopelist: last_seq > item_count after deletes (no rewind)' '
+    .scopes | map(select(.scope == "mega_data" or .scope == "mega_extra"))
+    | all(.[]; .last_seq > .item_count)
+'
+json_assert 'scopelist: every scope last_write_ts > 0' '
+    .scopes | map(.last_write_ts > 0) | all
+'
+json_assert 'scopelist: total item_count matches /stats total_items' '
+    (.scopes | map(.item_count) | add) == 94
+'
+
+# Prefix filter: literal strings.HasPrefix. All three scopes share
+# "mega_" but the test below narrows further to prove the match is
+# literal, not a glob — "mega_o" matches only mega_other.
+call 'scopelist: prefix=mega_o' 200 GET '/scopelist?prefix=mega_o'
+json_assert 'scopelist: prefix narrowed to mega_other only' '
+    .count == 1 and (.scopes | map(.scope)) == ["mega_other"]
+'
+
+# Empty prefix is the no-filter case.
+call 'scopelist: prefix= empty' 200 GET '/scopelist?prefix='
+json_assert 'scopelist: empty prefix == no filter' '.count == 3'
+
+# No-match prefix returns empty array (NOT null).
+call 'scopelist: prefix=zzz' 200 GET '/scopelist?prefix=zzz'
+json_assert 'scopelist: no-match prefix is empty array, not null' '
+    .count == 0 and .truncated == false and .scopes == []
+'
+
+# Cursor pagination: limit + after. Walking the three scopes one page
+# at a time must reconstruct the full alphabetical sequence.
+call 'scopelist: page1 limit=2' 200 GET '/scopelist?limit=2'
+json_assert 'scopelist: page1 = [mega_data, mega_extra], truncated=true' '
+    .truncated == true and (.scopes | map(.scope)) == ["mega_data","mega_extra"]
+'
+call 'scopelist: page2 after=mega_extra' 200 GET '/scopelist?limit=2&after=mega_extra'
+json_assert 'scopelist: page2 = [mega_other], truncated=false' '
+    .truncated == false and (.scopes | map(.scope)) == ["mega_other"]
+'
+
+# `after` past every scope name → empty page, not truncated.
+call 'scopelist: after past everything' 200 GET '/scopelist?after=zzz'
+json_assert 'scopelist: after=zzz returns empty' '.count == 0 and .truncated == false'
+
+# Validation: prefix and after both flow through the scope shape rules
+# (size cap, no control chars). Limit=0 also rejects up-front.
+call 'scopelist: limit=0 rejected' 400 GET '/scopelist?limit=0'
+json_assert 'scopelist: limit=0 error mentions positive' '
+    .error | test("positive")
+'
+call 'scopelist: POST not allowed' 405 POST /scopelist
 
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='

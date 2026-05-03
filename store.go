@@ -3,6 +3,8 @@ package scopecache
 import (
 	"errors"
 	"hash/maphash"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -720,4 +722,78 @@ func (s *Store) listScopes() map[string]*scopeBuffer {
 		sh.mu.RUnlock()
 	}
 	return out
+}
+
+// scopeListEntry is one row in a /scopelist response: the scope name plus
+// the seven per-scope primitives §2.4 of the RFC maintains directly.
+// Field declaration order = wire field order (encoding/json honours it).
+type scopeListEntry struct {
+	Scope          string `json:"scope"`
+	ItemCount      int    `json:"item_count"`
+	LastSeq        uint64 `json:"last_seq"`
+	ApproxScopeMB  MB     `json:"approx_scope_mb"`
+	CreatedTS      int64  `json:"created_ts"`
+	LastWriteTS    int64  `json:"last_write_ts"`
+	LastAccessTS   int64  `json:"last_access_ts"`
+	ReadCountTotal uint64 `json:"read_count_total"`
+}
+
+// scopeList returns the per-scope detail rows for /scopelist: optional
+// prefix filter, alphabetical sort, cursor pagination by name. Returns
+// (entries, truncated) where truncated is true when more matching scopes
+// exist past the limit window.
+//
+// Cost shape:
+//   - O(N) walk across every shard map under each shard's RLock; the
+//     filter (prefix match + after-cursor) runs inside the loop so only
+//     matching names enter the sort buffer.
+//   - O(M log M) sort, where M = filtered count.
+//   - O(limit) buf.stats() materialisations after the locks are released.
+//
+// Stats() takes its own buf.mu.RLock per scope, so a slow stats() call
+// cannot block writers on its shard for the duration of the listing.
+// A scope deleted between the snapshot and stats() materialises its
+// last-known state — same advisory-snapshot caveat as /stats (§7.3).
+func (s *Store) scopeList(prefix, after string, limit int) ([]scopeListEntry, bool) {
+	type ref struct {
+		name string
+		buf  *scopeBuffer
+	}
+	var refs []ref
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for name, buf := range sh.scopes {
+			if prefix != "" && !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			if after != "" && name <= after {
+				continue
+			}
+			refs = append(refs, ref{name: name, buf: buf})
+		}
+		sh.mu.RUnlock()
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].name < refs[j].name })
+
+	truncated := len(refs) > limit
+	if truncated {
+		refs = refs[:limit]
+	}
+
+	out := make([]scopeListEntry, 0, len(refs))
+	for _, r := range refs {
+		st := r.buf.stats()
+		out = append(out, scopeListEntry{
+			Scope:          r.name,
+			ItemCount:      st.ItemCount,
+			LastSeq:        st.LastSeq,
+			ApproxScopeMB:  st.ApproxScopeMB,
+			CreatedTS:      st.CreatedTS,
+			LastWriteTS:    st.LastWriteTS,
+			LastAccessTS:   st.LastAccessTS,
+			ReadCountTotal: st.ReadCountTotal,
+		})
+	}
+	return out, truncated
 }

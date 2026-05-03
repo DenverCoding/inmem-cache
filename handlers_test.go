@@ -1200,6 +1200,276 @@ func TestStats_Structure(t *testing.T) {
 	}
 }
 
+// --- /scopelist ---------------------------------------------------------------
+
+// mustScopelistEntries pulls the typed list of {scope, item_count, ...}
+// rows out of a /scopelist response. Lets tests read the wire shape
+// without re-asserting the same json.RawMessage dance per case.
+func mustScopelistEntries(t *testing.T, out map[string]interface{}) []map[string]interface{} {
+	t.Helper()
+	raw, ok := out["scopes"]
+	if !ok {
+		t.Fatalf("missing 'scopes' in /scopelist response: %+v", out)
+	}
+	arr, ok := raw.([]interface{})
+	if !ok {
+		t.Fatalf("'scopes' is not an array: %T", raw)
+	}
+	out2 := make([]map[string]interface{}, 0, len(arr))
+	for i, e := range arr {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			t.Fatalf("scopes[%d] is not an object: %T", i, e)
+		}
+		out2 = append(out2, m)
+	}
+	return out2
+}
+
+func mustScopeNames(t *testing.T, out map[string]interface{}) []string {
+	t.Helper()
+	entries := mustScopelistEntries(t, out)
+	names := make([]string, 0, len(entries))
+	for i, e := range entries {
+		s, ok := e["scope"].(string)
+		if !ok {
+			t.Fatalf("scopes[%d].scope is not a string: %v", i, e["scope"])
+		}
+		names = append(names, s)
+	}
+	return names
+}
+
+// /scopelist with no params returns every scope, sorted alphabetically,
+// each row carrying the seven §2.4 primitives + scope name.
+func TestScopelist_AlphaSortAndShape(t *testing.T) {
+	h, _ := newTestHandler(10)
+	for _, s := range []string{"thread:42", "alpha", "events", "thread:1"} {
+		body := fmt.Sprintf(`{"scope":%q,"payload":{"v":1}}`, s)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("seed %q: code=%d body=%s", s, code, raw)
+		}
+	}
+
+	code, out, raw := doRequest(t, h, "GET", "/scopelist", "")
+	if code != 200 {
+		t.Fatalf("code=%d body=%s", code, raw)
+	}
+	if !mustBool(t, out, "ok") {
+		t.Fatal("ok=false")
+	}
+	if mustFloat(t, out, "count") != 4 {
+		t.Errorf("count=%v want 4", out["count"])
+	}
+	if mustBool(t, out, "truncated") {
+		t.Error("truncated=true with limit > scope count")
+	}
+
+	got := mustScopeNames(t, out)
+	want := []string{"alpha", "events", "thread:1", "thread:42"}
+	if len(got) != len(want) {
+		t.Fatalf("scopes=%v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("scopes[%d]=%q want %q (alpha sort)", i, got[i], want[i])
+		}
+	}
+
+	// Per-row shape: every entry must carry the seven primitives + scope.
+	row := mustScopelistEntries(t, out)[0]
+	for _, key := range []string{
+		"scope", "item_count", "last_seq", "approx_scope_mb",
+		"created_ts", "last_write_ts", "last_access_ts", "read_count_total",
+	} {
+		if _, ok := row[key]; !ok {
+			t.Errorf("row missing %q: %+v", key, row)
+		}
+	}
+}
+
+// Prefix filter is literal strings.HasPrefix — no regex, no wildcard parsing.
+// Empty prefix is the no-filter case, equivalent to omitting the param.
+func TestScopelist_PrefixFilter(t *testing.T) {
+	h, _ := newTestHandler(10)
+	for _, s := range []string{"thread:42", "alpha", "events", "thread:1"} {
+		body := fmt.Sprintf(`{"scope":%q,"payload":{"v":1}}`, s)
+		_, _, _ = doRequest(t, h, "POST", "/append", body)
+	}
+
+	_, out, _ := doRequest(t, h, "GET", "/scopelist?prefix=thread:", "")
+	got := mustScopeNames(t, out)
+	want := []string{"thread:1", "thread:42"}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("prefix=thread: got=%v want %v", got, want)
+	}
+
+	// Empty prefix is treated as "no filter" — must equal the unfiltered call.
+	_, out2, _ := doRequest(t, h, "GET", "/scopelist?prefix=", "")
+	if mustFloat(t, out2, "count") != 4 {
+		t.Errorf("empty prefix: count=%v want 4", out2["count"])
+	}
+
+	// No matches → empty array, not null.
+	_, out3, _ := doRequest(t, h, "GET", "/scopelist?prefix=zzz", "")
+	if mustFloat(t, out3, "count") != 0 {
+		t.Errorf("no-match prefix: count=%v want 0", out3["count"])
+	}
+	if got := mustScopelistEntries(t, out3); len(got) != 0 {
+		t.Errorf("no-match prefix: scopes=%v want []", got)
+	}
+}
+
+// Cursor pagination: limit + after is the only paging mode shipped.
+// `truncated` flips when more matching scopes exist past the page,
+// and resuming with after=<last scope> walks the next page.
+func TestScopelist_LimitAndAfterCursor(t *testing.T) {
+	h, _ := newTestHandler(10)
+	scopes := []string{"a", "b", "c", "d", "e"}
+	for _, s := range scopes {
+		body := fmt.Sprintf(`{"scope":%q,"payload":{"v":1}}`, s)
+		_, _, _ = doRequest(t, h, "POST", "/append", body)
+	}
+
+	_, out, _ := doRequest(t, h, "GET", "/scopelist?limit=2", "")
+	if !mustBool(t, out, "truncated") {
+		t.Error("truncated=false on limit=2 with 5 scopes")
+	}
+	got := mustScopeNames(t, out)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("page1=%v want [a b]", got)
+	}
+
+	_, out, _ = doRequest(t, h, "GET", "/scopelist?limit=2&after=b", "")
+	if !mustBool(t, out, "truncated") {
+		t.Error("truncated=false on second page with more behind")
+	}
+	got = mustScopeNames(t, out)
+	if len(got) != 2 || got[0] != "c" || got[1] != "d" {
+		t.Errorf("page2=%v want [c d]", got)
+	}
+
+	_, out, _ = doRequest(t, h, "GET", "/scopelist?limit=2&after=d", "")
+	if mustBool(t, out, "truncated") {
+		t.Error("truncated=true on final page")
+	}
+	got = mustScopeNames(t, out)
+	if len(got) != 1 || got[0] != "e" {
+		t.Errorf("page3=%v want [e]", got)
+	}
+
+	// after past every scope name → empty page, not truncated.
+	_, out, _ = doRequest(t, h, "GET", "/scopelist?after=zzz", "")
+	if mustFloat(t, out, "count") != 0 {
+		t.Errorf("after=zzz: count=%v want 0", out["count"])
+	}
+}
+
+// /scopelist must not bump per-scope read-bookkeeping. Eviction-candidate
+// addons that poll /scopelist would otherwise see their own polls inflate
+// the read_count_total they're trying to measure. Same rule the RFC §8.2
+// applies to /stats.
+func TestScopelist_DoesNotBumpReadBookkeeping(t *testing.T) {
+	h, api := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"x","id":"a","payload":{"v":1}}`)
+
+	for i := 0; i < 5; i++ {
+		_, _, _ = doRequest(t, h, "GET", "/scopelist", "")
+	}
+
+	buf, ok := api.store.getScope("x")
+	if !ok {
+		t.Fatal("scope x missing")
+	}
+	if got := buf.readCountTotal.Load(); got != 0 {
+		t.Errorf("read_count_total=%d want 0 (/scopelist must not count as a read)", got)
+	}
+	if got := buf.lastAccessTS.Load(); got != 0 {
+		t.Errorf("last_access_ts=%d want 0 (/scopelist must not stamp access)", got)
+	}
+}
+
+// Validation errors share the standard 400 envelope: prefix and after both
+// flow through checkKeyField (same shape rules as scope), so an embedded
+// control character or oversize value is rejected up-front.
+func TestScopelist_ValidationErrors(t *testing.T) {
+	h, _ := newTestHandler(10)
+	cases := []struct{ url, wantSubstr string }{
+		{"/scopelist?prefix=" + strings.Repeat("a", MaxScopeBytes+1), "256"},
+		{"/scopelist?after=" + strings.Repeat("b", MaxScopeBytes+1), "256"},
+		{"/scopelist?limit=0", "positive"},
+		{"/scopelist?limit=-3", "positive"},
+		{"/scopelist?limit=abc", "positive"},
+	}
+	for _, c := range cases {
+		code, out, raw := doRequest(t, h, "GET", c.url, "")
+		if code != 400 {
+			t.Errorf("%s: code=%d want 400 body=%s", c.url, code, raw)
+			continue
+		}
+		errStr, _ := out["error"].(string)
+		if !strings.Contains(errStr, c.wantSubstr) {
+			t.Errorf("%s: error=%q does not mention %q", c.url, errStr, c.wantSubstr)
+		}
+	}
+}
+
+func TestScopelist_MethodNotAllowed(t *testing.T) {
+	h, _ := newTestHandler(10)
+	code, _, _ := doRequest(t, h, "POST", "/scopelist", "")
+	if code != 405 {
+		t.Errorf("POST /scopelist: code=%d want 405", code)
+	}
+}
+
+// Empty store → empty array, count=0, truncated=false. Wire-format check
+// that no client sees null instead of [].
+func TestScopelist_EmptyStore(t *testing.T) {
+	h, _ := newTestHandler(10)
+	_, out, _ := doRequest(t, h, "GET", "/scopelist", "")
+	if mustFloat(t, out, "count") != 0 {
+		t.Errorf("count=%v want 0", out["count"])
+	}
+	if mustBool(t, out, "truncated") {
+		t.Error("truncated=true on empty store")
+	}
+	entries := mustScopelistEntries(t, out)
+	if len(entries) != 0 {
+		t.Errorf("scopes=%v want []", entries)
+	}
+}
+
+// Sanity: the seven primitives carry the values the buffer actually holds.
+// Reading a per-scope row from /scopelist must report the same numbers as
+// poking the *scopeBuffer directly.
+func TestScopelist_ReportsPerScopePrimitives(t *testing.T) {
+	h, api := newTestHandler(10)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"x","id":"a","payload":{"v":1}}`)
+	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"x","id":"b","payload":{"v":2}}`)
+	_, _, _ = doRequest(t, h, "GET", "/get?scope=x&id=a", "") // bumps read_count_total + last_access_ts
+
+	_, out, _ := doRequest(t, h, "GET", "/scopelist?prefix=x", "")
+	row := mustScopelistEntries(t, out)[0]
+	if row["scope"].(string) != "x" {
+		t.Errorf("scope=%v want x", row["scope"])
+	}
+	if row["item_count"].(float64) != 2 {
+		t.Errorf("item_count=%v want 2", row["item_count"])
+	}
+	if row["last_seq"].(float64) != 2 {
+		t.Errorf("last_seq=%v want 2", row["last_seq"])
+	}
+	if row["read_count_total"].(float64) != 1 {
+		t.Errorf("read_count_total=%v want 1 (one /get hit)", row["read_count_total"])
+	}
+
+	buf, _ := api.store.getScope("x")
+	wantLastWrite := buf.lastWriteTS
+	if got := int64(row["last_write_ts"].(float64)); got != wantLastWrite {
+		t.Errorf("last_write_ts=%d want %d", got, wantLastWrite)
+	}
+}
+
 // --- integration: mixed workload ---------------------------------------------
 
 // TestIntegration_MixedWorkload_StatsAndInvariants drives the full API through

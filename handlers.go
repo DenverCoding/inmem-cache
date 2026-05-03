@@ -393,5 +393,6 @@ func (api *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/delete_scope", api.handleDeleteScope)
 	// Observability.
 	mux.HandleFunc("/stats", api.handleStats)
+	mux.HandleFunc("/scopelist", api.handleScopeList)
 	mux.HandleFunc("/help", api.handleHelp)
 }

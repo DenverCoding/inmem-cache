@@ -229,11 +229,13 @@ deltas off a scheduler — see §8.
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
 | `detached`           | lifecycle flag set by `/delete_scope`, `/wipe`, `/rebuild` to fail in-flight writes against an orphan buffer |
 
-These fields are not currently surfaced through any HTTP endpoint as
-a per-scope bundle — `/stats` is aggregate-only (§2.5) and the
-paginated per-scope listing endpoint (`/scopelist`) is not yet
-implemented. In-process Go callers can read individual fields via
-the (forthcoming) `*Direct` API.
+The seven primitives (`item_count`, `last_seq`, `approx_scope_mb`,
+`created_ts`, `last_write_ts`, `last_access_ts`, `read_count_total`)
+are surfaced as a per-scope bundle on `/scopelist` (§6.5), with
+optional prefix filtering and alphabetical cursor pagination.
+`/stats` itself stays aggregate-only (§2.5). In-process Go callers
+will be able to read the same fields via the `*Direct` API once it
+ships in Phase B.
 
 **`/counter_add` and the freshness signal.** `/counter_add` refreshes
 the per-item `ts` on every create and increment, but does NOT bump the
@@ -509,7 +511,7 @@ scopecache exposes the following endpoints, grouped by purpose:
 | §6.2 Deletes                | `/delete`, `/delete_up_to`, `/delete_scope`, `/wipe`       |
 | §6.3 Bulk                   | `/warm`, `/rebuild`                                         |
 | §6.4 Reads                  | `/get`, `/render`, `/head`, `/tail`                         |
-| §6.5 Observability          | `/stats`, `/help`                                           |
+| §6.5 Observability          | `/stats`, `/scopelist`, `/help`                             |
 
 ### Endpoint conventions
 
@@ -1149,10 +1151,9 @@ curl -s 'http://localhost:8080/tail?scope=events&limit=10'
 #### `GET /stats`
 
 Return a **store-wide aggregate snapshot**: scope count, total item
-count, approximate stored bytes, and the configured byte cap. No
+count, approximate stored bytes, and the freshness tick. No
 per-scope enumeration — that lives on `/scopelist` (paginated, with
-sort and prefix filters; see roadmap). Per-field semantics are
-documented in §2.5.
+optional prefix filter). Per-field semantics are documented in §2.5.
 
 **Query parameters**
 
@@ -1201,6 +1202,188 @@ reasons (capacity-disclosure, side-channel timing); see §1.3.
 curl -s 'http://localhost:8080/stats'
 # → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"last_write_ts":1700000000123456,"duration_us":0}
 ```
+
+---
+
+#### `GET /scopelist`
+
+Return per-scope detail rows in alphabetical order, with an optional
+prefix filter and cursor pagination by name. The per-scope counterpart
+of `/stats`: where `/stats` is store-wide aggregate, `/scopelist` walks
+the scopes themselves and surfaces the seven primitives §2.4 maintains
+on every buffer.
+
+**Query parameters**
+
+| parameter | type   | default | notes                                                       |
+|-----------|--------|---------|-------------------------------------------------------------|
+| `prefix`  | string | —       | optional, literal `strings.HasPrefix` filter on scope name; shape per §4.1 when present |
+| `after`   | string | —       | optional cursor; returns scopes whose name `>` `after` (strict); shape per §4.1 when present |
+| `limit`   | int    | 1000    | clamped to ≤ 10000                                          |
+
+Sort order is alphabetical, the only mode shipped. Scope names do not
+move once created, so the cursor stays stable under concurrent writes
+— resuming with `?after=<last-scope-of-previous-page>` walks the next
+page deterministically. Other ranking modes (by byte size, by
+read-count) are explicitly out of core; addons that want them poll
+`/scopelist` and rank client-side.
+
+**Response (200)**
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "truncated": true,
+  "scopes": [
+    {
+      "scope": "events",
+      "item_count": 42,
+      "last_seq": 50,
+      "approx_scope_mb": 0.0042,
+      "created_ts": 1700000000000000,
+      "last_write_ts": 1700000001234567,
+      "last_access_ts": 1700000002345678,
+      "read_count_total": 99
+    },
+    {
+      "scope": "thread:42",
+      "item_count": 3,
+      "last_seq": 3,
+      "approx_scope_mb": 0.0008,
+      "created_ts": 1700000001000000,
+      "last_write_ts": 1700000001500000,
+      "last_access_ts": 0,
+      "read_count_total": 0
+    }
+  ],
+  "duration_us": 42,
+  "approx_response_mb": 0.0009
+}
+```
+
+- `count` — number of scopes in this page.
+- `truncated` — `true` when more matching scopes exist past the limit;
+  resume by repeating the call with `?after=<last scope of this page>`.
+- `scopes` — array of per-scope detail rows; field semantics per §2.4.
+  Empty array (and `count: 0`, `truncated: false`) when no scopes match.
+
+**Endpoint-specific errors**
+
+| status | error                                                | when                                  |
+|--------|------------------------------------------------------|---------------------------------------|
+| 507    | `the response would exceed the maximum allowed size` | response > `MaxResponseBytes`         |
+
+**Cost**
+
+`O(N)` walk across every shard map (under each shard's RLock) to apply
+the prefix and `after` filters, `O(M log M)` sort on the surviving
+names where M is the filtered count, and `O(limit)` `buf.stats()`
+materialisations once the locks are released. Filtering happens inside
+the walk so a narrow prefix is much cheaper than a full enumeration.
+
+This is fundamentally an `O(scope_count)` endpoint — unlike `/stats`,
+which is `O(1)` — so use it for periodic enumeration and addon polling
+rather than per-request hot paths.
+
+**Side effects**
+
+None. `/scopelist` is observability and does NOT bump per-scope
+read-bookkeeping (§8). An addon that polls `/scopelist` to compute
+read-count deltas would otherwise see its own polls inflate the
+counters it is trying to measure.
+
+**Examples**
+
+Three illustrative calls against a store that holds an `events` scope
+plus a handful of `thread:42:*` scopes. Responses are abbreviated for
+readability: `created_ts`, `last_write_ts`, `last_access_ts`,
+`read_count_total`, `duration_us`, and `approx_response_mb` are present
+on the wire but omitted from the prose below.
+
+*First page, every scope:*
+
+```bash
+curl -s 'http://localhost:8080/scopelist?limit=100'
+```
+
+```json
+{
+  "ok": true,
+  "count": 4,
+  "truncated": false,
+  "scopes": [
+    {"scope": "events",        "item_count": 42, "last_seq": 50, "approx_scope_mb": 0.0042, ...},
+    {"scope": "thread:42:abc", "item_count": 3,  "last_seq": 3,  "approx_scope_mb": 0.0008, ...},
+    {"scope": "thread:42:def", "item_count": 5,  "last_seq": 5,  "approx_scope_mb": 0.0011, ...},
+    {"scope": "thread:42:xyz", "item_count": 1,  "last_seq": 1,  "approx_scope_mb": 0.0003, ...}
+  ]
+}
+```
+
+*Prefix search — narrow to one tenant's footprint:*
+
+```bash
+curl -s 'http://localhost:8080/scopelist?prefix=thread:42:&limit=100'
+```
+
+```json
+{
+  "ok": true,
+  "count": 3,
+  "truncated": false,
+  "scopes": [
+    {"scope": "thread:42:abc", "item_count": 3, "last_seq": 3, "approx_scope_mb": 0.0008, ...},
+    {"scope": "thread:42:def", "item_count": 5, "last_seq": 5, "approx_scope_mb": 0.0011, ...},
+    {"scope": "thread:42:xyz", "item_count": 1, "last_seq": 1, "approx_scope_mb": 0.0003, ...}
+  ]
+}
+```
+
+The filter is literal `strings.HasPrefix`: `prefix=thread:42:` matches
+every scope name starting with that exact byte sequence and skips
+`events`. There is no glob, regex, or `:` parsing — `thread:` would
+match every `thread:*:*` scope across tenants, `thread:42:` narrows
+to one.
+
+*Cursor pagination — combine `prefix` with `limit` and `after` to walk
+a tenant's scopes in pages:*
+
+```bash
+curl -s 'http://localhost:8080/scopelist?prefix=thread:42:&limit=2'
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "truncated": true,
+  "scopes": [
+    {"scope": "thread:42:abc", "item_count": 3, ...},
+    {"scope": "thread:42:def", "item_count": 5, ...}
+  ]
+}
+```
+
+`truncated: true` signals there is more behind this page. Resume by
+passing the last `scope` value as `after`:
+
+```bash
+curl -s 'http://localhost:8080/scopelist?prefix=thread:42:&limit=2&after=thread:42:def'
+```
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "truncated": false,
+  "scopes": [
+    {"scope": "thread:42:xyz", "item_count": 1, ...}
+  ]
+}
+```
+
+`truncated: false` on this page means the walk is complete.
 
 ---
 
@@ -1319,9 +1502,9 @@ lives in addons that poll the primitives off a scheduler.
 
 The fields are maintained on the per-scope buffer; `/stats` is
 aggregate-only and does not surface them. They are exposed via
-`/scopelist` (per-scope detail with paginated enumeration) and via
-the in-process Go API (Phase B). See §2.4 for the full list of
-per-scope fields.
+`/scopelist` (§6.5) as part of the per-scope detail bundle, and will
+also be readable via the in-process Go API (Phase B). See §2.4 for
+the full list of per-scope fields.
 
 | field              | type   | meaning                                                 |
 |--------------------|--------|---------------------------------------------------------|
