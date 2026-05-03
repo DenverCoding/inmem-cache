@@ -167,20 +167,41 @@ Within a scope, items appear in `seq` order. `seq` starts at 1 for
 the first write into a scope and increases monotonically per scope.
 `seq` numbers are not reused after deletion.
 
-### 2.3 Scopes are opaque strings
+The flexibility of the addressing surface comes from how clients
+**name** scopes and IDs. A wide range of real-world access patterns
+can be modelled by encoding the relevant query key into the scope
+name, the ID, or both. If an application needs a query the core
+cannot answer (for example: "all events with `level=error`"), the
+standard pattern is a **materialized view** — a separate scope
+maintained by the application alongside the primary scope,
+containing only the items that match the query. Reads from the view
+are then a plain `/tail` or `/head` against a smaller,
+query-specific scope. The core makes no special accommodations for
+this pattern; it simply allows it through naming flexibility.
 
-The cache imposes no structure on scope names beyond size and
-encoding limits. Scope names like `thread:42`, `user:alice:inbox`,
-or HMAC-derived prefixes are equally valid; the cache does not
-parse them, does not split on `:`, and does not interpret leading
+Adding more filter axes to the core is explicitly **not** on the
+roadmap. See §9.3.
+
+### 2.3 Scopes and IDs are opaque strings
+
+Both `scope` and `id` are free-form strings of up to 256 bytes
+(see §4.1). The core imposes no structure beyond the size and
+encoding limits: names like `thread:42`, `user:alice:inbox`, or
+HMAC-derived prefixes are equally valid. The core does not parse
+them, does not split on `:`, and does not interpret leading
 underscores as reserved.
+
+Lookup by `scope`, `id`, or `seq` runs against in-memory hashmaps
+and is independent of name length. In-process measurements
+report sub-microsecond latency for a single-item read on a
+50,000-item scope.
 
 The `_` prefix is a **social convention** for state managed by
 addons (`_tokens`, `_counters_*`, addon-internal scopes). The core
 does not enforce it. If an addon wants its state protected from
 public writes, that protection must come from the operator (gating
 which endpoints are publicly reachable) or from the addon itself
-(signed payloads, unguessable scope names) — see §1.3.
+(signed payloads, unguessable scope names) — see §1.4.
 
 ---
 
