@@ -253,3 +253,140 @@ Operator tools to manage capacity:
 
 Read-heat metadata (§8) helps operators identify which scopes are
 cold enough to evict, but the cache itself never decides.
+
+---
+
+## 4. Validation
+
+All write paths share the same validation pass before the request
+reaches the store. Errors are returned as `400 Bad Request` with a
+JSON body — see §5.2.
+
+### 4.1 Field-shape rules
+
+Validation rules for the fields that appear across the API:
+
+| field       | type            | shape rule                                               |
+|-------------|-----------------|----------------------------------------------------------|
+| `scope`     | string          | required; ≤ 256 bytes; no leading/trailing whitespace; no control characters (0x00–0x1F, 0x7F) |
+| `id`        | string          | optional or required (per endpoint); same shape as `scope` when present |
+| `payload`   | any JSON value  | required; literal `null` is rejected; bytes are opaque to the cache |
+| `seq`       | uint64          | cache-assigned; clients must omit on every write; reads accept it as an addressing key |
+| `ts`        | int64           | cache-assigned; clients must omit on every write |
+| `by`        | int64           | required for `/counter_add`; non-zero; within ±(2^53 − 1) |
+| `max_seq`   | uint64          | required for `/delete_up_to`; must be > 0 |
+
+Per-item byte size (the sum of `scope`, `id`, fixed overhead, and
+payload bytes — see `approxItemSize` in code) is checked against
+`MaxItemBytes` after field-shape validation. An over-cap item is
+rejected with `400 Bad Request`. See §3.2.
+
+### 4.2 Query parameters
+
+Read endpoints accept query parameters with the following rules:
+
+| parameter   | type    | default | rule                                          |
+|-------------|---------|---------|-----------------------------------------------|
+| `scope`     | string  | —       | same shape rules as the body field            |
+| `id`        | string  | —       | same shape rules as the body field            |
+| `seq`       | uint64  | —       | parsed as unsigned integer                    |
+| `limit`     | int     | 1000    | must be > 0; values above 10000 are clamped, not rejected |
+| `offset`    | int     | 0       | must be ≥ 0                                   |
+| `after_seq` | uint64  | 0       | parsed as unsigned integer; 0 means "from the start" |
+
+Single-item read endpoints (`/get`, `/render`) require exactly one
+of `id` or `seq`. Supplying both, or neither, is rejected with
+`400 Bad Request`.
+
+### 4.3 Why the cache rejects client-supplied `seq` and `ts`
+
+Both fields are owned by the cache and stamped on every write that
+touches an item. Accepting client-supplied values would silently
+break the invariant that `seq` is monotonic per scope and that `ts`
+reflects the cache's own write time. The validator rejects them
+with an explicit error rather than overwriting silently — clients
+that need a "client timestamp" can carry it inside `payload`, where
+the cache stays opaque.
+
+---
+
+## 5. HTTP contract
+
+### 5.1 Response envelope
+
+Successful responses use a JSON envelope. The shape of the envelope
+varies per endpoint, but two fields are universal:
+
+- `ok` — boolean, always present, `true` on success and `false` on
+  error.
+- `duration_us` — integer, always present, the handler's internal
+  duration in microseconds (measured from the start of request
+  processing to the start of response write).
+
+Read endpoints whose response size scales with the request (`/get`,
+`/head`, `/tail`) additionally include:
+
+- `approx_response_mb` — number, the approximate marshalled size
+  of the response body in MiB (4-decimal precision).
+
+Two endpoints break the JSON-envelope rule by design:
+
+- **`/render`** — returns raw payload bytes (or empty body on
+  miss); see §6.4.
+- **`/help`** — returns `text/plain`; see §6.5.
+
+### 5.2 Error envelope
+
+Error responses use the same JSON envelope shape with `ok: false`
+and a string `error` field describing the failure. Capacity errors
+(`507`) include additional structured fields naming the offending
+scope or store-wide totals — see §3.
+
+```json
+{
+  "ok": false,
+  "error": "the 'scope' field is required for the '/append' endpoint",
+  "duration_us": 12
+}
+```
+
+### 5.3 Status codes
+
+The cache uses a small, deterministic set of HTTP status codes:
+
+| status | meaning                                     | examples                                |
+|--------|---------------------------------------------|-----------------------------------------|
+| 200    | success                                     | every successful operation              |
+| 400    | request-shape error (validation, parse)     | missing field, oversize item, malformed |
+| 404    | resource not found (raw-bytes endpoint only)| `/render` miss                          |
+| 405    | method not allowed                          | `GET /append`, `POST /get`              |
+| 409    | scope detached mid-flight                   | concurrent `/wipe` or `/delete_scope`   |
+| 507    | capacity exceeded                           | per-scope or store-wide cap reached     |
+
+The JSON-envelope reads (`/get`, `/head`, `/tail`) deliberately do
+**not** use 404 for misses. A miss is a successful query that
+happened to find nothing; the envelope carries `hit: false` instead.
+This keeps client error-handling on read paths simple — only network
+failures and 4xx-as-validation-errors need attention; misses are
+ordinary results.
+
+### 5.4 Content types
+
+| endpoint            | response content-type                      |
+|---------------------|--------------------------------------------|
+| every JSON endpoint | `application/json; charset=utf-8`          |
+| `/render`           | `application/octet-stream`                 |
+| `/help`             | `text/plain; charset=utf-8`                |
+
+`/render` deliberately uses `application/octet-stream` — a neutral
+default that the fronting proxy is expected to override per-route
+(`header Content-Type text/html`, etc.). The cache does not sniff
+content or guess the real MIME type.
+
+### 5.5 Method matching
+
+Every endpoint accepts exactly one HTTP method (`GET` for reads
+and observability, `POST` for writes and bulk operations). Calling
+an endpoint with the wrong method returns `405 Method Not Allowed`
+with the standard error envelope. The exact method per endpoint is
+listed in §6.
