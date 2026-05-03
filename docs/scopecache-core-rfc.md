@@ -221,7 +221,7 @@ addon-side eviction logic — see §8.
 | `bytes`              | Σ `approxItemSize` over items — feeds store-wide `totalBytes`                  |
 | `idKeyBytes`         | Σ `len(item.ID)` over `byID` — keeps `approxSizeBytes` O(1)                    |
 | `createdTS`          | microsecond timestamp of scope creation                                        |
-| `lastWriteTS`        | microsecond timestamp of the most recent write to any item in the scope       |
+| `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/counter_add` (create and increment), `/delete`, `/delete_up_to`, `/warm`, `/rebuild` |
 | `lastAccessTS`       | microsecond timestamp of the most recent read hit (atomic, lock-free)         |
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
 | `last7DReadCount`    | rolling 7-day read-hit count (atomic, lock-free)                               |
