@@ -221,7 +221,7 @@ addon-side eviction logic — see §8.
 | `bytes`              | Σ `approxItemSize` over items — feeds store-wide `totalBytes`                  |
 | `idKeyBytes`         | Σ `len(item.ID)` over `byID` — keeps `approxSizeBytes` O(1)                    |
 | `createdTS`          | microsecond timestamp of scope creation                                        |
-| `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/counter_add` (create and increment), `/delete`, `/delete_up_to`, `/warm`, `/rebuild` |
+| `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/delete`, `/delete_up_to`, `/warm`, `/rebuild`. `/counter_add` is excluded by design; see note below. |
 | `lastAccessTS`       | microsecond timestamp of the most recent read hit (atomic, lock-free)         |
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
 | `last7DReadCount`    | rolling 7-day read-hit count (atomic, lock-free)                               |
@@ -233,6 +233,16 @@ a per-scope bundle — `/stats` is aggregate-only (§2.5) and the
 paginated per-scope listing endpoint (`/scopelist`) is not yet
 implemented. In-process Go callers can read individual fields via
 the (forthcoming) `*Direct` API.
+
+**`/counter_add` and the freshness signal.** `/counter_add` refreshes
+the per-item `ts` on every create and increment, but does NOT bump the
+scope's `lastWriteTS` or the store-wide `last_write_ts` (§2.5).
+Counters are typically used to track read-driven activity (view
+counters bumping on every page hit), and folding those increments into
+`lastWriteTS` would degrade it from a "did meaningful content change?"
+signal into a heartbeat. Consumers who specifically care about a
+counter's freshness do `GET /get?scope=…&id=…` and read `item.ts`,
+which is the per-counter "last activity" timestamp.
 
 ### 2.5 Store-wide metadata
 
@@ -687,10 +697,20 @@ bytes.
 
 **Side effects**
 
-The payload is read, parsed as an integer, incremented by `by`, and
-written back as a JSON integer. The counter's underlying byte size
-may change (e.g. `99` → `100` is one byte longer); the per-item and
-store-wide caps are evaluated against the new size.
+The counter value is incremented atomically by `by`. Increments run
+lock-free under the scope's read lock (CAS on an atomic int64 sidecar
+on the item) — concurrent `/counter_add` calls on the same counter do
+not serialise on each other or on read endpoints, only on actual
+mutations of the same scope (`/append`, `/upsert`, `/delete`).
+
+A worst-case payload reservation (max int64 width plus cell heap) is
+charged against the per-item and store-wide caps once at creation
+time, so subsequent increments never re-evaluate the byte budget;
+`99 → 100` and `999_999 → 1_000_000` are both free at the cap level.
+
+`item.ts` (visible via `/get`) advances on every successful
+increment. The scope's `lastWriteTS` and `/stats.last_write_ts` do
+NOT — see §2.4 for the rationale.
 
 **Example**
 

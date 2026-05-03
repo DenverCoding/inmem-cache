@@ -50,8 +50,8 @@ func precomputeRenderBytes(payload json.RawMessage) []byte {
 // delta != 0) guard: forgetting either condition produces a nil-
 // pointer crash on orphan buffers (used in tests) or a CAS for a
 // zero delta (cheap but pointless).
-func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, error) {
-	delta := int64(newSize) - int64(oldSize)
+func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int64) (int64, error) {
+	delta := newSize - oldSize
 	if b.store != nil && delta != 0 {
 		ok, current, max := b.store.reserveBytes(delta)
 		if !ok {
@@ -59,6 +59,22 @@ func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int) (int64, er
 		}
 	}
 	return delta, nil
+}
+
+// payloadAndRenderBytes returns the byte cost approxItemSize attributes
+// to an item's payload-related fields. For a counter item that's the
+// fixed counterCellOverhead (cell heap + worst-case int64 string); for
+// a regular item it's len(Payload) + len(renderBytes). Used by the
+// replace paths (upsert/update) to compute the size delta between the
+// old shape and the new shape correctly when either side is a counter
+// item — a naive `len(payload)` comparison would under-count counter
+// items because their stored Payload is stale-by-construction (see
+// Item.counter's comment in types.go).
+func payloadAndRenderBytes(item Item) int64 {
+	if item.counter != nil {
+		return counterCellOverhead
+	}
+	return int64(len(item.Payload)) + int64(len(item.renderBytes))
 }
 
 // replaceItemAtIndexLocked overwrites payload and ts at items[i],
@@ -91,6 +107,13 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	b.items[i].Payload = payload
 	b.items[i].Ts = ts
 	b.items[i].renderBytes = renderBytes
+	// /update and /upsert replace the whole item shape, so any
+	// previously-installed counter cell is no longer canonical: future
+	// reads must see the new Payload bytes, not a stale cell value.
+	// Clear the pointer so subsequent /counter_add slow-path reaches
+	// the promote branch (parsing the freshly-installed payload) rather
+	// than the orphaned cell.
+	b.items[i].counter = nil
 	updated := b.items[i]
 	// replaceItemAtIndexLocked is only reachable when the item already
 	// existed in this buffer, so bySeq and (when ID != "") byID have

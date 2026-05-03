@@ -72,10 +72,12 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	if existing, exists := b.byID[item.ID]; exists {
 		// Delta covers both Payload and renderBytes: approxItemSize
 		// counts both, and the cap check must too. renderBytes is
-		// non-nil only for JSON-string payloads.
+		// non-nil only for JSON-string payloads. payloadAndRenderBytes
+		// handles the counter-item case where `existing.Payload` is
+		// stale-by-construction and the real cost lives in the cell —
+		// a naive `len(existing.Payload)` would under-count.
 		newRender := precomputeRenderBytes(item.Payload)
-		delta := int64(len(item.Payload)+len(newRender)) -
-			int64(len(existing.Payload)+len(existing.renderBytes))
+		delta := int64(len(item.Payload)+len(newRender)) - payloadAndRenderBytes(existing)
 		if b.store != nil && delta != 0 {
 			ok, current, max := b.store.reserveBytes(delta)
 			if !ok {
@@ -93,6 +95,11 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// stored ts always reflects when the current content arrived.
 		b.items[i].Ts = nowUs
 		b.items[i].renderBytes = newRender
+		// Clear any inherited counter cell — /upsert is "replace whole
+		// item with the supplied shape", so the cell from a prior
+		// /counter_add is no longer canonical. See replaceItemAtIndexLocked
+		// in buffer_locked.go for the same reasoning on the /update path.
+		b.items[i].counter = nil
 
 		updated := b.items[i]
 		// b.byID hit above proves byID was already allocated; same for
@@ -137,16 +144,14 @@ func (b *scopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 	}
 
 	// Only the payload changes on /update; scope/id are unchanged in
-	// size, so the byte delta reduces to (new_payload + new_renderBytes)
-	// - (old_payload + old_renderBytes). renderBytes is non-nil only for
-	// JSON-string payloads (precomputed at write so /render skips a
-	// per-hit Unmarshal); approxItemSize counts it, so the cap check
-	// must too. A shrink can't fail the cap check, but a grow must
-	// reserve first. Ts is a fixed-width int64, no delta contribution.
+	// size, so the byte delta reduces to new payload-bytes minus old
+	// payload-bytes. payloadAndRenderBytes handles the counter-item
+	// case (cell overhead vs len(Payload)+len(renderBytes)); see
+	// buffer_locked.go for the rationale.
 	newRender := precomputeRenderBytes(payload)
 	delta, err := b.reservePayloadDeltaLocked(
-		len(existing.Payload)+len(existing.renderBytes),
-		len(payload)+len(newRender),
+		payloadAndRenderBytes(existing),
+		int64(len(payload)+len(newRender)),
 	)
 	if err != nil {
 		return 0, err
@@ -177,8 +182,8 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 	// See updateByID for the renderBytes-aware delta rationale.
 	newRender := precomputeRenderBytes(payload)
 	delta, err := b.reservePayloadDeltaLocked(
-		len(existing.Payload)+len(existing.renderBytes),
-		len(payload)+len(newRender),
+		payloadAndRenderBytes(existing),
+		int64(len(payload)+len(newRender)),
 	)
 	if err != nil {
 		return 0, err

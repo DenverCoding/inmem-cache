@@ -134,7 +134,56 @@ type Item struct {
 	// state, not part of the wire format that /append, /get, /head,
 	// /tail and friends serialise.
 	renderBytes []byte
+
+	// counter is non-nil iff this item was created or promoted by
+	// /counter_add. When set, cell.value and cell.ts are the source of
+	// truth for the counter's value and "last increment" timestamp;
+	// Payload and Ts on the surrounding Item are stale by construction
+	// and are re-rendered from the cell at read time
+	// (materialiseCounter in buffer_read.go).
+	//
+	// Counters use this side-channel instead of mutating Payload bytes
+	// in place because counter_add's fast path runs under b.mu.RLock —
+	// rewriting a []byte under a read lock would race with concurrent
+	// readers on the same RLock. atomic.Int64 fields on the cell give
+	// us lock-free increment + CAS-max ts under RLock; the Payload
+	// bytes are only ever produced fresh on the read boundary, never
+	// mutated in place.
+	counter *counterCell
 }
+
+// counterCell is the lock-free state for a counter item. value is the
+// current integer; ts is the microsecond timestamp of the most recent
+// increment. Both are atomic so /counter_add's fast path can run under
+// b.mu.RLock without serialising on the scope's exclusive write lock —
+// see counterAdd in buffer_counter.go. The cell is allocated on counter
+// creation or promotion and lives as long as the surrounding Item.
+//
+// counterCell uses atomic.Int64 (which is non-copyable per `go vet`),
+// so Item.counter is a pointer, not an embedded value. Map / slice
+// copies of Item share the same cell — that's the point: an increment
+// on any copy is observed by every reader.
+type counterCell struct {
+	value atomic.Int64
+	ts    atomic.Int64
+}
+
+// counterCellOverhead is the byte cost approxItemSize charges for a
+// counter item's payload-related state, in place of len(Payload) +
+// len(renderBytes) for regular items. Two components:
+//
+//   - 24 bytes for the maximum decimal int64 representation
+//     ("-9223372036854775808" is 20 chars, plus slack). The cell's
+//     value is rendered fresh on every read so we charge the worst
+//     case once at creation and never re-reserve on increment.
+//   - 32 bytes for the *counterCell heap allocation itself
+//     (two atomic.Int64 fields + struct overhead).
+//
+// Pre-reserving the worst case is what lets counter increments run
+// lock-free: every increment that bumps the value's digit count would
+// otherwise need to take Lock to reserve the byte delta. With this
+// fixed overhead, increments never touch byte accounting.
+const counterCellOverhead = 24 + 32
 
 type DeleteRequest struct {
 	Scope string `json:"scope"`
@@ -277,6 +326,16 @@ func approxItemSize(item Item) int64 {
 	n += int64(len(item.ID))
 	n += 8 // Seq
 	n += 8 // Ts (always set, plain int64)
+	if item.counter != nil {
+		// Counter items charge a fixed overhead (cell heap + max int64
+		// string) instead of len(Payload). The actual stored Payload
+		// bytes on a counter item are stale by construction — readers
+		// materialise from cell.value at the boundary, so we don't
+		// account for them. See counterCellOverhead's comment for the
+		// rationale of pre-reserving the worst case at creation.
+		n += counterCellOverhead
+		return n
+	}
 	n += int64(len(item.Payload))
 	// renderBytes is heap-resident only for JSON-string payloads
 	// (precomputed at write time so /render skips a per-hit

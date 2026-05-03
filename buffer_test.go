@@ -553,6 +553,54 @@ func strconvFormatInt(n int64) string {
 	return string(b)
 }
 
+// counter_add's fast path runs under b.mu.RLock + atomic CAS on the
+// cell. This test fires N concurrent increments on a single counter
+// (after a one-time create under Lock) and asserts the final value is
+// exactly the sum of every delta — no lost updates from CAS-loop
+// retries, no torn reads from the materialiseCounter render. Run with
+// -race to catch missed synchronisation between fast-path increments
+// and any concurrent reads that materialise the cell.
+func TestCounterAdd_ParallelIncrementsAreLossless(t *testing.T) {
+	buf := newscopeBuffer(100)
+
+	// Seed the counter under Lock (slow-path create). Subsequent
+	// increments hit the fast path because the cell is already
+	// installed.
+	if _, _, err := buf.counterAdd("s", "c", 0+1); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const (
+		workers       = 16
+		incsPerWorker = 1000
+	)
+	done := make(chan struct{}, workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			for i := 0; i < incsPerWorker; i++ {
+				if _, _, err := buf.counterAdd("s", "c", 1); err != nil {
+					t.Errorf("counterAdd: %v", err)
+					return
+				}
+			}
+			done <- struct{}{}
+		}()
+	}
+	for w := 0; w < workers; w++ {
+		<-done
+	}
+
+	got, ok := buf.getByID("c")
+	if !ok {
+		t.Fatal("counter item missing after parallel increments")
+	}
+	want := int64(1 + workers*incsPerWorker)
+	gotN, _ := json.Number(string(got.Payload)).Int64()
+	if gotN != want {
+		t.Errorf("counter value=%d want %d (lost updates under parallel fast path)", gotN, want)
+	}
+}
+
 // --- scopeBuffer.deleteByID ---------------------------------------------------
 
 func TestDeleteByID_Hit(t *testing.T) {
@@ -1230,29 +1278,52 @@ func TestLastWriteTS_AdvancesOnUpdate(t *testing.T) {
 	}
 }
 
-func TestLastWriteTS_AdvancesOnCounterAdd(t *testing.T) {
+// counter_add operations are intentionally invisible to b.lastWriteTS:
+// the dominant call shape is read-driven (e.g. topic-view counters
+// firing on every page hit), so bumping the scope freshness signal on
+// every increment would degrade it into a heartbeat and break the
+// "did meaningful content change?" contract that lastWriteTS exists
+// to honour. Per-counter "when did this last change?" lives on the
+// cell.ts atomic instead — surfaced as item.Ts at read time, see
+// TestCounterAdd_RefreshesTsOnIncrement in ts_test.go.
+//
+// The rule applies uniformly across all three counter_add branches —
+// create (new id), promote (existing int payload, no cell), and
+// increment (existing cell, fast path). Treating them as one category
+// is what lets consumers reason about counter activity as a single,
+// silent dimension of the cache.
+func TestLastWriteTS_NotAffectedByCounterAdd(t *testing.T) {
 	buf := newscopeBuffer(10)
+	beforeCreate := buf.lastWriteTS
 
-	preCreate := nowUnixMicro()
 	if _, _, err := buf.counterAdd("s", "c", 1); err != nil {
 		t.Fatalf("counter create: %v", err)
 	}
-	if buf.lastWriteTS < preCreate {
-		t.Errorf("after create: lastWriteTS=%d pre=%d (create branch must stamp)",
-			buf.lastWriteTS, preCreate)
+	if buf.lastWriteTS != beforeCreate {
+		t.Errorf("counter create bumped lastWriteTS: before=%d after=%d (must stay unchanged)",
+			beforeCreate, buf.lastWriteTS)
 	}
-	afterCreate := buf.lastWriteTS
 
-	preInc := nowUnixMicro()
 	if _, _, err := buf.counterAdd("s", "c", 1); err != nil {
 		t.Fatalf("counter increment: %v", err)
 	}
-	if buf.lastWriteTS < preInc {
-		t.Errorf("after increment: lastWriteTS=%d pre=%d (replace branch via replaceItemAtIndexLocked must stamp)",
-			buf.lastWriteTS, preInc)
+	if buf.lastWriteTS != beforeCreate {
+		t.Errorf("counter increment bumped lastWriteTS: before=%d after=%d (must stay unchanged)",
+			beforeCreate, buf.lastWriteTS)
 	}
-	if buf.lastWriteTS < afterCreate {
-		t.Errorf("increment regressed lastWriteTS from %d to %d", afterCreate, buf.lastWriteTS)
+
+	// Promote path: append a regular int-payload item without a cell,
+	// then /counter_add it. Promotion still must not bump.
+	if _, err := buf.appendItem(Item{Scope: "s", ID: "p", Payload: []byte(`5`)}); err != nil {
+		t.Fatalf("append int payload: %v", err)
+	}
+	beforePromote := buf.lastWriteTS
+	if _, _, err := buf.counterAdd("s", "p", 1); err != nil {
+		t.Fatalf("counter promote: %v", err)
+	}
+	if buf.lastWriteTS != beforePromote {
+		t.Errorf("counter promote bumped lastWriteTS: before=%d after=%d (must stay unchanged)",
+			beforePromote, buf.lastWriteTS)
 	}
 }
 

@@ -532,8 +532,11 @@ case $LAST_BODY in
     *) bad "upsert did not replace: $LAST_BODY" ;;
 esac
 
-# /counter_add stamps on create AND on increment — refresh-on-increment
-# gives counters a free "last activity" timestamp.
+# /counter_add stamps the per-item `ts` on create AND refreshes it on
+# every increment — that gives counters a free "last activity"
+# timestamp consumers can poll via /get. The scope-level / store-wide
+# freshness signal (last_write_ts on /stats) is intentionally NOT bumped
+# by counter_add — see the next block for the contract and rationale.
 call 'counter_add create stamps ts'     200 POST   /counter_add '{"scope":"tsv","id":"c","by":5}'
 call 'verify counter ts present'        200 GET    '/get?scope=tsv&id=c'
 case $LAST_BODY in
@@ -547,6 +550,44 @@ case $LAST_BODY in
     *'"ts":'[1-9]*'"payload":8'*) okmsg 'counter_add increment: ts and updated payload present' ;;
     *) bad "counter_add increment response: $LAST_BODY" ;;
 esac
+
+# /counter_add MUST NOT bump /stats.last_write_ts on create or increment
+# — counter activity is read-driven by design (view-counter +1 on every
+# topic hit) and bumping the store-wide freshness tick on each call
+# would degrade it into a heartbeat, breaking the polling contract that
+# tells consumers "skip refetch when nothing changed". The per-counter
+# ts (verified above) remains the granularity at which counter activity
+# IS observable.
+#
+# The test seeds the scope via /append first so the scope-creation bump
+# (which DOES legitimately fire when /counter_add hits a brand-new
+# scope) is out of the way before we measure counter behaviour. The
+# baseline /stats snapshot is then captured AFTER the seed, and we
+# assert last_write_ts is unchanged after both create and increment.
+call 'ts-stats: seed scope so creation bump is out of the way' 200 POST /append \
+    '{"scope":"tsv_stats","id":"seed","payload":"v"}'
+call 'ts-stats: baseline /stats'        200 GET    /stats
+LAST_WRITE_TS_BEFORE_COUNTER=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
+sleep 1
+call 'ts-stats: counter_add create on existing scope' 200 POST /counter_add \
+    '{"scope":"tsv_stats","id":"views","by":1}'
+call 'ts-stats: /stats after counter create' 200 GET /stats
+json_assert 'ts-stats: last_write_ts unchanged after counter create' \
+    ".last_write_ts == $LAST_WRITE_TS_BEFORE_COUNTER"
+sleep 1
+call 'ts-stats: counter_add increment' 200 POST /counter_add \
+    '{"scope":"tsv_stats","id":"views","by":1}'
+call 'ts-stats: /stats after counter increment' 200 GET /stats
+json_assert 'ts-stats: last_write_ts unchanged after counter increment' \
+    ".last_write_ts == $LAST_WRITE_TS_BEFORE_COUNTER"
+# But the per-counter ts MUST advance — verify both increments are
+# observable on the item itself, just not on the store-wide signal.
+call 'ts-stats: read counter to confirm per-item ts advanced' 200 GET \
+    '/get?scope=tsv_stats&id=views'
+json_assert 'ts-stats: counter item value == 2 (both increments landed)' \
+    '.item.payload == 2'
+json_assert 'ts-stats: counter item ts is fresh (> baseline last_write_ts)' \
+    ".item.ts > $LAST_WRITE_TS_BEFORE_COUNTER"
 
 # Empty/missing ts in body is treated as "absent" (zero value) and passes
 # validation; the cache stamps now() on its own. ts:0 from a client is the

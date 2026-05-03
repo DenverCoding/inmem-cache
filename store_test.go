@@ -1260,16 +1260,10 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 			t.Fatalf("upsertOne create: %v", err)
 		}
 	})
-	step("counterAddOne create", func() {
-		if _, _, err := s.counterAddOne("a", "ctr", 5); err != nil {
-			t.Fatalf("counterAddOne create: %v", err)
-		}
-	})
-	step("counterAddOne increment", func() {
-		if _, _, err := s.counterAddOne("a", "ctr", 1); err != nil {
-			t.Fatalf("counterAddOne increment: %v", err)
-		}
-	})
+	// counterAddOne is intentionally absent from this list: counter
+	// operations do not bump s.lastWriteTS by design (see file header
+	// on buffer_counter.go). A separate test below
+	// (TestStore_LastWriteTS_NotBumpedByCounterAdd) pins that contract.
 	step("updateOne", func() {
 		if _, err := s.updateOne(Item{Scope: "a", ID: "1", Payload: json.RawMessage(`"v3"`)}); err != nil {
 			t.Fatalf("updateOne: %v", err)
@@ -1312,6 +1306,74 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 	})
 	step("wipe", func() {
 		_, _, _ = s.wipe()
+	})
+}
+
+// TestStore_LastWriteTS_NotBumpedByCounterAdd pins the inverse contract
+// to TestStore_LastWriteTS_BumpsOnEveryWritePath: counter activity must
+// never advance s.lastWriteTS, regardless of branch (create / promote
+// / increment). View-counter-style read-driven workloads would
+// otherwise turn the store-wide freshness signal into a heartbeat and
+// break consumers polling /stats.last_write_ts to skip needless
+// refetches. See the file header on buffer_counter.go for the design
+// rationale.
+//
+// scopeCreated is the one bump that legitimately fires when /counter_add
+// runs against a brand-new scope: getOrCreateScopeTrackingCreated
+// bumps s.lastWriteTS as part of scope provisioning (scope_count grew
+// — a structural /stats change). That bump is incidental to the counter
+// operation itself, so the test seeds the scope first to keep the
+// counter ops on an existing-scope path where no other bump source
+// exists.
+func TestStore_LastWriteTS_NotBumpedByCounterAdd(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	// Seed the scope via /append so getOrCreateScope's structural bump
+	// has fired before we measure counter activity.
+	if _, err := s.appendOne(Item{Scope: "a", ID: "seed", Payload: json.RawMessage(`"v"`)}); err != nil {
+		t.Fatalf("seed append: %v", err)
+	}
+	// Also seed an int-payload item so we have something to promote.
+	if _, err := s.appendOne(Item{Scope: "a", ID: "promotable", Payload: json.RawMessage(`5`)}); err != nil {
+		t.Fatalf("seed int append: %v", err)
+	}
+
+	check := func(name string, op func()) {
+		t.Helper()
+		// time.Microsecond gap so ANY accidental bump would be visible
+		// in the comparison; without it a same-microsecond no-op would
+		// look identical to a same-microsecond bump.
+		time.Sleep(time.Microsecond)
+		before := s.lastWriteTS.Load()
+		op()
+		after := s.lastWriteTS.Load()
+		if after != before {
+			t.Errorf("after %s: lastWriteTS bumped from %d to %d (counter op must be silent)",
+				name, before, after)
+		}
+	}
+
+	check("counter create", func() {
+		if _, _, err := s.counterAddOne("a", "ctr", 5); err != nil {
+			t.Fatalf("counter create: %v", err)
+		}
+	})
+	check("counter increment (fast path)", func() {
+		if _, _, err := s.counterAddOne("a", "ctr", 1); err != nil {
+			t.Fatalf("counter increment: %v", err)
+		}
+	})
+	check("counter promote", func() {
+		if _, _, err := s.counterAddOne("a", "promotable", 1); err != nil {
+			t.Fatalf("counter promote: %v", err)
+		}
+	})
+	// Subsequent increment on the just-promoted counter — verifies
+	// promotion installed a cell that the fast path now uses.
+	check("counter increment (post-promote, fast path)", func() {
+		if _, _, err := s.counterAddOne("a", "promotable", 1); err != nil {
+			t.Fatalf("counter post-promote increment: %v", err)
+		}
 	})
 }
 

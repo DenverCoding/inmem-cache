@@ -15,6 +15,38 @@ import "sort"
 // is no orphan-write hazard, only an eventually-stale snapshot. The
 // hot-path heat tracking (recordRead in buffer_heat.go) runs separately
 // and is intentionally lock-free.
+//
+// Counter materialisation: every read path runs returned items through
+// materialiseCounter so consumers see the cell's current value/ts
+// rather than the stored Payload bytes (which are stale-by-design on
+// counter items — see Item.counter's comment in types.go).
+// Materialisation is a single atomic load + a fresh strconv when the
+// item is a counter, and a no-op otherwise.
+
+func materialiseCounter(item Item) Item {
+	if item.counter == nil {
+		return item
+	}
+	item.Payload = renderCounterPayload(item.counter)
+	item.Ts = item.counter.ts.Load()
+	// renderBytes is never set on counter items — bare integers don't
+	// hit the JSON-string shortcut path — so nothing to clear.
+	return item
+}
+
+// materialiseCountersInPlace walks `items` and rewrites any counter-
+// shaped entry with a fresh Payload/Ts derived from its cell. Used by
+// the multi-item read paths (tailOffset, sinceSeq) on the slice they
+// are about to return; the caller owns the slice (it's a fresh copy of
+// b.items) so in-place is safe.
+func materialiseCountersInPlace(items []Item) []Item {
+	for i := range items {
+		if items[i].counter != nil {
+			items[i] = materialiseCounter(items[i])
+		}
+	}
+	return items
+}
 
 // tailOffset returns the newest-first window `[start, end)` of b.items and a
 // hasMore flag. hasMore is true when older items exist before the window (i.e.
@@ -42,7 +74,7 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 		return []Item{}, false
 	}
 
-	return append([]Item(nil), b.items[start:end]...), hasMore
+	return materialiseCountersInPlace(append([]Item(nil), b.items[start:end]...)), hasMore
 }
 
 // sinceSeq returns items with seq > afterSeq, oldest-first, up to limit. The
@@ -74,19 +106,25 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	}
 	out := make([]Item, take)
 	copy(out, b.items[idx:idx+take])
-	return out, hasMore
+	return materialiseCountersInPlace(out), hasMore
 }
 
 func (b *scopeBuffer) getByID(id string) (Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	item, ok := b.byID[id]
-	return item, ok
+	if !ok {
+		return Item{}, false
+	}
+	return materialiseCounter(item), true
 }
 
 func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	item, ok := b.bySeq[seq]
-	return item, ok
+	if !ok {
+		return Item{}, false
+	}
+	return materialiseCounter(item), true
 }
