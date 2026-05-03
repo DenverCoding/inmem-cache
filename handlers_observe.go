@@ -108,8 +108,13 @@ func (api *API) handleScopeList(w http.ResponseWriter, r *http.Request) {
 
 	// Cap-aware writer: a max-limit response with long scope names can
 	// approach api.maxResponseBytes; same shape as /head and /tail.
+	// `hit` is `count > 0` — same semantic as on /head/tail (which also
+	// derive it from len(items)>0), kept here so the list-return read
+	// family (`/head`, `/tail`, `/scopelist`) shares one wire prefix:
+	// `ok, hit, count, truncated, <list>`.
 	writeJSONWithMetaCap(w, http.StatusOK, orderedFields{
 		{"ok", true},
+		{"hit", len(entries) > 0},
 		{"count", len(entries)},
 		{"truncated", truncated},
 		{"scopes", entries},

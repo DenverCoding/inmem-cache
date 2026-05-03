@@ -1258,6 +1258,9 @@ func TestScopelist_AlphaSortAndShape(t *testing.T) {
 	if !mustBool(t, out, "ok") {
 		t.Fatal("ok=false")
 	}
+	if !mustBool(t, out, "hit") {
+		t.Error("hit=false with non-empty scopes (must be count>0)")
+	}
 	if mustFloat(t, out, "count") != 4 {
 		t.Errorf("count=%v want 4", out["count"])
 	}
@@ -1314,6 +1317,9 @@ func TestScopelist_PrefixFilter(t *testing.T) {
 	_, out3, _ := doRequest(t, h, "GET", "/scopelist?prefix=zzz", "")
 	if mustFloat(t, out3, "count") != 0 {
 		t.Errorf("no-match prefix: count=%v want 0", out3["count"])
+	}
+	if mustBool(t, out3, "hit") {
+		t.Error("no-match prefix: hit=true want false (count==0)")
 	}
 	if got := mustScopelistEntries(t, out3); len(got) != 0 {
 		t.Errorf("no-match prefix: scopes=%v want []", got)

@@ -913,8 +913,8 @@ say '== /scopelist: per-scope detail =='
 
 # Default page returns every scope, alphabetically.
 call 'scopelist: default' 200 GET /scopelist
-json_assert 'scopelist: ok=true count=3 truncated=false' '
-    .ok == true and .count == 3 and .truncated == false and
+json_assert 'scopelist: ok=true hit=true count=3 truncated=false' '
+    .ok == true and .hit == true and .count == 3 and .truncated == false and
     (.scopes | length) == 3
 '
 json_assert 'scopelist: alphabetical order' '
@@ -969,10 +969,10 @@ json_assert 'scopelist: prefix narrowed to mega_other only' '
 call 'scopelist: prefix= empty' 200 GET '/scopelist?prefix='
 json_assert 'scopelist: empty prefix == no filter' '.count == 3'
 
-# No-match prefix returns empty array (NOT null).
+# No-match prefix returns empty array (NOT null) and hit=false.
 call 'scopelist: prefix=zzz' 200 GET '/scopelist?prefix=zzz'
-json_assert 'scopelist: no-match prefix is empty array, not null' '
-    .count == 0 and .truncated == false and .scopes == []
+json_assert 'scopelist: no-match prefix is empty array, hit=false' '
+    .hit == false and .count == 0 and .truncated == false and .scopes == []
 '
 
 # Cursor pagination: limit + after. Walking the three scopes one page
@@ -986,9 +986,9 @@ json_assert 'scopelist: page2 = [mega_other], truncated=false' '
     .truncated == false and (.scopes | map(.scope)) == ["mega_other"]
 '
 
-# `after` past every scope name → empty page, not truncated.
+# `after` past every scope name → empty page, not truncated, hit=false.
 call 'scopelist: after past everything' 200 GET '/scopelist?after=zzz'
-json_assert 'scopelist: after=zzz returns empty' '.count == 0 and .truncated == false'
+json_assert 'scopelist: after=zzz returns empty' '.hit == false and .count == 0 and .truncated == false'
 
 # Validation: prefix and after both flow through the scope shape rules
 # (size cap, no control chars). Limit=0 also rejects up-front.

@@ -1233,6 +1233,7 @@ read-count) are explicitly out of core; addons that want them poll
 ```json
 {
   "ok": true,
+  "hit": true,
   "count": 2,
   "truncated": true,
   "scopes": [
@@ -1262,11 +1263,15 @@ read-count) are explicitly out of core; addons that want them poll
 }
 ```
 
+- `hit` — `true` when at least one scope matched, `false` otherwise.
+  Equivalent to `count > 0`; carried for symmetry with `/head` and
+  `/tail` so the list-return read family shares one wire prefix.
 - `count` — number of scopes in this page.
 - `truncated` — `true` when more matching scopes exist past the limit;
   resume by repeating the call with `?after=<last scope of this page>`.
 - `scopes` — array of per-scope detail rows; field semantics per §2.4.
-  Empty array (and `count: 0`, `truncated: false`) when no scopes match.
+  Empty array (and `hit: false`, `count: 0`, `truncated: false`) when
+  no scopes match.
 
 **Endpoint-specific errors**
 
@@ -1310,6 +1315,7 @@ curl -s 'http://localhost:8080/scopelist?limit=100'
 ```json
 {
   "ok": true,
+  "hit": true,
   "count": 4,
   "truncated": false,
   "scopes": [
@@ -1330,6 +1336,7 @@ curl -s 'http://localhost:8080/scopelist?prefix=thread:42:&limit=100'
 ```json
 {
   "ok": true,
+  "hit": true,
   "count": 3,
   "truncated": false,
   "scopes": [
@@ -1356,6 +1363,7 @@ curl -s 'http://localhost:8080/scopelist?prefix=thread:42:&limit=2'
 ```json
 {
   "ok": true,
+  "hit": true,
   "count": 2,
   "truncated": true,
   "scopes": [
@@ -1375,6 +1383,7 @@ curl -s 'http://localhost:8080/scopelist?prefix=thread:42:&limit=2&after=thread:
 ```json
 {
   "ok": true,
+  "hit": true,
   "count": 1,
   "truncated": false,
   "scopes": [
