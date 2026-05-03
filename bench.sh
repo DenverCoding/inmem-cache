@@ -2,8 +2,8 @@
 # bench.sh — repeatable single-version benchmark for scopecache.
 #
 # For a given git tag (or branch), spins up a caddyscope container
-# (Caddy + scopecache module via xcaddy) with generous capacity caps
-# and admin enabled, then runs one of four canned workloads 5 times
+# (Caddy + scopecache module via xcaddy) with generous capacity caps,
+# then runs one of four canned workloads 5 times
 # and reports per-run rps + latency percentiles, error counts, and
 # the median across runs.
 #
@@ -38,7 +38,6 @@
 #   scope_max_items 10_000_000
 #   max_store_mb    8192     (8 GiB)
 #   max_item_mb     16
-#   enable_admin    yes      (so /wipe via /admin works between runs)
 #
 # Output:
 #   - Per-run line: rps, p50, p99, non-2xx count, timeout count, and
@@ -143,8 +142,6 @@ cat > "$REPO_ROOT/Caddyfile.caddyscope" <<'CADDYFILE'
         scope_max_items 10000000
         max_store_mb    8192
         max_item_mb     16
-        server_secret   {$SCOPECACHE_SERVER_SECRET}
-        enable_admin    yes
     }
 }
 CADDYFILE
@@ -306,9 +303,7 @@ LUA
 
 # --- helpers ---
 wipe() {
-    curl -s -X POST -H 'Content-Type: application/json' \
-        -d '{"calls":[{"path":"/wipe"}]}' \
-        "http://localhost:$PORT/admin" >/dev/null
+    curl -s -X POST "http://localhost:$PORT/wipe" >/dev/null
 }
 
 seed_for_get() {
