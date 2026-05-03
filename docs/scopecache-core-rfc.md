@@ -76,7 +76,8 @@ The core has no business logic and no policy logic. It owns:
 - memory and capacity enforcement
 - `scope`/`id`/`seq` addressing
 - write, read, delete, and bulk primitives
-- raw payload rendering (`/render`)
+- raw payload rendering (`/render`) — cached HTML, XML, or other
+  bytes served directly to a client with no JSON envelope
 - operational stats and lightweight read-heat metadata
 - a public, validated Go API for in-process callers
 
