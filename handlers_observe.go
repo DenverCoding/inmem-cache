@@ -73,7 +73,7 @@ func (api *API) handleHelp(w http.ResponseWriter, r *http.Request) {
 	// Placeholder until the dedicated /help finetune pass closer to v1.0;
 	// keeping a stale long-form here would just drift out of sync with
 	// the RFC. One-line pointer is the lowest-maintenance shape.
-	helpText := "scopecache — see instructions at https://github.com/VeloxCoding/scopecache/blob/main/docs/scopecache-rfc.md\n"
+	helpText := "scopecache — see instructions at https://github.com/VeloxCoding/scopecache/blob/main/docs/scopecache-core-rfc.md\n"
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

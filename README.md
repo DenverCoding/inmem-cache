@@ -84,7 +84,7 @@ Module path: `github.com/VeloxCoding/scopecache`. Stdlib only.
 ## Documentation
 
 The full design, endpoint contracts, and architectural rationale live
-in [docs/scopecache-rfc.md](docs/scopecache-rfc.md).
+in [docs/scopecache-core-rfc.md](docs/scopecache-core-rfc.md).
 
 ## License
 

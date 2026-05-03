@@ -9,11 +9,12 @@
 > Those endpoints are returning as separate add-on sub-packages, each
 > with its own RFC.
 >
-> **The current core RFC is being written; until it lands here as
-> `scopecache-rfc.md`, this document remains the most complete
-> reference for the cache's contract — but with the understanding that
-> §6.3, §6.4, §13.17, and §13.19-§13.23 describe endpoints no longer
-> in core.**
+> **The current core RFC is being written in
+> [scopecache-core-rfc.md](scopecache-core-rfc.md); until that
+> document is complete, this one remains the most complete reference
+> for the cache's contract — but with the understanding that §6.3,
+> §6.4, §13.17, and §13.19-§13.23 describe endpoints no longer in
+> core.**
 >
 > The boundary rule, item model, capacity rules, locking model, and
 > the per-endpoint contracts in §6.1 / §6.2 (excluding `/delete_guarded`,
