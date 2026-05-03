@@ -81,10 +81,12 @@ The core has no business logic and no policy logic. It owns:
 - operational stats and lightweight read-heat metadata
 - a public, validated Go API for in-process callers
 
-It does not own anything that requires request context (who is
-calling, what tenant, what permission). Those concerns live in
-**addons**: separate Go sub-packages built on top of the core's
-public Go API, each with its own RFC.
+The core has no request context (who is calling, what tenant,
+what permission). Those concerns live in **addons** — separate Go
+sub-packages built on top of the core's public Go API — or are
+handled outside the cache entirely (Caddyfile route guards,
+nginx/apache equivalents, Unix-socket filesystem permissions, or
+any other transport-layer policy).
 
 The current set of standard addons covers multi-tenant gateways,
 batch dispatch, write-only ingestion, operator-elevated dispatch,
