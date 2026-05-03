@@ -78,7 +78,8 @@ The core has no business logic and no policy logic. It owns:
 - write, read, delete, and bulk primitives
 - raw payload rendering (`/render`) — cached HTML, XML, or other
   bytes served directly to a client with no JSON envelope
-- operational stats and lightweight read-heat metadata
+- operational stats and lightweight read-bookkeeping metadata
+  (`readCountTotal`, `lastAccessTS`)
 - a public, validated Go API for in-process callers
 
 The core has no request context (who is calling, what tenant,
@@ -208,9 +209,11 @@ the protection model.
 
 In addition to the items themselves, every scope carries a small set
 of metadata fields. Most are bookkeeping for cap accounting and
-addressing; the read-heat fields (`lastAccessTS`, `readCountTotal`,
-`last7DReadCount`, `readHeatBuckets`) are exposed as primitives for
-addon-side eviction logic — see §8.
+addressing; the two read-bookkeeping fields (`lastAccessTS`,
+`readCountTotal`) are exposed as primitives. Time-windowed
+aggregations (rolling N-day counts, hourly histograms, exponential
+decay, …) are policy and live in addons that poll `readCountTotal`
+deltas off a scheduler — see §8.
 
 | field                | purpose                                                                        |
 |----------------------|--------------------------------------------------------------------------------|
@@ -224,8 +227,6 @@ addon-side eviction logic — see §8.
 | `lastWriteTS`        | microsecond timestamp of the most recent write that touched the scope — `/append`, `/upsert` (create and replace), `/update`, `/delete`, `/delete_up_to`, `/warm`, `/rebuild`. `/counter_add` is excluded by design; see note below. |
 | `lastAccessTS`       | microsecond timestamp of the most recent read hit (atomic, lock-free)         |
 | `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
-| `last7DReadCount`    | rolling 7-day read-hit count (atomic, lock-free)                               |
-| `readHeatBuckets[7]` | ring buffer with one slot per day in the rolling 7-day window                  |
 | `detached`           | lifecycle flag set by `/delete_scope`, `/wipe`, `/rebuild` to fail in-flight writes against an orphan buffer |
 
 These fields are not currently surfaced through any HTTP endpoint as
@@ -353,8 +354,9 @@ Operator tools to manage capacity:
   previous contents' bytes in the same call)
 - `/rebuild` — atomically replace the entire store
 
-Read-heat metadata (§8) helps operators identify which scopes are
-cold enough to evict, but the cache itself never decides.
+Read-bookkeeping metadata (§8) helps operators identify which
+scopes are cold enough to evict, but the cache itself never
+decides.
 
 ---
 
@@ -982,8 +984,7 @@ true|false`. See §5.3 for why misses are not 404.
 
 **Side effects**
 
-A successful hit increments the per-scope read-heat counters
-(§8) unless `DisableReadHeat` is set.
+A successful hit bumps the per-scope read-bookkeeping atomics (§8).
 
 **Example**
 
@@ -1022,7 +1023,7 @@ Same as `/get`: `scope`, plus exactly one of `id` or `seq`.
 
 **Side effects**
 
-A successful hit increments the per-scope read-heat counters (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§8).
 
 **Example**
 
@@ -1085,7 +1086,7 @@ cursor-based forward paging (stable under `/delete_up_to`), or
 
 **Side effects**
 
-A successful hit increments the per-scope read-heat counters (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§8).
 
 **Example**
 
@@ -1132,7 +1133,7 @@ tail. Returns 200 in both the hit and miss case.
 
 **Side effects**
 
-A successful hit increments the per-scope read-heat counters (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§8).
 
 **Example**
 
@@ -1180,10 +1181,9 @@ path. See §2.5 for the polling pattern that `last_write_ts` enables.
 The previous shape included a per-scope `scopes` map keyed by scope
 name. At 100k+ scopes that response routinely blew past practical
 client and proxy response-size limits, and the per-scope enumeration
-(one buffer.stats() materialisation per scope, plus
-`computeLast7DReadCount`) dominated `/stats` latency. Per-scope
-listing moved to a dedicated paginated endpoint to keep `/stats`
-cheap regardless of cache size.
+(one `buffer.stats()` materialisation per scope) dominated `/stats`
+latency. Per-scope listing moved to a dedicated paginated endpoint
+to keep `/stats` cheap regardless of cache size.
 
 **Side effects**
 
@@ -1304,37 +1304,38 @@ rather than transactional.
 
 ---
 
-## 8. Read-heat tracking
+## 8. Read bookkeeping
 
-The cache maintains lightweight per-scope read-heat metadata so
-addons (and operators) can identify cold scopes for eviction
-without polling every scope.
+Every successful read hit on `/get`, `/render`, `/head` or `/tail`
+bumps two per-scope atomics so addons (and operators) can tell
+which scopes are active. The cache deliberately stops at primitives:
+any time-windowed aggregation — rolling 7-day count, hourly
+histogram, exponential decay, eviction ranking — is policy and
+lives in addons that poll the primitives off a scheduler.
 
 ### 8.1 Tracked fields
 
-Every scope carries the following read-heat metadata. The fields
-are maintained on the per-scope buffer; `/stats` is aggregate-only
-and does not surface them. They are exposed via `/scopelist`
-(per-scope detail with paginated enumeration) and via the in-process
-Go API (Phase B). See §2.4 for the full list of per-scope fields,
-including non-heat metadata; this section zooms in on the read-heat
-subset and adds the type and rolling-window semantics.
+The fields are maintained on the per-scope buffer; `/stats` is
+aggregate-only and does not surface them. They are exposed via
+`/scopelist` (per-scope detail with paginated enumeration) and via
+the in-process Go API (Phase B). See §2.4 for the full list of
+per-scope fields.
 
-| field                | type    | meaning                                            |
-|----------------------|---------|----------------------------------------------------|
-| `last_access_ts`     | int64   | microsecond timestamp of the most recent read      |
-| `read_count_total`   | uint64  | lifetime read count (since process start or last reset) |
-| `last_7d_read_count` | uint64  | rolling 7-day read count                           |
+| field              | type   | meaning                                                 |
+|--------------------|--------|---------------------------------------------------------|
+| `last_access_ts`   | int64  | microsecond timestamp of the most recent successful read hit |
+| `read_count_total` | uint64 | monotonic lifetime hit count; never expires             |
 
-`last_7d_read_count` is computed via a per-scope ring buffer of
-day-bucket counters. The bucket for the current day is updated on
-each read; buckets older than 7 days are recycled lazily on the
-next read into that scope.
+That is the entire read-side surface in core. There is no rolling
+window, no day-bucket ringbuffer, no decay model. `read_count_total`
++ a wall-clock at observation time is enough to compute any window
+the caller wants — the addon owns the policy, the cache owns the
+primitive.
 
 ### 8.2 What counts as a read
 
-The following endpoints stamp `last_access_ts` and increment the
-counters on a successful hit:
+The following endpoints stamp `last_access_ts` and increment
+`read_count_total` on a successful hit:
 
 - `GET /get`
 - `GET /render`
@@ -1346,29 +1347,23 @@ Observability endpoints (`/stats`, `/scopelist`) do not count.
 
 ### 8.3 Concurrency
 
-Read-heat updates are lock-free: timestamps and counters are
-modified via compare-and-swap on atomic 64-bit values. The hot
-read path does not take the scope's write lock to update heat,
-so concurrent readers do not serialise on heat updates.
+Bookkeeping updates are lock-free: `lastAccessTS` is an `atomic.Int64`
+store, `readCountTotal` is an `atomic.Uint64` add. The hot read path
+does not take the scope's write lock to update them, so concurrent
+readers do not serialise on bookkeeping.
 
-### 8.4 Disabling read-heat
+### 8.4 Read bookkeeping as a building block
 
-Heat tracking can be turned off via the `DisableReadHeat`
-configuration knob (env-var `SCOPECACHE_DISABLE_READ_HEAT` on the
-standalone binary; `disable_read_heat` directive in the Caddy
-module). With heat tracking off the per-scope heat counters remain
-zero. Disabling saves the per-read `time.Now()` call plus the
-atomic CAS work — useful when the operator does not need
-heat-driven eviction.
-
-### 8.5 Read-heat as a building block
-
-Read-heat is exposed as a primitive. The cache itself never uses
-it to decide anything; eviction decisions live in addons (or in
-operator-side logic that polls `/scopelist`). For example, an addon
-that ranks scopes for eviction by ascending `last_access_ts`
-builds its query on top of `/scopelist`'s per-scope detail rather
-than asking the core to sort.
+The two primitives are exposed unconditionally — there is no
+"disable read bookkeeping" knob. Two atomic stores are not
+expensive enough to gate behind configuration. The cache itself
+never uses these fields to decide anything; eviction decisions
+live in addons. A typical eviction-candidates addon walks
+`/scopelist` on a scheduler, snapshots `read_count_total` per
+scope, computes deltas against the previous snapshot, and feeds
+the deltas into whatever windowed model it implements (daily
+buckets, exponential decay, etc.). Different addons can ship
+different models without the core baking any one of them in.
 
 ---
 
@@ -1392,9 +1387,9 @@ non-goal entirely.
   (`/multi_call`-shaped). Lives in an addon.
 - **Write-only ingestion shapes.** Cache-assigned IDs, fire-and-
   forget append patterns, payload-cap variations — addon territory.
-- **Eviction-hint queries.** Sorting scopes by read-heat to
-  recommend which to drop — addon, built on `/scopelist` and §8
-  data.
+- **Eviction-hint queries.** Sorting scopes by activity, age, or
+  byte-size to recommend which to drop — addon, built on
+  `/scopelist` and §8 data.
 
 ### 9.2 Not in core: operator policy
 

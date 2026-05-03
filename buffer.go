@@ -23,11 +23,11 @@ import (
 //     and deleteGuardedTenant, all of which take shard.mu first and
 //     then individual buf.mu's.
 //
-//  3. Read-path heat-tracking (recordRead) is intentionally lock-free
-//     on b.mu — it uses atomics on the heat-bucket ring buffer. This
-//     is what lets concurrent readers hold b.mu.RLock simultaneously
-//     without serialising on the heat counters. See recordRead's own
-//     comment in buffer_heat.go for the CAS state machine.
+//  3. Read-path bookkeeping (recordRead) runs without taking b.mu —
+//     it bumps the readCountTotal and lastAccessTS atomics directly.
+//     This is what lets concurrent readers hold b.mu.RLock simultaneously
+//     without serialising on the read counters. See recordRead in
+//     buffer_heat.go.
 //
 // Adding a new scopeBuffer method that violates rule 2 is the most
 // likely future deadlock — flag it in code review.
@@ -38,7 +38,7 @@ import (
 //	buffer_locked.go   — cross-cutting helpers (precomputeRenderBytes,
 //	                     indexBySeqLocked, replaceItemAtIndexLocked,
 //	                     reservePayloadDeltaLocked)
-//	buffer_heat.go     — lock-free read-heat tracking
+//	buffer_heat.go     — lock-free recordRead bookkeeping
 //	buffer_write.go    — appendItem, upsertByID, updateByID, updateBySeq
 //	buffer_counter.go  — counterAdd, parseCounterValue
 //	buffer_delete.go   — deleteByID, deleteBySeq, deleteUpToSeq, deleteIndexLocked
@@ -85,23 +85,15 @@ type scopeBuffer struct {
 	// "touch"). Surfaced as last_write_ts on /stats. Distinct from
 	// lastAccessTS — that one tracks reads.
 	lastWriteTS int64
-	// lastAccessTS, readCountTotal, last7DReadCount and the heat-bucket
-	// counts are atomic so the read-hot path (recordRead) does not need
-	// to take b.mu. recordRead used to take b.mu.Lock() — a write lock
-	// on the same mutex readers were just on under RLock — turning every
-	// hit on /get, /render, /head and /tail into a serialise
-	// point. Block profiling pinned ~88% of all read-path lock-wait time
-	// to that one call. Moving the bucket state to atomics drops it to
-	// effectively zero.
-	lastAccessTS    atomic.Int64
-	readCountTotal  atomic.Uint64
-	last7DReadCount atomic.Uint64
-	// Ring buffer indexed by day % ReadHeatWindowDays. Each bucket
-	// carries the absolute day it represents so we can detect a stale
-	// slot when it wraps. Day and Count inside each bucket are atomic;
-	// expiry and slot-claim are coordinated via CAS on Day. See
-	// recordRead in buffer_heat.go for the state machine.
-	readHeatBuckets [ReadHeatWindowDays]ScopeReadHeatBucket
+	// lastAccessTS and readCountTotal are atomic so the read-hot path
+	// (recordRead) does not need to take b.mu. recordRead used to take
+	// b.mu.Lock() — a write lock on the same mutex readers were just on
+	// under RLock — turning every hit on /get, /render, /head and /tail
+	// into a serialise point. Block profiling pinned ~88% of all
+	// read-path lock-wait time to that one call. Atomic stores drop it
+	// to effectively zero.
+	lastAccessTS   atomic.Int64
+	readCountTotal atomic.Uint64
 }
 
 func newscopeBuffer(maxItems int) *scopeBuffer {

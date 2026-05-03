@@ -911,113 +911,31 @@ func TestGetByIDAndSeq(t *testing.T) {
 	}
 }
 
-// --- recordRead (7-day heat tracking) -----------------------------------------
+// --- recordRead ---------------------------------------------------------------
 
-// microsOnDay returns a microsecond Unix timestamp that falls on the given day index.
-func microsOnDay(day int64) int64 {
-	return day * 86400000000
-}
-
-func TestRecordRead_KeepsReadsWithinWindow(t *testing.T) {
+// recordRead bumps two atomics: readCountTotal and lastAccessTS. The
+// time-windowed aggregation that used to live here moved out of core
+// — see buffer_heat.go.
+func TestRecordRead_BumpsCountAndTimestamp(t *testing.T) {
 	buf := newscopeBuffer(10)
 
-	// Read on day 1000 and day 1001 (both within the 7-day window).
-	buf.recordRead(microsOnDay(1000))
-	buf.recordRead(microsOnDay(1001))
-
-	if buf.last7DReadCount.Load() != 2 {
-		t.Fatalf("last7DReadCount=%d want 2 (buggy code would reset on day change)", buf.last7DReadCount.Load())
+	if got := buf.readCountTotal.Load(); got != 0 {
+		t.Fatalf("pre-read readCountTotal=%d want 0", got)
 	}
-}
-
-func TestRecordRead_ExpiresBucketsOutsideWindow(t *testing.T) {
-	buf := newscopeBuffer(10)
-
-	buf.recordRead(microsOnDay(1000))
-	buf.recordRead(microsOnDay(1001))
-	buf.recordRead(microsOnDay(1002))
-
-	if buf.last7DReadCount.Load() != 3 {
-		t.Fatalf("pre-window last7DReadCount=%d want 3", buf.last7DReadCount.Load())
+	if got := buf.lastAccessTS.Load(); got != 0 {
+		t.Fatalf("pre-read lastAccessTS=%d want 0", got)
 	}
 
-	// Jump to day 1010 — all prior reads are > 6 days old.
-	buf.recordRead(microsOnDay(1010))
+	now := nowUnixMicro()
+	buf.recordRead(now)
+	buf.recordRead(now + 1)
+	buf.recordRead(now + 2)
 
-	if buf.last7DReadCount.Load() != 1 {
-		t.Fatalf("after expiry last7DReadCount=%d want 1", buf.last7DReadCount.Load())
+	if got := buf.readCountTotal.Load(); got != 3 {
+		t.Errorf("readCountTotal=%d want 3", got)
 	}
-}
-
-func TestRecordRead_ReusesBucketSlotAcross7DayCycle(t *testing.T) {
-	buf := newscopeBuffer(10)
-
-	// Day 1000 lands in slot 1000%7 = 6.
-	buf.recordRead(microsOnDay(1000))
-	// Day 1007 also lands in slot 6 — same physical slot, 7 days later.
-	buf.recordRead(microsOnDay(1007))
-
-	// Day 1000's read is now outside the rolling window (>= 7 days old).
-	if buf.last7DReadCount.Load() != 1 {
-		t.Fatalf("last7DReadCount=%d want 1 (old slot should have been expired)", buf.last7DReadCount.Load())
-	}
-}
-
-// stats() must report a fresh Last7DReadCount even when no recent
-// recordRead has expired stale buckets. Without computeLast7DReadCountLocked
-// a scope read 8 days ago and never since would still report its old
-// "warm" count via /stats and /delete_scope_candidates, biasing
-// eviction decisions against scopes that are actually cold.
-func TestStats_Last7DReadCount_ExpiresWithoutNewReads(t *testing.T) {
-	buf := newscopeBuffer(10)
-
-	// Three reads on day 1000 — cached field reads 3.
-	buf.recordRead(microsOnDay(1000))
-	buf.recordRead(microsOnDay(1000))
-	buf.recordRead(microsOnDay(1000))
-
-	if buf.last7DReadCount.Load() != 3 {
-		t.Fatalf("pre-stats last7DReadCount=%d want 3", buf.last7DReadCount.Load())
-	}
-
-	// Eight days later — no fresh recordRead, so the cached field
-	// still reads 3. stats() must compute live and report 0.
-	st := buf.stats(microsOnDay(1008))
-	if st.Last7DReadCount != 0 {
-		t.Errorf("stats(day 1008).Last7DReadCount=%d want 0; cached field=%d (stale)",
-			st.Last7DReadCount, buf.last7DReadCount.Load())
-	}
-
-	// Boundary check: at day 1006 (6 days after the reads, still in
-	// the rolling 7-day window), stats() must still report 3.
-	st = buf.stats(microsOnDay(1006))
-	if st.Last7DReadCount != 3 {
-		t.Errorf("stats(day 1006).Last7DReadCount=%d want 3 (still in window)",
-			st.Last7DReadCount)
-	}
-}
-
-func TestRecordRead_RollingWindowSum(t *testing.T) {
-	buf := newscopeBuffer(10)
-
-	// 2 reads on day 1000, 1 on day 1003, 3 on day 1006.
-	buf.recordRead(microsOnDay(1000))
-	buf.recordRead(microsOnDay(1000))
-	buf.recordRead(microsOnDay(1003))
-	buf.recordRead(microsOnDay(1006))
-	buf.recordRead(microsOnDay(1006))
-	buf.recordRead(microsOnDay(1006))
-
-	if buf.last7DReadCount.Load() != 6 {
-		t.Fatalf("last7DReadCount=%d want 6", buf.last7DReadCount.Load())
-	}
-
-	// Read on day 1007 — day 1000 falls out of window (1007-6=1001, 1000 < 1001).
-	buf.recordRead(microsOnDay(1007))
-
-	// Expected: 0 from day 1000, 1 from day 1003, 3 from day 1006, 1 from day 1007 = 5.
-	if buf.last7DReadCount.Load() != 5 {
-		t.Fatalf("last7DReadCount=%d want 5 (day 1000's 2 reads should expire)", buf.last7DReadCount.Load())
+	if got := buf.lastAccessTS.Load(); got != now+2 {
+		t.Errorf("lastAccessTS=%d want %d (most-recent stamp wins)", got, now+2)
 	}
 }
 
@@ -1087,7 +1005,6 @@ func walkApproxSize(b *scopeBuffer) int64 {
 		total += int64(len(k))
 	}
 	total += int64(len(b.bySeq)) * 16
-	total += int64(len(b.readHeatBuckets)) * 16
 	return total
 }
 
@@ -1395,7 +1312,7 @@ func TestStats_SurfacesLastWriteTS(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	st := buf.stats(nowUnixMicro())
+	st := buf.stats()
 	if st.LastWriteTS != buf.lastWriteTS {
 		t.Errorf("stats.LastWriteTS=%d buf.lastWriteTS=%d (snapshot must mirror the field)",
 			st.LastWriteTS, buf.lastWriteTS)

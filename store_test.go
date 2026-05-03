@@ -104,8 +104,7 @@ func TestConfig_WithDefaults(t *testing.T) {
 }
 
 // APIConfig.WithDefaults mirrors Config.WithDefaults: numeric zeros fall
-// back to compile-time defaults; bool zeros stay unchanged because their
-// zero-value is documented (false DisableReadHeat = heat tracked).
+// back to compile-time defaults.
 func TestAPIConfig_WithDefaults(t *testing.T) {
 	t.Run("zero fields fall back to defaults", func(t *testing.T) {
 		got := APIConfig{}.WithDefaults()
@@ -256,7 +255,7 @@ func TestStore_deleteUpTo_MissingScope(t *testing.T) {
 
 func TestStore_head_MissingScope(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	items, truncated, found := s.head("nope", 0, 10, false)
+	items, truncated, found := s.head("nope", 0, 10)
 	if found {
 		t.Error("found=true; want false")
 	}
@@ -270,7 +269,7 @@ func TestStore_head_MissingScope(t *testing.T) {
 
 func TestStore_tail_MissingScope(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	items, truncated, found := s.tail("nope", 10, 0, false)
+	items, truncated, found := s.tail("nope", 10, 0)
 	if found {
 		t.Error("found=true; want false")
 	}
@@ -284,14 +283,14 @@ func TestStore_tail_MissingScope(t *testing.T) {
 
 func TestStore_get_MissingScope(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	if _, found := s.get("nope", "x", 0, false); found {
+	if _, found := s.get("nope", "x", 0); found {
 		t.Error("found=true; want false")
 	}
 }
 
 func TestStore_render_MissingScope(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
-	if _, found := s.render("nope", "x", 0, false); found {
+	if _, found := s.render("nope", "x", 0); found {
 		t.Error("found=true; want false")
 	}
 }
@@ -305,7 +304,7 @@ func TestStore_render_PeelsJSONString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("appendOne: %v", err)
 	}
-	body, found := s.render("s", "html", 0, false)
+	body, found := s.render("s", "html", 0)
 	if !found {
 		t.Fatal("found=false; want true")
 	}

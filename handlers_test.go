@@ -1152,46 +1152,10 @@ func TestRender_BySeq(t *testing.T) {
 	}
 }
 
-// With Config.DisableReadHeat = true the hot read path skips
-// recordRead entirely. Hits still succeed; the heat counters stay at
-// zero. /delete_scope_candidates loses ranking signal but the cache
-// itself keeps working. Validates the opt-out path that operators
-// who don't use /delete_scope_candidates can take for ~2× faster
-// reads.
-func TestReadHeat_DisabledMode(t *testing.T) {
-	api := NewAPI(
-		NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
-		APIConfig{MaxResponseBytes: 25 << 20, DisableReadHeat: true},
-	)
-	mux := http.NewServeMux()
-	api.RegisterRoutes(mux)
-
-	_, _, _ = doRequest(t, mux, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
-
-	// Four reads across /get, /render, /tail, /head — every hit-pad on
-	// the read side. With heat disabled, none should increment the heat
-	// counters.
-	_, _, _ = doRequest(t, mux, "GET", "/get?scope=s&id=a", "")
-	_ = doRawRequest(t, mux, "GET", "/render?scope=s&id=a")
-	_, _, _ = doRequest(t, mux, "GET", "/tail?scope=s&limit=10", "")
-	_, _, _ = doRequest(t, mux, "GET", "/head?scope=s&limit=10", "")
-
-	buf, _ := api.store.getScope("s")
-	if got := buf.readCountTotal.Load(); got != 0 {
-		t.Errorf("readCountTotal=%d want 0 with disableReadHeat=true", got)
-	}
-	if got := buf.last7DReadCount.Load(); got != 0 {
-		t.Errorf("last7DReadCount=%d want 0 with disableReadHeat=true", got)
-	}
-	if got := buf.lastAccessTS.Load(); got != 0 {
-		t.Errorf("lastAccessTS=%d want 0 with disableReadHeat=true", got)
-	}
-}
-
-// /render hits feed scope read-heat the same way /get hits do, so
-// /delete_scope_candidates reflects render-driven traffic. Misses must not
-// count (same rule as /get) — otherwise a hot 404 would skew eviction.
-func TestRender_HitBumpsReadHeat_MissDoesNot(t *testing.T) {
+// /render hits bump scope read-bookkeeping the same way /get hits do.
+// Misses must not count (same rule as /get) — otherwise a hot 404
+// would skew downstream observability.
+func TestRender_HitBumpsReadCount_MissDoesNot(t *testing.T) {
 	h, api := newTestHandler(10)
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","id":"a","payload":{"v":1}}`)
 
@@ -1200,9 +1164,9 @@ func TestRender_HitBumpsReadHeat_MissDoesNot(t *testing.T) {
 	_ = doRawRequest(t, h, "GET", "/render?scope=s&id=nonexistent") // miss — must not count
 
 	buf, _ := api.store.getScope("s")
-	got := buf.last7DReadCount.Load()
+	got := buf.readCountTotal.Load()
 	if got != 2 {
-		t.Errorf("last_7d_read_count=%d want 2 (two hits, miss must not count)", got)
+		t.Errorf("read_count_total=%d want 2 (two hits, miss must not count)", got)
 	}
 }
 
@@ -1373,7 +1337,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	xItemCount := len(xBuf.items)
 	xLastSeq := xBuf.lastSeq
 	xBuf.mu.RUnlock()
-	xLast7D := xBuf.last7DReadCount.Load()
+	xReadCount := xBuf.readCountTotal.Load()
 	xLastAccess := xBuf.lastAccessTS.Load()
 
 	if xItemCount != 69 {
@@ -1382,8 +1346,8 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	if xLastSeq != 100 {
 		t.Errorf("x.last_seq=%d want 100 (delete_up_to must not rewind lastSeq)", xLastSeq)
 	}
-	if xLast7D < 1 {
-		t.Errorf("x.last_7d_read_count=%d want >= 1 after /head", xLast7D)
+	if xReadCount < 1 {
+		t.Errorf("x.read_count_total=%d want >= 1 after /head", xReadCount)
 	}
 	// /head on x was the last touch, so its last_access_ts must sit inside
 	// the window we bracketed around that call.
@@ -1399,7 +1363,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	yItemCount := len(yBuf.items)
 	yLastSeq := yBuf.lastSeq
 	yBuf.mu.RUnlock()
-	yLast7D := yBuf.last7DReadCount.Load()
+	yReadCount := yBuf.readCountTotal.Load()
 	yLastAccess := yBuf.lastAccessTS.Load()
 
 	if yItemCount != 149 {
@@ -1408,9 +1372,9 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	if yLastSeq != 150 {
 		t.Errorf("y.last_seq=%d want 150", yLastSeq)
 	}
-	// /tail + /get byID both hit y — at least 2 reads, same calendar day → single bucket.
-	if yLast7D < 2 {
-		t.Errorf("y.last_7d_read_count=%d want >= 2 after /tail + /get", yLast7D)
+	// /tail + /get byID both hit y — so at least two reads landed on this scope.
+	if yReadCount < 2 {
+		t.Errorf("y.read_count_total=%d want >= 2 after /tail + /get", yReadCount)
 	}
 	// /get byID was the last read on y, so last_access_ts must sit inside
 	// that call's bracket.

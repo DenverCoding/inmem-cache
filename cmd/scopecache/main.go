@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -110,22 +109,6 @@ func maxResponseBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
-// disableReadHeatFromEnv reads SCOPECACHE_DISABLE_READ_HEAT. Default
-// is false — heat tracking is on. Set "1", "true", "yes", or "on"
-// (case-insensitive) to skip recordRead on the hot read path; saves
-// the time.Now() call plus the heat counters' atomic adds, at the
-// cost of always-zero last_access_ts / last_7d_read_count /
-// read_count_total in /stats.
-func disableReadHeatFromEnv() bool {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SCOPECACHE_DISABLE_READ_HEAT")))
-	switch raw {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
 const shutdownGracePeriod = 5 * time.Second
 
 func listenUnixSocket(path string) (net.Listener, error) {
@@ -180,17 +163,11 @@ func main() {
 	}
 	apiCfg := scopecache.APIConfig{
 		MaxResponseBytes: maxResponseBytesFromEnv(),
-		DisableReadHeat:  disableReadHeatFromEnv(),
 	}
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store, apiCfg)
 
-	heatStatus := "enabled"
-	if apiCfg.DisableReadHeat {
-		heatStatus = "DISABLED (SCOPECACHE_DISABLE_READ_HEAT=on)"
-	}
 	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, apiCfg.MaxResponseBytes>>20)
-	log.Printf("scopecache features: read-heat %s", heatStatus)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

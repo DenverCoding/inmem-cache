@@ -295,13 +295,13 @@ func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
 //
 // These were added to profile the read path under real concurrency
 // (32 cores in the bench host). The bare lookup methods (getByID,
-// getBySeq, tailOffset, sinceSeq) only take buf.mu.RLock(),
-// so they should scale linearly with cores. The HTTP-equivalent paths
-// (/get, /render, /head, /tail) additionally call
-// buf.recordRead() after a successful lookup, which takes
-// buf.mu.Lock() — a write lock on the same mutex the readers were
-// just on. The "_WithRecordRead" suffix on benches below tells you
-// whether that second lock is included.
+// getBySeq, tailOffset, sinceSeq) only take buf.mu.RLock(), so they
+// should scale linearly with cores. The HTTP-equivalent paths
+// (/get, /render, /head, /tail) additionally call buf.recordRead()
+// after a successful lookup. recordRead is now lock-free (two atomic
+// stores: readCountTotal + lastAccessTS), so the marginal cost over
+// the bare lookup is small but non-zero. The "_WithRecordRead" suffix
+// on benches below tells you whether that bookkeeping is included.
 //
 // Run with -cpuprofile -memprofile -blockprofile to find what
 // dominates the parallel read path.
@@ -331,9 +331,9 @@ func BenchmarkStore_GetBySeq_Parallel(b *testing.B) {
 
 // BenchmarkStore_GetByID_Parallel_WithRecordRead is the bench above
 // plus the recordRead(now) call that /get and /render perform on a hit.
-// recordRead takes buf.mu.Lock() (write lock), serialising every read
-// on a given scope. The delta between this and GetByID_Parallel
-// quantifies the heat-bucket cost on the hot read path.
+// recordRead is lock-free (two atomic stores: readCountTotal and
+// lastAccessTS), so the delta against GetByID_Parallel is the marginal
+// cost of those two stores plus the time.Now() call.
 func BenchmarkStore_GetByID_Parallel_WithRecordRead(b *testing.B) {
 	store, scopes, ids := benchStore(b, 100, 1000, 512)
 	numScopes := len(scopes)
@@ -351,33 +351,6 @@ func BenchmarkStore_GetByID_Parallel_WithRecordRead(b *testing.B) {
 			if _, ok := buf.getByID(id); ok {
 				buf.recordRead(nowUnixMicro())
 			}
-			i++
-		}
-	})
-}
-
-// BenchmarkStore_GetByID_Parallel_HeatDisabled is the equivalent of
-// _WithRecordRead but with the path that handlers take when
-// APIConfig.DisableReadHeat is true: skip recordRead entirely (and the
-// time.Now() that feeds it). Mimics what /get and /render do at runtime
-// in heat-off mode. Compare to _WithRecordRead to see the per-op
-// savings on the read-hot path when heat tracking is off.
-func BenchmarkStore_GetByID_Parallel_HeatDisabled(b *testing.B) {
-	store, scopes, ids := benchStore(b, 100, 1000, 512)
-	numScopes := len(scopes)
-	itemsPerScope := len(ids) / numScopes
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			scope := scopes[i%numScopes]
-			id := ids[i%itemsPerScope]
-			buf, _ := store.getScope(scope)
-			_, _ = buf.getByID(id)
-			// recordRead intentionally skipped — what disableReadHeat does.
 			i++
 		}
 	})

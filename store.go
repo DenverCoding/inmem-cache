@@ -489,32 +489,32 @@ func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 }
 
 // head returns up to `limit` oldest items in the scope with seq >
-// afterSeq. Returns (items, truncated, scopeFound). recordHeat=true
-// stamps the scope's read-heat (only on non-empty result, mirroring
-// the prior handler behaviour). A missing scope reports (nil, false,
-// false); a found-but-empty window reports (empty, false, true) —
-// handlers translate that into hit:false / count:0.
-func (s *Store) head(scope string, afterSeq uint64, limit int, recordHeat bool) ([]Item, bool, bool) {
+// afterSeq. Returns (items, truncated, scopeFound). On a non-empty
+// result the scope's read-bookkeeping atomics are bumped via
+// recordRead. A missing scope reports (nil, false, false); a
+// found-but-empty window reports (empty, false, true) — handlers
+// translate that into hit:false / count:0.
+func (s *Store) head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false, false
 	}
 	items, truncated := buf.sinceSeq(afterSeq, limit)
-	if recordHeat && len(items) > 0 {
+	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}
 	return items, truncated, true
 }
 
 // tail returns up to `limit` newest items in the scope, skipping the
-// first `offset`. Same return shape and recordHeat semantics as head.
-func (s *Store) tail(scope string, limit, offset int, recordHeat bool) ([]Item, bool, bool) {
+// first `offset`. Same return shape and bookkeeping as head.
+func (s *Store) tail(scope string, limit, offset int) ([]Item, bool, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false, false
 	}
 	items, truncated := buf.tailOffset(limit, offset)
-	if recordHeat && len(items) > 0 {
+	if len(items) > 0 {
 		buf.recordRead(nowUnixMicro())
 	}
 	return items, truncated, true
@@ -522,8 +522,8 @@ func (s *Store) tail(scope string, limit, offset int, recordHeat bool) ([]Item, 
 
 // get returns one item by scope+id or scope+seq. (item, found) — the
 // found flag is true only when both the scope and the item exist.
-// recordHeat fires on hit only.
-func (s *Store) get(scope, id string, seq uint64, recordHeat bool) (Item, bool) {
+// recordRead fires on hit only.
+func (s *Store) get(scope, id string, seq uint64) (Item, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return Item{}, false
@@ -538,17 +538,15 @@ func (s *Store) get(scope, id string, seq uint64, recordHeat bool) (Item, bool) 
 	if !found {
 		return Item{}, false
 	}
-	if recordHeat {
-		buf.recordRead(nowUnixMicro())
-	}
+	buf.recordRead(nowUnixMicro())
 	return item, true
 }
 
 // render returns the bytes /render writes on the wire, peeling the
 // renderBytes shortcut for JSON-string payloads at the Store boundary
 // so the handler does not need to know the renderBytes field exists.
-// (bytes, found) — same hit semantics as get; recordHeat fires on hit.
-func (s *Store) render(scope, id string, seq uint64, recordHeat bool) ([]byte, bool) {
+// (bytes, found) — same hit semantics as get; recordRead fires on hit.
+func (s *Store) render(scope, id string, seq uint64) ([]byte, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false
@@ -563,9 +561,7 @@ func (s *Store) render(scope, id string, seq uint64, recordHeat bool) ([]byte, b
 	if !found {
 		return nil, false
 	}
-	if recordHeat {
-		buf.recordRead(nowUnixMicro())
-	}
+	buf.recordRead(nowUnixMicro())
 	if item.renderBytes != nil {
 		return item.renderBytes, true
 	}
@@ -678,9 +674,8 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 //
 // The snapshot is intentionally aggregate-only — no per-scope map. At
 // 100k+ scopes the per-scope enumeration was the dominant cost of
-// /stats (one buffer.stats() call per scope, each materialising a
-// scopeStats and computing computeLast7DReadCount), and the response
-// would routinely exceed practical client and proxy limits. Per-scope
+// /stats (one buffer.stats() call per scope), and the response would
+// routinely exceed practical client and proxy limits. Per-scope
 // enumeration moves to a separate paginated /scopelist endpoint
 // (see Phase A roadmap).
 type storeStats struct {

@@ -32,8 +32,6 @@ const (
 	// plus JSON framing (keys, quotes, separators, wrapper object).
 	BulkRequestBytesOverhead = 16 << 20 // 16 MiB
 
-	ReadHeatWindowDays = 7
-
 	// MaxCounterValue is the largest absolute value a /counter_add operation
 	// may observe or produce. Matches the JavaScript safe-integer range
 	// (2^53 - 1), so counter values marshalled into JSON round-trip through
@@ -211,18 +209,6 @@ type CounterAddRequest struct {
 
 type ItemsRequest struct {
 	Items []Item `json:"items"`
-}
-
-// ScopeReadHeatBucket is one slot in the per-scope rolling-7-day read-
-// heat ring buffer. Day is the unix-day this slot is currently
-// representing (0 = empty); Count is the number of reads recorded on
-// that day. Both fields are atomic so the read-hot path
-// (scopeBuffer.recordRead) can update them without taking the scope
-// write lock — see the lock-free state machine in recordRead for the
-// claim/expire protocol.
-type ScopeReadHeatBucket struct {
-	Day   atomic.Int64
-	Count atomic.Uint64
 }
 
 // ScopeCapacityOffender is one entry in a 507 response body: which scope

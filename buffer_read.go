@@ -13,8 +13,8 @@ import "sort"
 // of them check b.detached: reading from a detached buffer returns the
 // state the buffer had at detach time, which is fine for reads — there
 // is no orphan-write hazard, only an eventually-stale snapshot. The
-// hot-path heat tracking (recordRead in buffer_heat.go) runs separately
-// and is intentionally lock-free.
+// hot-path read bookkeeping (recordRead in buffer_heat.go) runs
+// separately and is intentionally lock-free on b.mu.
 //
 // Counter materialisation: every read path runs returned items through
 // materialiseCounter so consumers see the cell's current value/ts

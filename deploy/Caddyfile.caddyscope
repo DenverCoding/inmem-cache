@@ -2,9 +2,8 @@
 #
 # The scopecache block's subdirectives mirror the standalone binary's
 # env vars (SCOPECACHE_SCOPE_MAX_ITEMS, SCOPECACHE_MAX_STORE_MB,
-# SCOPECACHE_MAX_ITEM_MB, SCOPECACHE_MAX_RESPONSE_MB,
-# SCOPECACHE_DISABLE_READ_HEAT). Omit any of them to use the
-# compile-time default.
+# SCOPECACHE_MAX_ITEM_MB, SCOPECACHE_MAX_RESPONSE_MB). Omit any of them
+# to use the compile-time default.
 #
 # Mount paths other than root work too — the handler returns "next" for any
 # path it does not recognise, so `handle /cache/*` with a `uri strip_prefix

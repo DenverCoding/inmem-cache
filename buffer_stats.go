@@ -1,18 +1,17 @@
 package scopecache
 
 // approxSizeBytes is a richer estimate than the raw approxItemSize sum: it
-// also folds in Go map/slice overhead for b.byID, b.bySeq, and the heat
-// buckets. It surfaces as the per-scope approx_scope_mb value in
-// observability snapshots. It is NOT used for cap enforcement —
-// admission control uses Store.totalBytes (approxItemSize sum +
-// scopeBufferOverhead per scope) so the 507 budget matches what
-// reserveBytes accounts for. Per-item Go heap overhead (slice/map
-// entries) is intentionally outside the cap: charging it would tie
-// admission control to Go's internal data-structure layout, while the
-// current accounting (approxItemSize + per-scope overhead) is
-// layout-independent and matches reserveBytes exactly. Trade-off:
-// approx_store_mb under-reports real memory pressure at very high
-// scope counts, where Go heap overhead per scope becomes non-trivial
+// also folds in Go map/slice overhead for b.byID and b.bySeq. It surfaces
+// as the per-scope approx_scope_mb value in observability snapshots. It
+// is NOT used for cap enforcement — admission control uses
+// Store.totalBytes (approxItemSize sum + scopeBufferOverhead per scope)
+// so the 507 budget matches what reserveBytes accounts for. Per-item Go
+// heap overhead (slice/map entries) is intentionally outside the cap:
+// charging it would tie admission control to Go's internal data-structure
+// layout, while the current accounting (approxItemSize + per-scope
+// overhead) is layout-independent and matches reserveBytes exactly.
+// Trade-off: approx_store_mb under-reports real memory pressure at very
+// high scope counts, where Go heap overhead per scope becomes non-trivial
 // relative to item bytes.
 //
 // O(1) by construction: every term is either a constant, a length on
@@ -28,25 +27,21 @@ package scopecache
 //   - len(b.byID) * 32            : map bucket overhead per byID entry
 //   - b.idKeyBytes                : Σ len(item.ID) over the byID keys
 //   - len(b.bySeq) * 16           : map bucket overhead per bySeq entry
-//   - ReadHeatWindowDays * 16     : heat-bucket ringbuffer (constant)
 //
 // PRECONDITION: caller holds b.mu (or b.mu.RLock — the formula reads
-// only mu-protected state and the read-heat ringbuffer constant; the
-// atomic Day/Count fields inside heat buckets are not touched here).
+// only mu-protected state).
 func (b *scopeBuffer) approxSizeBytesLocked() int64 {
 	const structOverhead = int64(64)
 	const itemSlotOverhead = int64(32)
 	const byIDBucketOverhead = int64(32)
 	const bySeqBucketOverhead = int64(16)
-	const heatBucketOverhead = int64(ReadHeatWindowDays) * 16
 
 	return structOverhead +
 		int64(len(b.items))*itemSlotOverhead +
 		b.bytes +
 		int64(len(b.byID))*byIDBucketOverhead +
 		b.idKeyBytes +
-		int64(len(b.bySeq))*bySeqBucketOverhead +
-		heatBucketOverhead
+		int64(len(b.bySeq))*bySeqBucketOverhead
 }
 
 func (b *scopeBuffer) approxSizeBytes() int64 {
@@ -56,38 +51,34 @@ func (b *scopeBuffer) approxSizeBytes() int64 {
 }
 
 // scopeStats is the typed snapshot of a single scopeBuffer. It is what
-// buf.stats() returns so callers inside the package (e.g. the candidate-
-// selection path) can read fields directly, and what API-layer handlers
-// flatten into orderedFields for the wire format.
+// buf.stats() returns so callers inside the package can read fields
+// directly, and what API-layer handlers flatten into orderedFields for
+// the wire format.
 type scopeStats struct {
-	ItemCount       int
-	LastSeq         uint64
-	ApproxScopeMB   MB
-	CreatedTS       int64
-	LastWriteTS     int64
-	LastAccessTS    int64
-	ReadCountTotal  uint64
-	Last7DReadCount uint64
+	ItemCount      int
+	LastSeq        uint64
+	ApproxScopeMB  MB
+	CreatedTS      int64
+	LastWriteTS    int64
+	LastAccessTS   int64
+	ReadCountTotal uint64
 }
 
-// stats returns a snapshot of this scope's metrics. The caller passes
-// `now` so Last7DReadCount reflects the rolling window ending at the
-// caller's clock — last7DReadCount the runtime field is only updated
-// by recordRead, so a scope that hasn't been read in 7+ days would
-// otherwise still report a stale "warm" count to observability
-// callers.
-func (b *scopeBuffer) stats(now int64) scopeStats {
+// stats returns a snapshot of this scope's metrics. All fields are
+// primitives the cache maintains directly (timestamps + monotonic
+// counters); time-windowed aggregations are addon territory — see
+// recordRead in buffer_heat.go.
+func (b *scopeBuffer) stats() scopeStats {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	return scopeStats{
-		ItemCount:       len(b.items),
-		LastSeq:         b.lastSeq,
-		ApproxScopeMB:   MB(b.approxSizeBytesLocked()),
-		CreatedTS:       b.createdTS,
-		LastWriteTS:     b.lastWriteTS,
-		LastAccessTS:    b.lastAccessTS.Load(),
-		ReadCountTotal:  b.readCountTotal.Load(),
-		Last7DReadCount: b.computeLast7DReadCount(now),
+		ItemCount:      len(b.items),
+		LastSeq:        b.lastSeq,
+		ApproxScopeMB:  MB(b.approxSizeBytesLocked()),
+		CreatedTS:      b.createdTS,
+		LastWriteTS:    b.lastWriteTS,
+		LastAccessTS:   b.lastAccessTS.Load(),
+		ReadCountTotal: b.readCountTotal.Load(),
 	}
 }

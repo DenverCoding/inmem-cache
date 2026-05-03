@@ -131,7 +131,7 @@ func (api *API) handleHead(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	items, truncated, found := api.store.head(q.Scope, afterSeq, q.Limit, !api.disableReadHeat)
+	items, truncated, found := api.store.head(q.Scope, afterSeq, q.Limit)
 	if !found {
 		api.writeItemsMiss(w, started, nil)
 		return
@@ -162,7 +162,7 @@ func (api *API) handleTail(w http.ResponseWriter, r *http.Request) {
 	// — the helpers slot `extra` at exactly that position.
 	offsetField := orderedFields{kv{"offset", offset}}
 
-	items, truncated, found := api.store.tail(q.Scope, q.Limit, offset, !api.disableReadHeat)
+	items, truncated, found := api.store.tail(q.Scope, q.Limit, offset)
 	if !found {
 		api.writeItemsMiss(w, started, offsetField)
 		return
@@ -198,9 +198,9 @@ func (api *API) handleGet(w http.ResponseWriter, r *http.Request) {
 		found bool
 	)
 	if target.ByID {
-		item, found = api.store.get(target.Scope, target.ID, 0, !api.disableReadHeat)
+		item, found = api.store.get(target.Scope, target.ID, 0)
 	} else {
-		item, found = api.store.get(target.Scope, "", target.Seq, !api.disableReadHeat)
+		item, found = api.store.get(target.Scope, "", target.Seq)
 	}
 	if !found {
 		miss()
@@ -255,9 +255,9 @@ func (api *API) handleRender(w http.ResponseWriter, r *http.Request) {
 		found bool
 	)
 	if target.ByID {
-		body, found = api.store.render(target.Scope, target.ID, 0, !api.disableReadHeat)
+		body, found = api.store.render(target.Scope, target.ID, 0)
 	} else {
-		body, found = api.store.render(target.Scope, "", target.Seq, !api.disableReadHeat)
+		body, found = api.store.render(target.Scope, "", target.Seq)
 	}
 	if !found {
 		writeMiss()

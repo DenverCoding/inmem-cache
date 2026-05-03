@@ -4,8 +4,8 @@ package scopecache
 // NewAPI. The split between APIConfig and Config mirrors the boundary
 // rule: Config carries cache-internal limits (per-scope item cap, store
 // byte cap, per-item byte cap), APIConfig carries everything that only
-// makes sense once a request is being served — response sizing and the
-// read-path heat-tracking opt-out.
+// makes sense once a request is being served — currently just response
+// sizing.
 //
 // Multi-tenancy, auth, batching and operator-policy concerns previously
 // in this struct (ServerSecret, InboxScopes, EnableAdmin, MaxMultiCall*,
@@ -20,21 +20,14 @@ package scopecache
 // Fields:
 //   - MaxResponseBytes:  per-response cap on read endpoints whose body can
 //     grow with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
-//   - DisableReadHeat:   opt-out of per-scope read-heat tracking on the hot read
-//     path (/get, /render, /head, /tail). Saves time.Now() + atomic
-//     adds at the cost of always-zero last_access_ts / last_7d_read_count /
-//     read_count_total in /stats. Default false (heat tracked).
 type APIConfig struct {
 	MaxResponseBytes int64
-	DisableReadHeat  bool
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields
 // replaced by the package-level compile-time defaults. NewAPI calls this
 // internally so callers can pass a partially-filled APIConfig (or a bare
-// `APIConfig{}` for "all defaults") and still get a working API. Bool
-// fields are left untouched: their zero-value is the documented shape
-// (false DisableReadHeat keeps heat tracking on).
+// `APIConfig{}` for "all defaults") and still get a working API.
 func (c APIConfig) WithDefaults() APIConfig {
 	if c.MaxResponseBytes <= 0 {
 		c.MaxResponseBytes = int64(MaxResponseMiB) << 20
@@ -44,9 +37,8 @@ func (c APIConfig) WithDefaults() APIConfig {
 
 // API is the HTTP layer in front of *Store. It owns request-shape
 // concerns the core deliberately knows nothing about: response-size
-// caps and the read-heat opt-out. Multi-tenancy, batching and
-// operator-policy concerns live in addon packages built on top of the
-// public *API surface.
+// caps. Multi-tenancy, batching and operator-policy concerns live in
+// addon packages built on top of the public *API surface.
 type API struct {
 	store *Store
 	// maxBulkBytes is the per-request body cap for /warm and /rebuild,
@@ -64,13 +56,6 @@ type API struct {
 	// maxResponseBytes is the per-response byte cap for /head, /tail —
 	// endpoints whose response can grow with limit × per-item-cap.
 	maxResponseBytes int64
-
-	// disableReadHeat skips recordRead() on every hot read-path call
-	// (/get, /render, /head, /tail). Default zero-value
-	// (false) keeps heat tracking on; setting true saves the time.Now()
-	// call plus the atomic adds on the heat counters. See
-	// APIConfig.DisableReadHeat.
-	disableReadHeat bool
 }
 
 // NewAPI wires the HTTP API to a Store and an APIConfig. Request caps that
@@ -83,6 +68,5 @@ func NewAPI(store *Store, cfg APIConfig) *API {
 		maxBulkBytes:     bulkRequestBytesFor(store.maxStoreBytes),
 		maxSingleBytes:   singleRequestBytesFor(store.maxItemBytes),
 		maxResponseBytes: cfg.MaxResponseBytes,
-		disableReadHeat:  cfg.DisableReadHeat,
 	}
 }

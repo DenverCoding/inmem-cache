@@ -44,13 +44,6 @@ type Handler struct {
 	// MaxResponseMB caps the byte size of /head and /tail responses
 	// in MiB. 0 = use scopecache.MaxResponseMiB.
 	MaxResponseMB int `json:"max_response_mb,omitempty"`
-	// DisableReadHeat turns off per-scope read-heat tracking on the
-	// hot read path (/get, /render, /head, /tail). Default false —
-	// heat is tracked. Set to true to skip recordRead and the
-	// time.Now() that feeds it; saves ~2× on the hottest paths at
-	// the cost of always-zero last_access_ts / last_7d_read_count /
-	// read_count_total in /stats.
-	DisableReadHeat bool `json:"disable_read_heat,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -81,7 +74,6 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	})
 	h.api = scopecache.NewAPI(store, scopecache.APIConfig{
 		MaxResponseBytes: int64(h.MaxResponseMB) << 20,
-		DisableReadHeat:  h.DisableReadHeat,
 	})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
@@ -109,11 +101,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    max_store_mb        100
 //	    max_item_mb         1
 //	    max_response_mb     25
-//	    disable_read_heat   no
 //	}
-//
-// Numeric capacity knobs are integer; `disable_read_heat` is a boolean
-// (yes/no, true/false, on/off, 1/0).
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
@@ -125,19 +113,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			value := d.Val()
-
-			// Boolean-valued directives.
-			if key == "disable_read_heat" {
-				switch value {
-				case "yes", "true", "on", "1":
-					h.DisableReadHeat = true
-				case "no", "false", "off", "0":
-					h.DisableReadHeat = false
-				default:
-					return d.Errf("disable_read_heat: %q is not a boolean (use yes/no, true/false, on/off, or 1/0)", value)
-				}
-				continue
-			}
 
 			// Integer-valued directives.
 			n, err := strconv.Atoi(value)
