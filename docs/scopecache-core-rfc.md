@@ -192,9 +192,11 @@ them, does not split on `:`, and does not interpret leading
 underscores as reserved.
 
 Lookup by `scope`, `id`, or `seq` runs against in-memory hashmaps
-and is independent of name length. In-process measurements
-report sub-microsecond latency for a single-item read on a
-50,000-item scope.
+and is independent of both name length and scope size — the
+underlying Go-map lookup is constant-time on average. In-process
+measurements show roughly 35–40 ns per single-item read on
+commodity hardware (`BenchmarkStore_GetByID` and
+`BenchmarkStore_GetBySeq`).
 
 The `_` prefix is a **social convention** for state managed by
 addons (`_tokens`, `_counters_*`, addon-internal scopes). The core
