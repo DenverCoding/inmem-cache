@@ -40,7 +40,7 @@ set -eu
 # and macOS where MSYS isn't in the picture.
 export MSYS_NO_PATHCONV=1
 
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 QUICK=0
 DOWN=0
 
@@ -70,7 +70,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cd "$SCRIPT_DIR"
+cd "$REPO_ROOT"
 
 elapsed() {
     printf '%ss' "$(( $(date +%s) - $1 ))"
@@ -135,7 +135,7 @@ printf 'ready (%s)\n' "$(elapsed "$t0")"
 printf '\n[4/4] e2e against unix-socket scopecache:\n'
 t0=$(date +%s)
 set +e
-docker compose exec -T dev sh /src/e2e_test.sh
+docker compose exec -T dev sh /src/scripts/e2e_test.sh
 unix_rc=$?
 set -e
 unix_dur=$(elapsed "$t0")
@@ -143,7 +143,7 @@ unix_dur=$(elapsed "$t0")
 printf '\n[4/4] e2e against caddyscope (TCP):\n'
 t0=$(date +%s)
 set +e
-docker compose exec -T -e SOCK= -e BASE=http://caddyscope:8080 dev sh /src/e2e_test.sh
+docker compose exec -T -e SOCK= -e BASE=http://caddyscope:8080 dev sh /src/scripts/e2e_test.sh
 tcp_rc=$?
 set -e
 tcp_dur=$(elapsed "$t0")

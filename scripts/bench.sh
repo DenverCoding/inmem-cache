@@ -77,7 +77,7 @@ case "$MODE" in
     *) echo "invalid mode: $MODE (expected: get | get-seq | append-unique | append-same)"; exit 2 ;;
 esac
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TS="$(date +%Y%m%d-%H%M%S)"
 RESULTS_DIR="$REPO_ROOT/bench-results/$VERSION-$MODE-$TS"
 mkdir -p "$RESULTS_DIR"
@@ -102,9 +102,8 @@ ORIG_REF="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 
 restore_state() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    if [[ -f "$REPO_ROOT/Caddyfile.caddyscope.bench-backup" ]]; then
-        mv -f "$REPO_ROOT/Caddyfile.caddyscope.bench-backup" \
-              "$REPO_ROOT/Caddyfile.caddyscope"
+    if [[ -n "${CADDYFILE_BACKUP:-}" && -f "$CADDYFILE_BACKUP" ]]; then
+        mv -f "$CADDYFILE_BACKUP" "$CADDYFILE_PATH"
     fi
     git -C "$REPO_ROOT" checkout -q "$ORIG_REF" 2>/dev/null || true
 }
@@ -117,11 +116,22 @@ if ! git -C "$REPO_ROOT" checkout -q "$VERSION" 2>&1; then
     exit 1
 fi
 
-# --- generous Caddyfile ---
-[[ ! -f "$REPO_ROOT/Caddyfile.caddyscope.bench-backup" ]] && \
-    cp "$REPO_ROOT/Caddyfile.caddyscope" "$REPO_ROOT/Caddyfile.caddyscope.bench-backup"
+# --- detect Caddyfile location ---
+# Post-reorg tags (v0.7.18+) keep Caddyfile.caddyscope under deploy/;
+# pre-reorg tags have it at the repo root. Detect after checkout so
+# benchmarks against historical versions still work.
+if [[ -f "$REPO_ROOT/deploy/Caddyfile.caddyscope" ]]; then
+    CADDYFILE_PATH="$REPO_ROOT/deploy/Caddyfile.caddyscope"
+else
+    CADDYFILE_PATH="$REPO_ROOT/Caddyfile.caddyscope"
+fi
+CADDYFILE_BACKUP="${CADDYFILE_PATH}.bench-backup"
 
-cat > "$REPO_ROOT/Caddyfile.caddyscope" <<'CADDYFILE'
+# --- generous Caddyfile ---
+[[ ! -f "$CADDYFILE_BACKUP" ]] && \
+    cp "$CADDYFILE_PATH" "$CADDYFILE_BACKUP"
+
+cat > "$CADDYFILE_PATH" <<'CADDYFILE'
 {
     admin off
     log {
@@ -157,7 +167,7 @@ MSYS_NO_PATHCONV=1 docker run -d \
     --network "$NETWORK" \
     --cpuset-cpus="$SERVER_CPUSET" \
     -p "$PORT:8080" \
-    -v "$REPO_ROOT/Caddyfile.caddyscope:/etc/caddy/Caddyfile:ro" \
+    -v "$CADDYFILE_PATH:/etc/caddy/Caddyfile:ro" \
     -e SCOPECACHE_SERVER_SECRET=test-secret \
     caddy_module-caddyscope \
     caddy run --config /etc/caddy/Caddyfile --adapter caddyfile \

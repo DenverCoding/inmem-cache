@@ -11,4 +11,5 @@
 /archive/
 /phase4/
 /bench-results/
+/deploy/Caddyfile.caddyscope.bench-backup
 /Caddyfile.caddyscope.bench-backup

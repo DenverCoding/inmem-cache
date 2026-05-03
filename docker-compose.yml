@@ -14,7 +14,7 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - ./Caddyfile.caddyscope:/etc/caddy/Caddyfile:ro
+      - ./deploy/Caddyfile.caddyscope:/etc/caddy/Caddyfile:ro
 
   dev:
     image: golang:1.26-alpine
