@@ -204,6 +204,57 @@ start with an underscore (`_tokens`, `_counters_*`, etc.). The
 core does not parse or interpret these prefixes — see §9.2 for
 the protection model.
 
+### 2.4 Per-scope metadata
+
+In addition to the items themselves, every scope carries a small set
+of metadata fields. Most are bookkeeping for cap accounting and
+addressing; the read-heat fields (`lastAccessTS`, `readCountTotal`,
+`last7DReadCount`, `readHeatBuckets`) are exposed as primitives for
+addon-side eviction logic — see §8.
+
+| field                | purpose                                                                        |
+|----------------------|--------------------------------------------------------------------------------|
+| `items []Item`       | the items themselves, in `seq` order                                           |
+| `byID`, `bySeq`      | id→item and seq→item lookup maps (lazy-allocated; absent until first item)     |
+| `lastSeq`            | monotonic `seq` counter; never rewinds; deleted seqs are not reused            |
+| `maxItems`           | per-scope item cap (writes past this are rejected with 507)                    |
+| `bytes`              | Σ `approxItemSize` over items — feeds store-wide `totalBytes`                  |
+| `idKeyBytes`         | Σ `len(item.ID)` over `byID` — keeps `approxSizeBytes` O(1)                    |
+| `createdTS`          | microsecond timestamp of scope creation                                        |
+| `lastWriteTS`        | microsecond timestamp of the most recent write to any item in the scope       |
+| `lastAccessTS`       | microsecond timestamp of the most recent read hit (atomic, lock-free)         |
+| `readCountTotal`     | lifetime read-hit count (atomic, lock-free)                                    |
+| `last7DReadCount`    | rolling 7-day read-hit count (atomic, lock-free)                               |
+| `readHeatBuckets[7]` | ring buffer with one slot per day in the rolling 7-day window                  |
+| `detached`           | lifecycle flag set by `/delete_scope`, `/wipe`, `/rebuild` to fail in-flight writes against an orphan buffer |
+
+These fields are not currently surfaced through any HTTP endpoint as
+a per-scope bundle — `/stats` is aggregate-only (§2.5) and the
+paginated per-scope listing endpoint (`/scopelist`) is not yet
+implemented. In-process Go callers can read individual fields via
+the (forthcoming) `*Direct` API.
+
+### 2.5 Store-wide metadata
+
+Four store-wide counters are surfaced via the `/stats` endpoint
+(§6.5). Each is maintained incrementally on the write/delete/bulk
+paths so `/stats` can answer in O(1) — three atomic loads plus the
+static cap, independent of how many scopes the store holds.
+
+| field             | purpose                                                                  |
+|-------------------|--------------------------------------------------------------------------|
+| `scope_count`     | live scope count (atomic; updated on scope create / delete / wipe / rebuild) |
+| `total_items`     | Σ `len(scope.items)` across all live scopes (atomic; updated on every write/delete) |
+| `approx_store_mb` | running byte-budget reservation in MiB (atomic; updated on every write that reserves or releases bytes) |
+| `max_store_mb`    | configured store-wide byte cap in MiB (constant — `Config.MaxStoreBytes`) |
+
+The three atomics (`scope_count`, `total_items`, `approx_store_mb`)
+are loaded independently. Concurrent writes between the three loads
+can produce a snapshot where the fields reflect three slightly
+different instants; the `Σ scope.bytes == approx_store_mb` and `Σ
+len(scope.items) == total_items` invariants hold at quiesce, not at
+every observation. See §7.3.
+
 ---
 
 ## 3. Capacity and limits
@@ -1066,7 +1117,8 @@ curl -s 'http://localhost:8080/tail?scope=events&limit=10'
 Return a **store-wide aggregate snapshot**: scope count, total item
 count, approximate stored bytes, and the configured byte cap. No
 per-scope enumeration — that lives on `/scopelist` (paginated, with
-sort and prefix filters; see roadmap).
+sort and prefix filters; see roadmap). Per-field semantics are
+documented in §2.5.
 
 **Query parameters**
 
@@ -1231,7 +1283,9 @@ Every scope carries the following read-heat metadata. The fields
 are maintained on the per-scope buffer; `/stats` is aggregate-only
 and does not surface them. They are exposed via `/scopelist`
 (per-scope detail with paginated enumeration) and via the in-process
-Go API (Phase B).
+Go API (Phase B). See §2.4 for the full list of per-scope fields,
+including non-heat metadata; this section zooms in on the read-heat
+subset and adds the type and rolling-window semantics.
 
 | field                | type    | meaning                                            |
 |----------------------|---------|----------------------------------------------------|

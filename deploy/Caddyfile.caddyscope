@@ -1,8 +1,10 @@
 # Minimal Caddyfile that mounts scopecache at the root of :8080.
 #
-# The scopecache block's three subdirectives mirror the standalone binary's
+# The scopecache block's subdirectives mirror the standalone binary's
 # env vars (SCOPECACHE_SCOPE_MAX_ITEMS, SCOPECACHE_MAX_STORE_MB,
-# SCOPECACHE_MAX_ITEM_MB). Omit any of them to use the compile-time default.
+# SCOPECACHE_MAX_ITEM_MB, SCOPECACHE_MAX_RESPONSE_MB,
+# SCOPECACHE_DISABLE_READ_HEAT). Omit any of them to use the
+# compile-time default.
 #
 # Mount paths other than root work too — the handler returns "next" for any
 # path it does not recognise, so `handle /cache/*` with a `uri strip_prefix
@@ -23,8 +25,6 @@
     # response is HTML, so rewrite the Content-Type here. In a real
     # deployment the operator decides per path/scope what the MIME type
     # should be.
-    # `>` prefix = "late" header op — overschrijft de Content-Type die
-    # scopecache zelf op /render zet (application/octet-stream).
     @render path /render
     header @render >Content-Type "text/html; charset=utf-8"
 
@@ -32,34 +32,6 @@
         scope_max_items 100000
         max_store_mb    100
         max_item_mb     1
-        # Enable /guarded by passing the HMAC key. Substituted from the
-        # process env at config-load (see guardedflow.md §I). Empty/unset
-        # would disable /guarded entirely (route returns 404).
-        server_secret   {$SCOPECACHE_SERVER_SECRET}
-        # Enable /inbox by listing operator-allowed shared write scope
-        # names. Each line registers one. Empty list (no inbox_scope
-        # directives) disables /inbox entirely.
-        inbox_scope     _inbox
-        inbox_scope     audit_log
-        # Enable /admin. Default on the Caddy module is "no" because
-        # /admin has no body-level auth and a Caddyfile mounting the
-        # handler at a public listener would expose /wipe, /warm,
-        # /rebuild, /delete_scope etc. to any caller. THIS DEMO SETUP
-        # IS NOT PUBLIC-INTERNET-SAFE: the e2e test suite needs /admin
-        # so we turn it on here. In a real deployment, pair this with a
-        # Caddy route guard so /admin is only reachable from a trusted
-        # network — for example:
-        #
-        #     @operator client_ip 10.0.0.0/8
-        #     handle /admin {
-        #         scopecache { ... enable_admin yes ... }
-        #     }
-        #     handle {
-        #         scopecache { ... enable_admin no ... }
-        #     }
-        #
-        # Or terminate /admin on a separate listener bound to localhost.
-        enable_admin    yes
     }
     # scopecache calls next() for any path it does not recognise; this
     # terminal handler then returns 404 instead of Caddy's default empty
