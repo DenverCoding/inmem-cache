@@ -29,7 +29,29 @@ The cache supports two main use patterns:
   drains the buffer in batches via `/tail` followed by
   `/delete_up_to`.
 
-### 1.2 What scopecache is not
+### 1.2 Deployment modes
+
+scopecache runs in two modes:
+
+- **Standalone binary.** Listens on a Unix domain socket, reachable
+  from any HTTP client in any language (`curl`, PHP `cURL`, Python
+  `requests`, Node `fetch`, …). The lowest-friction setup: any
+  webstack that already speaks HTTP can use it.
+- **Caddy module.** The cache lives inside the same process as
+  Caddy and is served on the Caddyfile-defined listener. This is
+  the recommended deployment when the cache sits behind a webserver
+  that already terminates client connections.
+
+The Caddy-module path is the one that gets the most out of the
+cache: the webserver answers cache hits directly from memory
+instead of forwarding the request to PHP/Python/etc., querying a
+separate cache like Redis, and serialising the response back.
+Phase-4 benchmarks measured roughly 5× the throughput of an
+equivalent webserver → application → Redis → response path serving
+the same bytes — even when the application path is FrankenPHP in
+worker mode.
+
+### 1.3 What scopecache is not
 
 The core does not implement:
 
@@ -40,9 +62,9 @@ The core does not implement:
 - business workflows of any kind
 
 Anything in this list that you need is operator policy or addon
-territory. See §1.3.
+territory. See §1.4.
 
-### 1.3 The boundary rule
+### 1.4 The boundary rule
 
 The core has no business logic and no policy logic. It owns:
 
@@ -63,13 +85,7 @@ batch dispatch, write-only ingestion, operator-elevated dispatch,
 and eviction-hint queries. Their RFCs live alongside this one in
 `docs/`. Third-party addons follow the same pattern.
 
-### 1.4 Modular architecture
-
-scopecache works both as a **Caddy module** (TCP, mounted in a
-Caddyfile) and as a **standalone binary** (Unix domain socket,
-reachable via `curl --unix-socket` or any HTTP client in any
-language). Both adapters wrap the same core; the only difference is
-the transport.
+### 1.5 Modular architecture
 
 The core is the foundation: a small set of building blocks — the
 data model, the capacity rules, the address primitives, and the
@@ -93,7 +109,7 @@ This separation is what allows the core to remain stable under
 heavy testing and benchmarking while addons can evolve, be added,
 or be removed without risk to the cache itself.
 
-### 1.5 Status
+### 1.6 Status
 
 Pre-v1.0. Core HTTP and Go API surfaces are subject to breaking
 change between minor versions. After v1.0 the core becomes
