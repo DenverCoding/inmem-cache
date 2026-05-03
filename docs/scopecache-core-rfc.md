@@ -46,7 +46,7 @@ The Caddy-module path is the one that gets the most out of the
 cache: the webserver answers cache hits directly from memory
 instead of forwarding the request to PHP/Python/etc., querying a
 separate cache like Redis, and serialising the response back.
-Phase-4 benchmarks measured roughly 5× the throughput of an
+Benchmarks measured roughly 5× the throughput of an
 equivalent webserver → application → Redis → response path serving
 the same bytes — even when the application path is FrankenPHP in
 worker mode.
