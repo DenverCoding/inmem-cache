@@ -1277,9 +1277,10 @@ non-goal entirely.
 ### 9.2 Not in core: operator policy
 
 - **Access control.** Which clients reach which endpoints is a
-  transport-layer decision. Caddyfile route guards, Unix-socket
-  filesystem permissions, separate listeners per trust level —
-  all lives outside the cache.
+  transport-layer decision. Caddyfile route guards (or nginx /
+  apache equivalents), Unix-socket filesystem permissions,
+  separate listeners per trust level — all lives outside the
+  cache.
 - **Reserved-scope enforcement.** The `_*` prefix is a social
   convention (§2.3), not a core check. Addons that want their
   state-scopes protected from public writes rely on operator
