@@ -31,18 +31,21 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	st := api.store.stats()
 
-	// /stats is a state endpoint: aggregate scope/item counts and
-	// current byte usage. Static config (DefaultLimit, MaxLimit,
-	// per-item/per-scope caps) lives in /help, not here. max_store_mb
-	// is the one cap that *does* appear — it pairs with approx_store_mb
-	// so a client can compute headroom in a single call. duration_us is
-	// appended by the helper.
+	// /stats is a state endpoint: aggregate scope/item counts, current
+	// byte usage, and a "freshness" tick. Static config (DefaultLimit,
+	// MaxLimit, per-item/per-scope caps) lives in /help, not here.
+	// max_store_mb is the one cap that *does* appear — it pairs with
+	// approx_store_mb so a client can compute headroom in a single call.
+	// last_write_ts lets a polling client decide "anything changed
+	// since I last looked?" with a single integer comparison instead
+	// of refetching state. duration_us is appended by the helper.
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},
 		{"scope_count", st.ScopeCount},
 		{"total_items", st.TotalItems},
 		{"approx_store_mb", st.ApproxStoreMB},
 		{"max_store_mb", st.MaxStoreMB},
+		{"last_write_ts", st.LastWriteTS},
 	}, started)
 }
 

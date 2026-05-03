@@ -101,6 +101,9 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		b.byID[item.ID] = updated
 		b.bytes += delta
 		b.lastWriteTS = nowUs
+		if b.store != nil {
+			b.store.bumpLastWriteTS(nowUs)
+		}
 		return updated, false, nil
 	}
 
@@ -251,6 +254,7 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	b.bytes += size
 	if b.store != nil {
 		b.store.totalItems.Add(1)
+		b.store.bumpLastWriteTS(nowUs)
 	}
 	b.lastWriteTS = nowUs
 

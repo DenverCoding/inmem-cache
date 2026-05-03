@@ -57,6 +57,9 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 	}
 
 	s.scopeCount.Add(-int64(deletedScopes))
+	if deletedScopes > 0 {
+		s.bumpLastWriteTS(nowUnixMicro())
+	}
 	return deletedScopes, deletedItems, freedBytes
 }
 
@@ -95,6 +98,13 @@ func (s *Store) wipe() (int, int, int64) {
 	freedBytes := s.totalBytes.Swap(0)
 	s.totalItems.Store(0)
 	s.scopeCount.Store(0)
+	// /wipe is a destructive event, not a per-scope b.lastWriteTS bump
+	// (the scopes are gone). Bump the store-wide tick so a polling
+	// client sees "something happened" even when the cache lands at
+	// scope_count=0. CAS-max means a concurrent in-flight write that
+	// snuck through with a strictly later nowUs would still win, which
+	// is the correct ordering — that write committed after the wipe.
+	s.bumpLastWriteTS(nowUnixMicro())
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
@@ -313,6 +323,11 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	s.totalBytes.Store(totalNewBytes)
 	s.totalItems.Store(int64(totalItems))
 	s.scopeCount.Store(int64(totalScopes))
+	// rebuildAll constructs new buffers off-side via newscopeBuffer
+	// (which only seeds b.lastWriteTS to the buffer's creation time)
+	// and never goes through commitReplacement, so the per-scope bumps
+	// don't fire here. Stamp store-wide explicitly.
+	s.bumpLastWriteTS(nowUnixMicro())
 
 	return totalScopes, totalItems, nil
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- Store --------------------------------------------------------------------
@@ -982,16 +983,23 @@ func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
 
 // --- /stats counter invariants -----------------------------------------------
 
-// assertStatsCountersInvariant walks every shard and verifies the two
+// assertStatsCountersInvariant walks every shard and verifies the
 // invariants that make the O(1) /stats shape correct:
 //
-//   - s.totalItems == Σ len(buf.items) over every live scope buffer
-//   - s.scopeCount == Σ len(sh.scopes) over every shard
+//   - s.totalItems  == Σ len(buf.items) over every live scope buffer
+//   - s.scopeCount  == Σ len(sh.scopes) over every shard
+//   - s.lastWriteTS >= max(buf.lastWriteTS) over every live scope buffer
 //
 // Forgetting to update one of these counters from a write/delete/bulk
 // path silently corrupts /stats output without affecting any cache
 // behaviour — exactly the class of bug a routine assertion catches and
 // a hand-test never finds. Call this after any sequence of mutations.
+//
+// The lastWriteTS check is `>=` not `==` because store-level
+// destructive paths (deleteScope, wipe) bump s.lastWriteTS without
+// leaving any per-scope b.lastWriteTS behind (the scope is gone), so
+// after such an event the store-wide value is strictly greater than
+// any surviving scope's.
 //
 // Takes per-scope read locks during the walk; safe to call from tests
 // that have other goroutines mutating the store, but any concurrent
@@ -1001,6 +1009,7 @@ func assertStatsCountersInvariant(t *testing.T, s *Store, ctx string) {
 
 	var sumItems int64
 	var sumScopes int64
+	var maxScopeLastWriteTS int64
 	for i := range s.shards {
 		sh := &s.shards[i]
 		sh.mu.RLock()
@@ -1008,6 +1017,9 @@ func assertStatsCountersInvariant(t *testing.T, s *Store, ctx string) {
 		for _, buf := range sh.scopes {
 			buf.mu.RLock()
 			sumItems += int64(len(buf.items))
+			if buf.lastWriteTS > maxScopeLastWriteTS {
+				maxScopeLastWriteTS = buf.lastWriteTS
+			}
 			buf.mu.RUnlock()
 		}
 		sh.mu.RUnlock()
@@ -1018,6 +1030,9 @@ func assertStatsCountersInvariant(t *testing.T, s *Store, ctx string) {
 	}
 	if got := s.scopeCount.Load(); got != sumScopes {
 		t.Errorf("[%s] scopeCount=%d but Σ len(sh.scopes)=%d (counter drift)", ctx, got, sumScopes)
+	}
+	if got := s.lastWriteTS.Load(); got < maxScopeLastWriteTS {
+		t.Errorf("[%s] lastWriteTS=%d but max(buf.lastWriteTS)=%d (store-wide tick lags scope)", ctx, got, maxScopeLastWriteTS)
 	}
 }
 
@@ -1194,4 +1209,155 @@ func TestStore_StatsCounters_Invariant_DoSCleanup(t *testing.T) {
 			t.Errorf("totalItems drifted after rejected append: %d -> %d", totalItemsBefore, got)
 		}
 	}
+}
+
+// TestStore_LastWriteTS_StartsAtZero pins the "freshness sentinel"
+// contract: a fresh store with no writes must report 0, so a polling
+// client can use 0 as the unambiguous "I've never seen this cache
+// before" marker.
+func TestStore_LastWriteTS_StartsAtZero(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	if got := s.lastWriteTS.Load(); got != 0 {
+		t.Errorf("fresh store lastWriteTS=%d want 0", got)
+	}
+}
+
+// TestStore_LastWriteTS_BumpsOnEveryWritePath drives every path that
+// is supposed to bump s.lastWriteTS and asserts each one strictly
+// advances the counter. If a future change forgets to wire the bump
+// into one path, this test fails with the path's name in the context.
+func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	// step runs `op` and asserts s.lastWriteTS strictly advances. The
+	// helper sleeps a microsecond first so the post-op time.Now() value
+	// is guaranteed to be greater than the pre-op snapshot — without
+	// this two consecutive calls inside the same microsecond would
+	// register as "no advance" even though the bump fired.
+	step := func(name string, op func()) {
+		t.Helper()
+		time.Sleep(time.Microsecond)
+		before := s.lastWriteTS.Load()
+		op()
+		after := s.lastWriteTS.Load()
+		if after <= before {
+			t.Errorf("after %s: lastWriteTS=%d want > before=%d (path forgot to bump?)", name, after, before)
+		}
+	}
+
+	step("appendOne", func() {
+		if _, err := s.appendOne(Item{Scope: "a", ID: "1", Payload: json.RawMessage(`"v"`)}); err != nil {
+			t.Fatalf("appendOne: %v", err)
+		}
+	})
+	step("upsertOne replace", func() {
+		if _, _, err := s.upsertOne(Item{Scope: "a", ID: "1", Payload: json.RawMessage(`"v2"`)}); err != nil {
+			t.Fatalf("upsertOne replace: %v", err)
+		}
+	})
+	step("upsertOne create", func() {
+		if _, _, err := s.upsertOne(Item{Scope: "a", ID: "2", Payload: json.RawMessage(`"v"`)}); err != nil {
+			t.Fatalf("upsertOne create: %v", err)
+		}
+	})
+	step("counterAddOne create", func() {
+		if _, _, err := s.counterAddOne("a", "ctr", 5); err != nil {
+			t.Fatalf("counterAddOne create: %v", err)
+		}
+	})
+	step("counterAddOne increment", func() {
+		if _, _, err := s.counterAddOne("a", "ctr", 1); err != nil {
+			t.Fatalf("counterAddOne increment: %v", err)
+		}
+	})
+	step("updateOne", func() {
+		if _, err := s.updateOne(Item{Scope: "a", ID: "1", Payload: json.RawMessage(`"v3"`)}); err != nil {
+			t.Fatalf("updateOne: %v", err)
+		}
+	})
+	step("deleteOne", func() {
+		if _, err := s.deleteOne("a", "1", 0); err != nil {
+			t.Fatalf("deleteOne: %v", err)
+		}
+	})
+	// Build up some items in scope b for deleteUpTo.
+	for i := 0; i < 3; i++ {
+		if _, err := s.appendOne(Item{Scope: "b", Payload: json.RawMessage(`"v"`)}); err != nil {
+			t.Fatalf("appendOne b: %v", err)
+		}
+	}
+	step("deleteUpTo", func() {
+		if _, err := s.deleteUpTo("b", 2); err != nil {
+			t.Fatalf("deleteUpTo: %v", err)
+		}
+	})
+	step("deleteScope", func() {
+		if _, ok := s.deleteScope("b"); !ok {
+			t.Fatal("deleteScope: scope b missing")
+		}
+	})
+	step("replaceScopes (warm)", func() {
+		if _, err := s.replaceScopes(map[string][]Item{
+			"warmed": {{Scope: "warmed", Payload: json.RawMessage(`"v"`)}},
+		}); err != nil {
+			t.Fatalf("replaceScopes: %v", err)
+		}
+	})
+	step("rebuildAll", func() {
+		if _, _, err := s.rebuildAll(map[string][]Item{
+			"r": {{Scope: "r", Payload: json.RawMessage(`"v"`)}},
+		}); err != nil {
+			t.Fatalf("rebuildAll: %v", err)
+		}
+	})
+	step("wipe", func() {
+		_, _, _ = s.wipe()
+	})
+}
+
+// TestStore_LastWriteTS_MonotonicUnderRace verifies the CAS-max
+// guarantee: even under aggressive concurrent writers from many
+// scopes (whose individual time.Now().UnixMicro() readings can
+// land in the counter out of order), the store-wide counter only
+// ever advances. The post-condition is the simplest possible:
+// the final counter value equals the maximum of every per-write
+// timestamp the workers observed.
+func TestStore_LastWriteTS_MonotonicUnderRace(t *testing.T) {
+	const (
+		workers      = 16
+		opsPerWorker = 200
+	)
+	s := NewStore(Config{ScopeMaxItems: 1000, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	maxObserved := make([]int64, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(id int) {
+			defer wg.Done()
+			scope := fmt.Sprintf("race_%d", id)
+			for i := 0; i < opsPerWorker; i++ {
+				if _, err := s.appendOne(Item{
+					Scope:   scope,
+					Payload: json.RawMessage(`"v"`),
+				}); err != nil {
+					t.Errorf("worker %d op %d: %v", id, i, err)
+					return
+				}
+				if got := s.lastWriteTS.Load(); got > maxObserved[id] {
+					maxObserved[id] = got
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	final := s.lastWriteTS.Load()
+	for id, v := range maxObserved {
+		if final < v {
+			t.Errorf("final lastWriteTS=%d < worker[%d] max-observed=%d (CAS-max regressed)", final, id, v)
+		}
+	}
+	// Also assert >= max(buf.lastWriteTS) per the standard invariant.
+	assertStatsCountersInvariant(t, s, "after race workload")
 }

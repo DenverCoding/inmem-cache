@@ -268,26 +268,34 @@ call 'unknown route'                    404 GET    /nope
 call 'wrong method on /help'            405 POST   /help
 
 # --- /stats aggregate counters ------------------------------------------------
-# /stats is aggregate-only since the 100k-scope DoS observation: three
-# atomic counters (scope_count, total_items, approx_store_mb) plus the
-# static cap, no per-scope map. This block proves the three counters
-# stay in lockstep with the actual store contents across a deterministic
-# wipe → appends sequence:
+# /stats is aggregate-only since the 100k-scope DoS observation: four
+# atomic counters (scope_count, total_items, approx_store_mb,
+# last_write_ts) plus the static cap, no per-scope map. This block
+# proves the four counters stay in lockstep with the actual store
+# contents across a deterministic wipe → appends sequence:
 #
 #   - 5 appends to scope "stat_a" (no id, no upsert, no replace)
 #   - 3 appends to scope "stat_b" — 1 plain, 2 upserts on the same id so
 #     net items added = 2 (idempotency check).
 #
-# Expected post-state: scope_count=2, total_items=7, and approx_store_mb
-# strictly between 0 and the configured cap. A regression on any
-# write/delete path that forgets to update one of the atomics shows up
-# here as a clean numeric mismatch — no per-scope walk needed.
+# Expected post-state: scope_count=2, total_items=7, approx_store_mb
+# strictly between 0 and the configured cap, and last_write_ts strictly
+# greater than the value /wipe stamped (proving every subsequent write
+# advanced the freshness tick). A regression on any write/delete path
+# that forgets to update one of the atomics shows up here as a clean
+# numeric mismatch — no per-scope walk needed.
 say '== /stats aggregate counters =='
 call 'stats agg: wipe'                  200 POST   /wipe
 call 'stats agg: stats after wipe'      200 GET    /stats
 json_assert 'stats agg: scope_count == 0 after wipe' '.scope_count == 0'
 json_assert 'stats agg: total_items == 0 after wipe' '.total_items == 0'
 json_assert 'stats agg: approx_store_mb == 0 after wipe' '.approx_store_mb == 0'
+# /wipe is itself a state-changing event, so last_write_ts must be
+# strictly greater than 0 right after — even though scope_count is 0.
+# This is the contract that lets a polling client distinguish "cache
+# was wiped" from "cache was never written to" (the latter reports 0).
+json_assert 'stats agg: last_write_ts > 0 after wipe' '.last_write_ts > 0'
+LAST_WRITE_TS_AFTER_WIPE=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
 
 i=1; while [ $i -le 5 ]; do
     quiet_call "stats agg: append stat_a #$i" 200 POST /append \
@@ -309,6 +317,12 @@ json_assert 'stats agg: scope_count == 2' '.scope_count == 2'
 json_assert 'stats agg: total_items == 7' '.total_items == 7'
 json_assert 'stats agg: approx_store_mb > 0' '.approx_store_mb > 0'
 json_assert 'stats agg: approx_store_mb < max_store_mb' '.approx_store_mb < .max_store_mb'
+# last_write_ts must have strictly advanced past the post-wipe value —
+# every successful write/upsert above bumps the freshness tick via
+# CAS-max. This is the polling-pattern contract: clients refetching
+# only on tick-change are guaranteed to see every state mutation.
+json_assert 'stats agg: last_write_ts strictly advanced past wipe' \
+    ".last_write_ts > $LAST_WRITE_TS_AFTER_WIPE"
 # Regression guard: /stats must NOT carry per-scope detail (moved to
 # /scopelist). Re-introducing it would silently re-create the 100k-scope
 # DoS that motivated this strip.

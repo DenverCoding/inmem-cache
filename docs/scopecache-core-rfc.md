@@ -236,9 +236,9 @@ the (forthcoming) `*Direct` API.
 
 ### 2.5 Store-wide metadata
 
-Four store-wide counters are surfaced via the `/stats` endpoint
+Five store-wide fields are surfaced via the `/stats` endpoint
 (§6.5). Each is maintained incrementally on the write/delete/bulk
-paths so `/stats` can answer in O(1) — three atomic loads plus the
+paths so `/stats` can answer in O(1) — four atomic loads plus the
 static cap, independent of how many scopes the store holds.
 
 | field             | purpose                                                                  |
@@ -247,13 +247,24 @@ static cap, independent of how many scopes the store holds.
 | `total_items`     | Σ `len(scope.items)` across all live scopes (atomic; updated on every write/delete) |
 | `approx_store_mb` | running byte-budget reservation in MiB (atomic; updated on every write that reserves or releases bytes) |
 | `max_store_mb`    | configured store-wide byte cap in MiB (constant — `Config.MaxStoreBytes`) |
+| `last_write_ts`   | microsecond timestamp of the most recent state-changing event anywhere in the cache (atomic, monotonic via CAS-max). 0 means no writes since process start. Bumped by every per-scope `lastWriteTS` update plus the destructive store-level paths (`/delete_scope`, `/wipe`, `/rebuild`) that don't go through a per-scope bump. |
 
-The three atomics (`scope_count`, `total_items`, `approx_store_mb`)
-are loaded independently. Concurrent writes between the three loads
-can produce a snapshot where the fields reflect three slightly
-different instants; the `Σ scope.bytes == approx_store_mb` and `Σ
-len(scope.items) == total_items` invariants hold at quiesce, not at
-every observation. See §7.3.
+The four atomics (`scope_count`, `total_items`, `approx_store_mb`,
+`last_write_ts`) are loaded independently. Concurrent writes between
+the loads can produce a snapshot where the fields reflect slightly
+different instants; the `Σ scope.bytes == approx_store_mb`, `Σ
+len(scope.items) == total_items`, and `last_write_ts >= max(scope.lastWriteTS)`
+invariants hold at quiesce, not at every observation. See §7.3.
+
+**Polling pattern.** Clients that maintain a local view of cache
+state can compare `last_write_ts` against the value from their
+previous `/stats` call: if equal, nothing changed and the local view
+is still authoritative. Useful for hot dashboards and ETag-style
+cache validation that don't want to refetch state on every tick.
+The CAS-max update guarantees the counter only ever advances, so a
+strict `>` comparison is enough; concurrent writes from different
+scopes can't reorder the counter backwards even when their wall
+clocks advance out of order across CPUs.
 
 ---
 
@@ -1133,16 +1144,18 @@ None.
   "total_items": 5400,
   "approx_store_mb": 12.3456,
   "max_store_mb": 100.0,
+  "last_write_ts": 1700000000123456,
   "duration_us": 0
 }
 ```
 
 **Cost**
 
-`/stats` is **O(1)**: three atomic loads (`scope_count`, `total_items`,
-`approx_store_mb`) plus the static `max_store_mb`. Cost is independent
-of the number of scopes in the store. The three counters are
-maintained incrementally on every write/delete/bulk path.
+`/stats` is **O(1)**: four atomic loads (`scope_count`, `total_items`,
+`approx_store_mb`, `last_write_ts`) plus the static `max_store_mb`.
+Cost is independent of the number of scopes in the store. The four
+counters are maintained incrementally on every write/delete/bulk
+path. See §2.5 for the polling pattern that `last_write_ts` enables.
 
 The previous shape included a per-scope `scopes` map keyed by scope
 name. At 100k+ scopes that response routinely blew past practical
@@ -1164,7 +1177,7 @@ reasons (capacity-disclosure, side-channel timing); see §1.3.
 
 ```bash
 curl -s 'http://localhost:8080/stats'
-# → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"max_store_mb":100.0,"duration_us":0}
+# → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"max_store_mb":100.0,"last_write_ts":1700000000123456,"duration_us":0}
 ```
 
 ---

@@ -99,6 +99,51 @@ type Store struct {
 	// above.
 	totalItems atomic.Int64
 	scopeCount atomic.Int64
+
+	// lastWriteTS is a microsecond timestamp surfaced on /stats as the
+	// "freshness" signal: a single number a polling client can compare
+	// against its previous value to skip a refetch when nothing has
+	// changed. Updated via bumpLastWriteTS (CAS-max) from every place
+	// that bumps per-scope b.lastWriteTS, plus the store-level
+	// destructive paths (deleteScope, wipe, deleteGuardedTenant,
+	// rebuildAll) that don't go through a per-scope bump.
+	//
+	// CAS-max (rather than naive Store) is required: two writes in
+	// different scopes can compute time.Now().UnixMicro() out of order
+	// across CPUs, then a naive store could leave the counter at the
+	// older value, lying about freshness. The CAS loop guarantees the
+	// counter only ever advances.
+	//
+	// Default value is 0 (epoch start) — distinguishable from any real
+	// timestamp the cache would produce. Cleared back to 0 by /wipe
+	// only conceptually; in practice /wipe immediately bumps it to its
+	// own commit time so a client polling right after a wipe still
+	// sees a non-zero "something happened" tick.
+	lastWriteTS atomic.Int64
+}
+
+// bumpLastWriteTS advances s.lastWriteTS to nowUs if and only if
+// nowUs > current. Concurrent writers from different scopes can
+// compute time.Now().UnixMicro() out of order across CPUs; a naive
+// Store(nowUs) would let the older timestamp overwrite the newer
+// one and lie about freshness. The CAS loop guarantees monotonicity.
+//
+// Loop terminates in 1 iteration when uncontested, and in O(few)
+// iterations under contention because each retry re-loads a strictly
+// greater current value. No lock taken — safe to call from inside
+// b.mu critical sections (which is the common case: write paths
+// stamp b.lastWriteTS = ts under b.mu, then call this with the same
+// ts).
+func (s *Store) bumpLastWriteTS(nowUs int64) {
+	for {
+		cur := s.lastWriteTS.Load()
+		if nowUs <= cur {
+			return
+		}
+		if s.lastWriteTS.CompareAndSwap(cur, nowUs) {
+			return
+		}
+	}
 }
 
 func NewStore(c Config) *Store {
@@ -300,6 +345,15 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, boo
 	}
 	sh.scopes[scope] = preBuf
 	s.scopeCount.Add(1)
+	// Scope creation changes scope_count — a /stats field — so bump
+	// the freshness tick. Most callers immediately follow with a write
+	// that bumps again with a strictly later timestamp; the CAS-max
+	// makes the second bump a no-op or a tick advance, either way
+	// honest. The transient "scope created but item insert failed"
+	// rollback path leaves a one-tick blip that resolves by the next
+	// real write — harmless under the polling contract (clients see a
+	// tick, refetch, find nothing changed, move on).
+	s.bumpLastWriteTS(preBuf.lastWriteTS)
 	sh.mu.Unlock()
 	return preBuf, true, nil
 }
@@ -564,6 +618,9 @@ func (s *Store) ensureScope(scope string) *scopeBuffer {
 	buf = s.newscopeBuffer()
 	sh.scopes[scope] = buf
 	s.scopeCount.Add(1)
+	// Same reasoning as getOrCreateScopeTrackingCreated: scope_count
+	// just changed, so the freshness tick advances.
+	s.bumpLastWriteTS(buf.lastWriteTS)
 	return buf
 }
 
@@ -608,6 +665,7 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 	s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
 	s.totalItems.Add(-int64(itemCount))
 	s.scopeCount.Add(-1)
+	s.bumpLastWriteTS(nowUnixMicro())
 	buf.detached = true
 	buf.store = nil
 	buf.mu.Unlock()
@@ -630,6 +688,7 @@ type storeStats struct {
 	TotalItems    int
 	ApproxStoreMB MB
 	MaxStoreMB    MB
+	LastWriteTS   int64
 }
 
 // stats returns the store-wide aggregate snapshot in O(1) — three
@@ -651,6 +710,7 @@ func (s *Store) stats() storeStats {
 		TotalItems:    int(s.totalItems.Load()),
 		ApproxStoreMB: MB(s.totalBytes.Load()),
 		MaxStoreMB:    MB(s.maxStoreBytes),
+		LastWriteTS:   s.lastWriteTS.Load(),
 	}
 }
 

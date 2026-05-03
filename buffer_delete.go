@@ -55,11 +55,13 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	}
 
 	b.bytes -= removedSize
+	now := nowUnixMicro()
 	if b.store != nil {
 		b.store.totalBytes.Add(-removedSize)
 		b.store.totalItems.Add(-1)
+		b.store.bumpLastWriteTS(now)
 	}
-	b.lastWriteTS = nowUnixMicro()
+	b.lastWriteTS = now
 }
 
 func (b *scopeBuffer) deleteByID(id string) (int, error) {
@@ -149,10 +151,12 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 
 	b.bytes -= freedBytes
 	b.idKeyBytes -= freedIDKeyBytes
+	now := nowUnixMicro()
 	if b.store != nil {
 		b.store.totalBytes.Add(-freedBytes)
 		b.store.totalItems.Add(-int64(idx))
+		b.store.bumpLastWriteTS(now)
 	}
-	b.lastWriteTS = nowUnixMicro()
+	b.lastWriteTS = now
 	return idx, nil
 }

@@ -139,6 +139,7 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	now := time.Now().UnixMicro()
 	if b.store != nil {
 		b.store.totalBytes.Add(newBytes - b.bytes)
 		// itemDelta uses the CURRENT len(b.items) under b.mu, not a
@@ -149,6 +150,7 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 		// swap. No drift parameter needed (unlike newBytes - oldSnapshot
 		// for bytes, which is pre-reserved in the PreReserved variant).
 		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
+		b.store.bumpLastWriteTS(now)
 	}
 	b.bytes = newBytes
 	b.idKeyBytes = r.idKeyBytes
@@ -156,7 +158,7 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.byID = r.byID
 	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
-	b.lastWriteTS = time.Now().UnixMicro()
+	b.lastWriteTS = now
 }
 
 // commitReplacementPreReserved is the batch-aware commit used by
@@ -182,6 +184,7 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	now := time.Now().UnixMicro()
 	if b.store != nil {
 		drift := b.bytes - oldSnapshot
 		if drift != 0 {
@@ -192,6 +195,7 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 		// any stale-pointer concurrent /append's contribution. Same
 		// reasoning as commitReplacement above; see that comment.
 		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
+		b.store.bumpLastWriteTS(now)
 	}
 	b.bytes = newBytes
 	b.idKeyBytes = r.idKeyBytes
@@ -199,7 +203,7 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	b.byID = r.byID
 	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
-	b.lastWriteTS = time.Now().UnixMicro()
+	b.lastWriteTS = now
 }
 
 func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {

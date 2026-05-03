@@ -108,6 +108,7 @@ func (b *scopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error
 	b.bytes += size
 	if b.store != nil {
 		b.store.totalItems.Add(1)
+		b.store.bumpLastWriteTS(item.Ts)
 	}
 	b.lastWriteTS = item.Ts
 
