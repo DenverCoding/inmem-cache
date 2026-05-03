@@ -435,7 +435,7 @@ scopecache exposes the following endpoints, grouped by purpose:
 | §6.4 Reads                  | `/get`, `/render`, `/head`, `/tail`                         |
 | §6.5 Observability          | `/stats`, `/help`                                           |
 
-### Conventions used in this section
+### Endpoint conventions
 
 To keep per-endpoint sections compact, the following errors are
 implicit on every endpoint and are not repeated:
