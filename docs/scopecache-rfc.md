@@ -63,7 +63,37 @@ batch dispatch, write-only ingestion, operator-elevated dispatch,
 and eviction-hint queries. Their RFCs live alongside this one in
 `docs/`. Third-party addons follow the same pattern.
 
-### 1.4 Status
+### 1.4 Modular architecture
+
+scopecache works both as a **Caddy module** (TCP, mounted in a
+Caddyfile) and as a **standalone binary** (Unix domain socket,
+reachable via `curl --unix-socket` or any HTTP client in any
+language). Both adapters wrap the same core; the only difference is
+the transport.
+
+The core is the foundation: a small set of building blocks — the
+data model, the capacity rules, the address primitives, and the
+public Go API. Anything beyond that comes from **addons**: separate
+Go sub-packages built on top of the public Go API. Some addons ship
+with `scopecache` as part of the standard distribution
+(multi-tenant gateways, batch dispatch, write-only ingestion, …);
+anyone can build their own addons against the same public interface
+without touching the core.
+
+The result is a clean separation of concerns:
+
+- The core does one job — store and address items, enforce
+  capacity, expose the primitives — and stays small, fast, and
+  heavily tested.
+- Addons add request-context-aware behaviour (auth, tenants, batch
+  composition, custom ingestion shapes) without ever needing
+  privileged access to core internals.
+
+This separation is what allows the core to remain stable under
+heavy testing and benchmarking while addons can evolve, be added,
+or be removed without risk to the cache itself.
+
+### 1.5 Status
 
 Pre-v1.0. Core HTTP and Go API surfaces are subject to breaking
 change between minor versions. After v1.0 the core becomes
