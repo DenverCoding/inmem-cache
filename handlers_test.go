@@ -3236,6 +3236,13 @@ func TestEvents_AutoPopulate_DeleteScope(t *testing.T) {
 	if _, hasPayload := envelope["payload"]; hasPayload {
 		t.Errorf("delete_scope envelope must not carry payload; got %v", envelope["payload"])
 	}
+
+	// Post-state: the deleted scope's items must actually be gone.
+	// The closure refactor of deleteScope (so emit fires after unlock)
+	// is verified to still commit the delete itself.
+	if code, out, _ := doRequest(t, h, "GET", "/get?scope=posts&id=a", ""); code != 200 || mustBool(t, out, "hit") {
+		t.Errorf("/delete_scope under events_mode=full did not actually delete: posts/a still reachable, hit=%v", out["hit"])
+	}
 }
 
 // /wipe explicitly does NOT emit into _events (the wipe wipes _events
@@ -3280,6 +3287,26 @@ func TestEvents_AutoPopulate_WipeNoEmit(t *testing.T) {
 	if drops := api.store.eventsDropsTotal.Load(); drops != 0 {
 		t.Errorf("post-wipe: eventsDropsTotal=%d want 0 (no emit attempt should have happened)", drops)
 	}
+
+	// Post-state: every seeded user item must actually be gone — the
+	// no-emit decision should not weaken /wipe's destructive contract.
+	for i := 0; i < 3; i++ {
+		path := fmt.Sprintf("/get?scope=posts&id=p-%d", i)
+		if code, out, _ := doRequest(t, mux, "GET", path, ""); code != 200 || mustBool(t, out, "hit") {
+			t.Errorf("/wipe under events_mode=full did not actually wipe posts/p-%d, hit=%v", i, out["hit"])
+		}
+	}
+	// And /stats should agree: only the 2 reserved scopes remain.
+	code, out, _ := doRequest(t, mux, "GET", "/stats", "")
+	if code != 200 {
+		t.Fatalf("/stats: code=%d", code)
+	}
+	if scopeCount := mustFloat(t, out, "scope_count"); scopeCount != 2 {
+		t.Errorf("post-wipe scope_count=%v want 2 (only _events + _inbox)", scopeCount)
+	}
+	if totalItems := mustFloat(t, out, "total_items"); totalItems != 0 {
+		t.Errorf("post-wipe total_items=%v want 0", totalItems)
+	}
 }
 
 // /rebuild explicitly does NOT emit into _events — same rationale as
@@ -3320,6 +3347,13 @@ func TestEvents_AutoPopulate_RebuildNoEmit(t *testing.T) {
 	// committed; only the auto-populate skip is being verified.
 	if code, out, _ := doRequest(t, mux, "GET", "/get?scope=new&id=n-0", ""); code != 200 || !mustBool(t, out, "hit") {
 		t.Errorf("/rebuild did not commit: new/n-0 not reachable")
+	}
+	// And the OLD scope is fully gone — /rebuild is replace, not merge.
+	for i := 0; i < 2; i++ {
+		path := fmt.Sprintf("/get?scope=old&id=o-%d", i)
+		if code, out, _ := doRequest(t, mux, "GET", path, ""); code != 200 || mustBool(t, out, "hit") {
+			t.Errorf("/rebuild under events_mode=full left old/o-%d behind, hit=%v", i, out["hit"])
+		}
 	}
 }
 
