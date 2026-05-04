@@ -174,10 +174,9 @@ type store struct {
 	// subsMu + subscribers form the Subscribe primitive's per-scope
 	// subscription registry. See subscribe.go for the full lifecycle
 	// + lock-discipline contract. Subscribers are restricted to
-	// reserved scopes (decide-doc settled #2) and at most one per
-	// scope (settled #20). Lives at Store level — NOT on
-	// *scopeBuffer — so the subscription survives /wipe and /rebuild
-	// buffer churn transparently (settled #21).
+	// reserved scopes and at most one per scope (RFC §7.4.1). Lives
+	// at Store level — NOT on *scopeBuffer — so the subscription
+	// survives /wipe and /rebuild buffer churn transparently.
 	//
 	// Lock-discipline (also see subscribe.go file-level comment):
 	//   - notifySubscriber:       subsMu.RLock + non-blocking send + RUnlock

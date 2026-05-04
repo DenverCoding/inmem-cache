@@ -1818,9 +1818,8 @@ operators wire automatic drainers, write-event publishers, and
 similar reactive pipelines: `Gateway.Subscribe`. On top of that
 primitive the core ships one ready-to-deploy bridge,
 `Gateway.StartSubscriber`, which translates wake-ups from the
-primitive into invocations of an operator-supplied executable. Both
-are documented here; the long-form design discussion lives in
-[`subscribe-drain-decide.md`](subscribe-drain-decide.md).
+primitive into invocations of an operator-supplied executable.
+Both are documented here.
 
 #### 7.4.1 Subscribe primitive
 
@@ -1988,9 +1987,6 @@ durability burden is entirely on the sink side.
   end-to-end smoke test that boots the standalone binary with
   `subscriber_command` set, performs 10 writes, polls until
   `_events` is empty, and verifies the JSONL output shape.
-- Settled-decisions log:
-  [`docs/subscribe-drain-decide.md`](subscribe-drain-decide.md)
-  — design history, rejected alternatives, lock-discipline notes.
 
 ---
 

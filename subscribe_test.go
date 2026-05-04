@@ -56,7 +56,7 @@ func expectNoWakeup(t *testing.T, ch <-chan struct{}, quiet time.Duration, label
 
 // Subscribe to a non-reserved scope must reject — the cache's
 // observability story is "everything goes through _events", subscribing
-// directly to user scopes is not supported (decide-doc settled #2).
+// directly to user scopes is not supported (RFC §7.4.1).
 func TestSubscribe_RestrictedToReservedScopes(t *testing.T) {
 	s := newTestStoreForSubscribe(t)
 

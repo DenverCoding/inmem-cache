@@ -4,35 +4,36 @@ import (
 	"errors"
 )
 
-// Subscribe primitive — see docs/subscribe-drain-decide.md for the
-// full design discussion. In short: a Go-only, in-process mechanism
-// by which an addon (the "subscriber") gets coalesced wake-up signals
-// when items land in `_events` or `_inbox`. The subscriber drains the
-// scope via Tail + DeleteUpTo in its own loop; this file owns ONLY
-// the wake-up channel + lifecycle.
+// Subscribe primitive — operator-facing contract is documented in
+// docs/scopecache-core-rfc.md §7.4. In short: a Go-only, in-process
+// mechanism by which a subscriber gets coalesced wake-up signals
+// when items land in `_events` or `_inbox`. The subscriber drains
+// the scope via Tail + DeleteUpTo in its own loop; this file owns
+// ONLY the wake-up channel + lifecycle.
 //
-// Settled invariants (decide-doc decisions referenced inline):
+// Implementation invariants:
 //
-//   - #2  Restricted to reserved scopes (`_events`, `_inbox`); other
-//         scopes return ErrInvalidSubscribeScope. User-managed scopes
-//         are observable via `_events` auto-populate — that is why
-//         `_events` exists.
-//   - #20 Single subscriber per reserved scope; a second Subscribe
-//         to the same scope returns ErrAlreadySubscribed.
-//   - #21 Subscriber state at Store level keyed by scope name, NOT
-//         on `*scopeBuffer`. Survives /wipe and /rebuild buffer churn
-//         transparently — drainer doesn't reconnect across destructive
-//         ops; cursor-rewind detection on the next Tail is enough.
-//   - #1  Single-slot, size-1 buffered channel with non-blocking send
-//         + drop-on-full. 10k writes while subscriber is busy coalesce
-//         to one wake-up; subscriber re-Tails and processes the batch
-//         via cursor.
-//   - Q19 close-on-unsub with lock-discipline: unsub() takes subsMu
-//         .Lock, removes the map entry, then close(ch) — all under the
-//         same Lock. Notify takes subsMu.RLock through the select-send
-//         (microseconds, non-blocking). Send-on-closed-channel cannot
-//         happen because the channel is only closed AFTER the map entry
-//         is gone.
+//   - Restricted to reserved scopes (`_events`, `_inbox`); other
+//     scopes return ErrInvalidSubscribeScope. User-managed scopes
+//     are observable via `_events` auto-populate — that is why
+//     `_events` exists.
+//   - Single subscriber per reserved scope; a second Subscribe to
+//     the same scope returns ErrAlreadySubscribed. Multi-fan-out is
+//     the subscriber's job, not the cache's.
+//   - Subscriber state at Store level keyed by scope name, NOT on
+//     `*scopeBuffer`. Survives /wipe and /rebuild buffer churn
+//     transparently — drainer doesn't reconnect across destructive
+//     ops; cursor-rewind detection on the next Tail is enough.
+//   - Single-slot, size-1 buffered channel with non-blocking send +
+//     drop-on-full. 10k writes while subscriber is busy coalesce to
+//     one wake-up; subscriber re-Tails and processes the batch via
+//     cursor.
+//   - Close-on-unsub with lock-discipline: unsub() takes subsMu
+//     .Lock, removes the map entry, then close(ch) — all under the
+//     same Lock. Notify takes subsMu.RLock through the select-send
+//     (microseconds, non-blocking). Send-on-closed-channel cannot
+//     happen because the channel is only closed AFTER the map entry
+//     is gone.
 //
 // Lock-order:
 //
@@ -46,14 +47,13 @@ import (
 
 // ErrInvalidSubscribeScope is returned by Store.Subscribe when the
 // supplied scope is not one of the cache's reserved scope names
-// (`_events`, `_inbox`). See decide-doc settled #2.
+// (`_events`, `_inbox`).
 var ErrInvalidSubscribeScope = errors.New("scopecache: subscribe is restricted to reserved scopes")
 
 // ErrAlreadySubscribed is returned by Store.Subscribe when the
-// supplied scope already has an active subscriber. See decide-doc
-// settled #20: the cache rejects multi-subscriber fanout outright;
-// composing two sinks (e.g. JSONL + webhook) is the subscriber's
-// job, not the cache's.
+// supplied scope already has an active subscriber. The cache rejects
+// multi-subscriber fanout outright; composing two sinks (e.g. JSONL
+// + webhook) is the subscriber's job, not the cache's.
 var ErrAlreadySubscribed = errors.New("scopecache: scope already has an active subscriber")
 
 // subscriber is the per-scope subscription state held at Store level

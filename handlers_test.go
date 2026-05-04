@@ -2872,7 +2872,7 @@ func TestEvents_AutoPopulate_Full_Many(t *testing.T) {
 }
 
 // Recursion guard: an external /append directly to `_events`
-// (allowed but unusual per RFC §2.6 + decide-doc settled #15) must
+// (allowed but unusual per RFC §2.6) must
 // NOT trigger the auto-populate machinery to write a SECOND event
 // for "the cache observed the previous write to _events". Without
 // the guard the cache would loop, doubling _events on every
