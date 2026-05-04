@@ -3,6 +3,8 @@ package caddymodule
 import (
 	"strings"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 // validateConfig must reject negative integer directives. The standalone
@@ -58,6 +60,40 @@ func TestValidateConfig_AcceptsPositive(t *testing.T) {
 	if err := h.validateConfig(); err != nil {
 		t.Errorf("positive config rejected: %v", err)
 	}
+}
+
+// subscriber_command lands on the SubscriberCommand field as-is. We
+// do no path validation in the adapter — operators can deploy
+// executables after Caddy starts, and the in-core bridge logs
+// per-invocation if the file is missing. The test pins the parser
+// shape so a future refactor doesn't silently misroute the value to
+// a different field.
+func TestUnmarshalCaddyfile_SubscriberCommand(t *testing.T) {
+	t.Run("set", func(t *testing.T) {
+		input := `scopecache {
+			subscriber_command /usr/local/bin/drain.sh
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		if h.SubscriberCommand != "/usr/local/bin/drain.sh" {
+			t.Errorf("SubscriberCommand=%q, want /usr/local/bin/drain.sh", h.SubscriberCommand)
+		}
+	})
+
+	t.Run("unset defaults to empty", func(t *testing.T) {
+		input := `scopecache {
+			max_store_mb 100
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		if h.SubscriberCommand != "" {
+			t.Errorf("SubscriberCommand=%q, want empty when not set", h.SubscriberCommand)
+		}
+	})
 }
 
 // events_mode must accept "", "off", "notify", "full" and reject

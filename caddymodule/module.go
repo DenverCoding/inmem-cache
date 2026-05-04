@@ -56,9 +56,20 @@ type Handler struct {
 	// scope. Valid values: "off" (default), "notify" (events without
 	// payload), "full" (events with payload). Empty string = "off".
 	EventsMode string `json:"events_mode,omitempty"`
+	// SubscriberCommand is the absolute path to an executable invoked
+	// by the in-core subscriber bridge on every wake-up from the
+	// reserved scopes (`_events`, `_inbox`). Empty (default) = no
+	// subscriber spawned. Set = one subscriber goroutine per reserved
+	// scope, each invoking the command with SCOPECACHE_SCOPE set to
+	// `_events` or `_inbox` so a single command can branch on which
+	// scope fired. The "command" can be a shell script, a compiled
+	// binary, or anything else exec.Command can run. See
+	// scopecache.Gateway.StartSubscriber for the contract.
+	SubscriberCommand string `json:"subscriber_command,omitempty"`
 
-	api *scopecache.API
-	mux *http.ServeMux
+	api             *scopecache.API
+	mux             *http.ServeMux
+	stopSubscribers func()
 }
 
 // CaddyModule returns the Caddy module registration. The ID places this under
@@ -98,7 +109,50 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	h.api = scopecache.NewAPI(gw, scopecache.APIConfig{})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
+	h.stopSubscribers = startSubscribers(gw, h.SubscriberCommand)
 	return nil
+}
+
+// Cleanup is called by Caddy when the module is being torn down (config
+// reload, server shutdown). Stops any active subscriber goroutines so
+// in-flight script invocations can complete and the scope-subscription
+// slots release before Caddy spins up the next Handler instance.
+func (h *Handler) Cleanup() error {
+	if h.stopSubscribers != nil {
+		h.stopSubscribers()
+		h.stopSubscribers = nil
+	}
+	return nil
+}
+
+// startSubscribers wires the in-core subscriber bridge to both
+// reserved scopes when command is non-empty. Mirrors the
+// standalone-binary helper in cmd/scopecache/main.go: a half-wired
+// subscriber (e.g. _events succeeded, _inbox failed) is allowed; the
+// function logs to stderr and continues so a single misconfiguration
+// doesn't take the Caddy module offline. The returned stop func
+// tears down every successful subscribe in reverse order.
+func startSubscribers(gw *scopecache.Gateway, command string) func() {
+	if command == "" {
+		return func() {}
+	}
+	stops := []func(){}
+	for _, scope := range []string{scopecache.EventsScopeName, scopecache.InboxScopeName} {
+		stop, err := gw.StartSubscriber(scope, command)
+		if err != nil {
+			caddy.Log().Named("scopecache.subscriber").Sugar().Warnf(
+				"subscriber: failed to subscribe to %s: %v", scope, err)
+			continue
+		}
+		stops = append(stops, stop)
+	}
+	caddy.Log().Named("scopecache.subscriber").Sugar().Infof(
+		"subscriber: %d subscriber(s) active, command=%s", len(stops), command)
+	return func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
 }
 
 // ServeHTTP dispatches to the scopecache mux. Any path the mux does not
@@ -123,7 +177,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    max_item_mb         1
 //	    inbox_max_items     100000
 //	    inbox_max_item_kb   64
-//	    events_mode          off
+//	    events_mode         off
+//	    subscriber_command  /usr/local/bin/drain.sh
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -144,6 +199,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Err(err.Error())
 				}
 				h.EventsMode = value
+				continue
+			}
+			if key == "subscriber_command" {
+				h.SubscriberCommand = value
 				continue
 			}
 
@@ -218,6 +277,7 @@ func init() {
 var (
 	_ caddy.Module                = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
+	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )

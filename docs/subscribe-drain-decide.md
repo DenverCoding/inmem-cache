@@ -308,25 +308,35 @@ These should NOT need re-litigation in the implementation phase:
 
 21. **Subscribe state lives at Store level, not on `*scopeBuffer`.** Per-scope `subscriber` map keyed by scope name on `*Store`, guarded by `subsMu`. Survives buffer churn: when `/wipe` and `/rebuild` drop+recreate `_events` and `_inbox`, the subscriber slot stays attached and re-points at the freshly-recreated buffer transparently, so subscribers don't have to reconnect across destructive ops. Subscriber detects wipe/rebuild via cursor-rewind (`lastSeq` going backwards on the next Tail) and resets its own state — same shape as the no-emit decision for /wipe and /rebuild events.
 
-22. **Default subscriber is a standard add-on, always linked, activated via one config knob.** Decision flips the previous "subscriber is operator-built or chosen reference" framing: the cache repo ships a default subscriber as a sub-package alongside the core (per Phase C standard-add-on tier in CLAUDE.md). It is **always** part of the build — no "minimal build without subscriber" mode — but its **runtime activation** is gated by one boolean config knob:
+22. **Default subscriber bridge lives in the core, activated by a single non-empty config string.** Decision flips the earlier "subscriber is an addon" framing: the script-runner bridge is universal enough — every realistic deployment wants it — that it lives in `package scopecache` directly as `Gateway.StartSubscriber(scope, command)`. Stdlib-only (`os/exec`), zero new dependencies. Runtime activation is gated by one config knob:
 
-    - Standalone: `SCOPECACHE_SUBSCRIBER_ENABLED=true|false`
-    - Caddyfile: `subscriber_enabled true|false`
-    - Go API (Caddy module / standalone): `Subscriber.Enabled bool`
+    - Standalone: `SCOPECACHE_SUBSCRIBER_COMMAND=/path/to/executable`
+    - Caddyfile: `subscriber_command /path/to/executable`
+    - Go API (Caddy module / standalone): `SubscriberCommand string`
 
-    When `false`: the adapter does not spawn the subscriber goroutine at all. `_events` and `_inbox` still exist (settled #10) but accumulate without being consumed; if the operator never wires their own subscriber, those scopes will eventually approach the global cap. Pure cache-only mode — the operator opted out of the auto-pipeline.
+    When **empty** (default): the adapter does not spawn any subscriber goroutine. `_events` and `_inbox` still exist (settled #10) but accumulate without being consumed; if the operator never wires their own subscriber, those scopes will eventually approach the global cap. Pure cache-only mode — the operator opted out of the auto-pipeline.
 
-    When `true`: the adapter spawns the subscriber goroutine at boot via `store.Subscribe(EventsScopeName)` + `store.Subscribe(InboxScopeName)`, and the goroutine handles the wake-up loop, Tail batching, and DeleteUpTo cycle. `unsub()` is called automatically by the adapter at process shutdown / Caddy module Cleanup; operators never see it directly.
+    When **set to a path**: the adapter spawns one subscriber goroutine per reserved scope at boot (one for `_events`, one for `_inbox`), each subscribed via `gw.StartSubscriber(scope, command)`. Both goroutines invoke the same command; the command branches on the `SCOPECACHE_SCOPE` env var to know which scope fired. `stop()` is called automatically by the adapter at process shutdown / Caddy module Cleanup; operators never see it directly.
 
-    What the activated subscriber actually **does** with consumed items is a separate, narrow set of additional knobs that the subscriber addon owns (sink choice, batch size, coalesce delay, etc.) — not the cache's concern. Those knobs live in the subscriber sub-package's own config block, not on `Config` or `APIConfig`. Cache-side this distinction is enforced architecturally: the subscriber package imports `scopecache` (uses `Subscribe`/`Tail`/`DeleteUpTo`); `scopecache` does not import the subscriber package.
+    "Command," not "script": the bridge calls `exec.Command(path)`, which works for shell scripts, Python/PHP/Ruby with a shebang, and compiled binaries (Go, C, Rust, anything). Operators are not limited to interpreted scripts. The previous "two-knob" shape (`subscriber_enabled` + `subscriber_script` with a "cap-relief no-op" mode when only enabled was set) was collapsed: a non-empty path is the single, unambiguous activation signal. Operators who want pure cap-relief without action can point at `/bin/true`. **Implemented (in-core).**
 
-23. **Subscriber default behaviour: invoke an operator-supplied script per batch.** The default subscriber, when activated, reads its sink choice from a single additional config knob (`subscriber_script /path/to/script`) that points at an executable. On each wake-up: `Tail` a batch, marshal items to the script's stdin as JSONL, exec the script, wait for exit code, `DeleteUpTo` on success. This pushes every sink-specific concern (file format, DB driver, HTTP endpoint, retry policy, fsync semantics) into the operator's script — the subscriber package itself stays stdlib-only and sink-agnostic. When `subscriber_enabled=true` AND `subscriber_script` is unset: the subscriber runs but does nothing (silent no-op — Tail + DeleteUpTo without invoking anything, useful for pure cap-relief). Sink-specific Go-side subscribers (subscriber-jsonl, subscriber-mercure, subscriber-sqlite, etc.) are an open Phase C question — the script-runner default may make them unnecessary. **Detail-level decisions for step 7.**
+23. **Subscriber default behaviour: notification-only — command handles all I/O itself.** On every wake-up the subscriber goroutine invokes the command and waits for it to exit (blocking via `cmd.Run`). The command — not the bridge — is responsible for fetching items (`curl /tail`), processing them, and deleting them (`curl /delete_up_to`). The bridge never reads, marshals, or writes item data; it is purely a "wake up, run, wait" loop.
+
+    The single environment variable `SCOPECACHE_SCOPE` (value: `_events` or `_inbox`) is set per invocation so a single command can serve both reserved scopes. Everything else the command needs (cache socket path, HTTP base URL, auth) is the operator's responsibility — the cache does not know how the command reaches itself.
+
+    Why notification-only over the previously-considered "items via stdin" shape: zero data-format coupling between cache and command. The command uses already-documented HTTP endpoints (`/tail`, `/delete_up_to`); operators learn nothing new. The ~2 ms per-cycle cost of the extra HTTP roundtrips is rounding error compared to process-startup (~30-100 ms) and the operator-side coalesce-sleep that lives at the top of the command.
+
+    Coalescing delay is **not** a bridge-side knob: if the operator wants to dampen burst rate, the first line of their command is `sleep 0.5` (or whatever they choose). The single-slot wake-up channel handles the actual coalescing; the sleep just makes batches larger. Concurrency: one subscriber goroutine per scope, one command run at a time per scope, in strict order. Wake-ups arriving while a command is running coalesce into a single pending wake-up.
+
+    Sink-specific Go-side subscribers (a hypothetical Mercure publisher, SQLite sink, etc.) remain a Phase C question if anyone needs them — but the practical answer is that the command-runner makes most of them unnecessary: a 5-line shell command does what a Go-side JSONL writer would. **Implemented (in-core).**
 
 ### Auto-populate semantics (still open)
 
-- **Q3 — Drain coalescing delay.** Subscriber sleeps before tailing to
-  let bursts coalesce. Default 0.5 s? Hardcoded or per-subscriber-instance
-  config? Per-scope config (different cadence for `_events` vs `_inbox`)?
+- ~~**Q3 — Drain coalescing delay.**~~ **Resolved by settled #23**: the
+  subscriber addon does no sleeping. If the operator wants to dampen
+  burst rate, they put `sleep 0.5` (or any other value) at the top of
+  their script. No subscriber-side knob; per-deployment tuning lives
+  in the operator's script.
 
 - **Event-emit ordering.** Decided: capture-under-lock, emit-outside-lock
   (option 1 of three considered). Same pattern as Subscribe's wake-up
