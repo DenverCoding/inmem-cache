@@ -170,6 +170,22 @@ type Store struct {
 	// own commit time so a client polling right after a wipe still
 	// sees a non-zero "something happened" tick.
 	lastWriteTS atomic.Int64
+
+	// subsMu + subscribers form the Subscribe primitive's per-scope
+	// subscription registry. See subscribe.go for the full lifecycle
+	// + lock-discipline contract. Subscribers are restricted to
+	// reserved scopes (decide-doc settled #2) and at most one per
+	// scope (settled #20). Lives at Store level — NOT on
+	// *scopeBuffer — so the subscription survives /wipe and /rebuild
+	// buffer churn transparently (settled #21).
+	//
+	// Lock-discipline (also see subscribe.go file-level comment):
+	//   - notifySubscriber:       subsMu.RLock + non-blocking send + RUnlock
+	//   - Subscribe / unsubscribe: subsMu.Lock + mutate map + Unlock
+	//   - notify is called AFTER buf.mu is released, so subsMu and
+	//     b.mu never nest in either order.
+	subsMu      sync.RWMutex
+	subscribers map[string]*subscriber
 }
 
 // bumpLastWriteTS advances s.lastWriteTS to nowUs if and only if
@@ -352,6 +368,7 @@ func NewStore(c Config) *Store {
 		inboxMaxItems:      c.Inbox.MaxItems,
 		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
 		eventsMode:         c.Events.Mode,
+		subscribers:        make(map[string]*subscriber),
 	}
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
@@ -630,7 +647,17 @@ func (s *Store) appendOne(item Item) (Item, error) {
 		}
 		return result, appendErr
 	}
+	// Order: emit FIRST (recurses into appendOne(_events) which itself
+	// fires notifySubscriber(_events) at the bottom of its own frame),
+	// THEN notify on the SCOPE we just wrote. For user-scope writes,
+	// the outer notify is a no-op (no subscriber on user scopes per
+	// settled #2); for /append directly to _events or _inbox the
+	// outer notify is what wakes the drainer. Single notify-call site
+	// in the cache — every write that targets _events or _inbox routes
+	// through this method (validator rejects /upsert /update /counter_add
+	// on reserved scopes per RFC §2.6).
 	s.emitAppendEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
+	s.notifySubscriber(result.Scope)
 	return result, nil
 }
 
