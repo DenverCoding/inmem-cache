@@ -3126,6 +3126,203 @@ func TestEvents_AutoPopulate_HighVolume_AppendThenDelete(t *testing.T) {
 	}
 }
 
+// /warm auto-populate: envelope is exactly {op:"warm", ts:N} — no
+// scope list, no item count. Drainers needing the warmed-scope
+// list /scopelist after waking up; the event is just a "large-
+// scale change happened, reconcile" pulse. Tests both the bare-
+// envelope shape AND that the action committed (the warmed scope's
+// items are reachable post-emit).
+func TestEvents_AutoPopulate_Warm(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	body := `{"items":[` +
+		`{"scope":"posts","id":"a","payload":{"v":1}},` +
+		`{"scope":"posts","id":"b","payload":{"v":2}}` +
+		`]}`
+	if code, _, raw := doRequest(t, h, "POST", "/warm", body); code != 200 {
+		t.Fatalf("/warm: code=%d body=%s", code, raw)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 1 {
+		t.Fatalf("warm auto-populate: _events count=%d want 1", count)
+	}
+	envelope, ok := items[0]["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("envelope payload not an object: %v", items[0]["payload"])
+	}
+	if envelope["op"] != "warm" {
+		t.Errorf("op=%v want warm", envelope["op"])
+	}
+	if _, hasScope := envelope["scope"]; hasScope {
+		t.Errorf("warm envelope must not carry scope (omitempty); got %v", envelope["scope"])
+	}
+	if _, hasID := envelope["id"]; hasID {
+		t.Errorf("warm envelope must not carry id; got %v", envelope["id"])
+	}
+	if _, hasSeq := envelope["seq"]; hasSeq {
+		t.Errorf("warm envelope must not carry seq; got %v", envelope["seq"])
+	}
+	if _, hasPayload := envelope["payload"]; hasPayload {
+		t.Errorf("warm envelope must not carry payload; got %v", envelope["payload"])
+	}
+	if ts, ok := envelope["ts"].(float64); !ok || ts <= 0 {
+		t.Errorf("warm envelope must carry positive ts; got %v", envelope["ts"])
+	}
+
+	// Sanity: the warmed items are actually present.
+	code, out, _ := doRequest(t, h, "GET", "/get?scope=posts&id=a", "")
+	if code != 200 || !mustBool(t, out, "hit") {
+		t.Errorf("/warm did not commit: posts/a not reachable")
+	}
+}
+
+// /delete_scope auto-populate: envelope is {op:"delete_scope", scope:X,
+// ts:N}. Tests the success path AND that emit is gated on the actual
+// deletion (calling /delete_scope on a non-existent scope must NOT emit).
+func TestEvents_AutoPopulate_DeleteScope(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Seed one scope so we can delete it (and one prior /append event).
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("seed /append: code=%d body=%s", code, raw)
+	}
+	baseline, _ := eventsTailCount(t, h)
+	if baseline != 1 {
+		t.Fatalf("after seed: _events count=%d want 1", baseline)
+	}
+
+	// Hit: delete the scope we just created.
+	if code, _, raw := doRequest(t, h, "POST", "/delete_scope",
+		`{"scope":"posts"}`); code != 200 {
+		t.Fatalf("/delete_scope hit: code=%d body=%s", code, raw)
+	}
+
+	// No-op: deleting a scope that doesn't exist must NOT emit.
+	if code, _, _ := doRequest(t, h, "POST", "/delete_scope",
+		`{"scope":"nope"}`); code != 200 {
+		t.Fatalf("/delete_scope miss: code=%d want 200", code)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 2 { // 1 seed-append + 1 delete_scope (miss skipped)
+		t.Fatalf("after delete_scope: _events count=%d want 2 (1 seed + 1 hit, miss must not emit)", count)
+	}
+
+	envelope, _ := items[1]["payload"].(map[string]interface{})
+	if envelope["op"] != "delete_scope" {
+		t.Errorf("op=%v want delete_scope", envelope["op"])
+	}
+	if envelope["scope"] != "posts" {
+		t.Errorf("scope=%v want posts", envelope["scope"])
+	}
+	if ts, ok := envelope["ts"].(float64); !ok || ts <= 0 {
+		t.Errorf("delete_scope envelope must carry positive ts; got %v", envelope["ts"])
+	}
+	if _, hasID := envelope["id"]; hasID {
+		t.Errorf("delete_scope envelope must not carry id; got %v", envelope["id"])
+	}
+	if _, hasPayload := envelope["payload"]; hasPayload {
+		t.Errorf("delete_scope envelope must not carry payload; got %v", envelope["payload"])
+	}
+}
+
+// /wipe explicitly does NOT emit into _events (the wipe wipes _events
+// itself, so any event written would either land in the about-to-be-
+// wiped buffer or paradoxically as seq=1 in the freshly-recreated
+// buffer). Drainers detect wipe via _events.lastSeq going backwards.
+//
+// Test verifies: events_mode=full, several /append events accumulate,
+// /wipe runs successfully, _events is empty post-wipe (no wipe-event
+// snuck in). Also verifies eventsDropsTotal stays 0 (the wipe didn't
+// trigger an emit-attempt that got dropped).
+func TestEvents_AutoPopulate_WipeNoEmit(t *testing.T) {
+	cfg := Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	}
+	api := NewAPI(NewStore(cfg), APIConfig{})
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	for i := 0; i < 3; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","id":"p-%d","payload":{"v":%d}}`, i, i)
+		if code, _, raw := doRequest(t, mux, "POST", "/append", body); code != 200 {
+			t.Fatalf("seed /append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+	pre, _ := eventsTailCount(t, mux)
+	if pre != 3 {
+		t.Fatalf("pre-wipe: _events count=%d want 3", pre)
+	}
+
+	if code, _, raw := doRequest(t, mux, "POST", "/wipe", ""); code != 200 {
+		t.Fatalf("/wipe: code=%d body=%s", code, raw)
+	}
+
+	post, _ := eventsTailCount(t, mux)
+	if post != 0 {
+		t.Errorf("post-wipe: _events count=%d want 0 (wipe must NOT emit)", post)
+	}
+	if drops := api.store.eventsDropsTotal.Load(); drops != 0 {
+		t.Errorf("post-wipe: eventsDropsTotal=%d want 0 (no emit attempt should have happened)", drops)
+	}
+}
+
+// /rebuild explicitly does NOT emit into _events — same rationale as
+// /wipe (rebuild drops + recreates _events). Test verifies the negative.
+func TestEvents_AutoPopulate_RebuildNoEmit(t *testing.T) {
+	cfg := Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	}
+	api := NewAPI(NewStore(cfg), APIConfig{})
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// Seed 2 events from /append.
+	for i := 0; i < 2; i++ {
+		body := fmt.Sprintf(`{"scope":"old","id":"o-%d","payload":{"v":%d}}`, i, i)
+		if code, _, raw := doRequest(t, mux, "POST", "/append", body); code != 200 {
+			t.Fatalf("seed /append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	rebuildBody := `{"items":[{"scope":"new","id":"n-0","payload":{"v":42}}]}`
+	if code, _, raw := doRequest(t, mux, "POST", "/rebuild", rebuildBody); code != 200 {
+		t.Fatalf("/rebuild: code=%d body=%s", code, raw)
+	}
+
+	post, _ := eventsTailCount(t, mux)
+	if post != 0 {
+		t.Errorf("post-rebuild: _events count=%d want 0 (rebuild must NOT emit)", post)
+	}
+	if drops := api.store.eventsDropsTotal.Load(); drops != 0 {
+		t.Errorf("post-rebuild: eventsDropsTotal=%d want 0", drops)
+	}
+
+	// The rebuilt scope's data IS reachable — confirms rebuild itself
+	// committed; only the auto-populate skip is being verified.
+	if code, out, _ := doRequest(t, mux, "GET", "/get?scope=new&id=n-0", ""); code != 200 || !mustBool(t, out, "hit") {
+		t.Errorf("/rebuild did not commit: new/n-0 not reachable")
+	}
+}
+
 // /delete_up_to auto-populate: envelope carries scope + max_seq.
 // Hit emits one event; a no-op cursor (max_seq below any stored item)
 // does NOT emit.

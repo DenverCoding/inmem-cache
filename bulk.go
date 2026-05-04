@@ -76,6 +76,13 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 //
 // The caller — the /wipe handler — surfaces (scopeCount, totalItems, freedBytes)
 // in the response so a client can verify how much state the call released.
+//
+// /wipe deliberately emits NO entry into `_events`: the wipe obliterates
+// `_events` itself as part of its work (initReservedScopesLocked recreates
+// it as a fresh empty scope at the end), so an event written here would
+// either land in the about-to-be-wiped old buffer or paradoxically as
+// seq=1 in the freshly-recreated buffer. Drainers detect wipe via
+// `_events.lastSeq < lastSeenSeq` (cursor-rewind) and reset their state.
 func (s *Store) wipe() (int, int, int64) {
 	s.lockAllShards()
 	defer s.unlockAllShards()
@@ -182,72 +189,98 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 	// still proceed via getOrCreateScope: they take buf.mu, not the shard
 	// lock, after a brief sh.mu.RLock for the lookup — and our shard write
 	// lock blocks even that RLock until the batch is committed.
-	scopeNames := make([]string, len(plans))
-	for i, p := range plans {
-		scopeNames[i] = p.scope
-	}
-	shards := s.shardsForScopes(scopeNames)
-	lockShards(shards)
-	defer unlockShards(shards)
-
-	// Phase 1.5 — snapshot per-scope b.bytes (under each scope's RLock so
-	// concurrent in-scope writers are observed consistently), compute the
-	// net batch delta, and CAS-reserve it against the store counter.
-	// Per-scope overhead is reserved here for plans that create a NEW
-	// scope (one not yet in its shard); existing scopes already have
-	// their overhead charged from when they were first allocated.
-	var totalDelta int64
-	for i := range plans {
-		sh := s.shardFor(plans[i].scope)
-		var old int64
-		if buf, ok := sh.scopes[plans[i].scope]; ok {
-			buf.mu.RLock()
-			old = buf.bytes
-			buf.mu.RUnlock()
-		} else {
-			// New scope — Phase 2 will create it. Reserve the
-			// per-scope overhead now so the cap check sees it.
-			totalDelta += scopeBufferOverhead
-		}
-		plans[i].oldBytes = old
-		totalDelta += plans[i].newBytes - old
-	}
-	if ok, current, max := s.reserveBytes(totalDelta); !ok {
-		return 0, &StoreFullError{
-			StoreBytes: current,
-			AddedBytes: totalDelta,
-			Cap:        max,
-		}
-	}
-
-	// Phase 2 — create-on-demand and commit. We hold every relevant shard
-	// in write mode so we can touch shard.scopes directly (calling
-	// getOrCreateScope here would deadlock on its internal RLock/Lock
-	// pair against our held write lock). Neither step can fail, so either
-	// every scope is replaced or (if an earlier phase aborted) none are.
 	//
-	// scopeCount delta accumulates here for new-scope inserts and is
-	// applied once at the end. totalItems is handled by
-	// commitReplacementPreReserved itself (it computes the per-scope
-	// item delta under b.mu against the post-drift len(b.items)).
-	var newScopes int64
-	for _, p := range plans {
-		sh := s.shardFor(p.scope)
-		buf, ok := sh.scopes[p.scope]
-		if !ok {
-			buf = s.newscopeBuffer()
-			sh.scopes[p.scope] = buf
-			newScopes++
+	// The locked phase is wrapped in an inline closure so `defer
+	// unlockShards(shards)` fires before emitWarmEvent below — the emit
+	// recurses into appendOne(_events) which acquires the _events shard's
+	// lock, and that shard might be among the ones we hold here. Without
+	// the closure the emit-while-locked path would deadlock.
+	n, err := func() (int, error) {
+		scopeNames := make([]string, len(plans))
+		for i, p := range plans {
+			scopeNames[i] = p.scope
 		}
-		buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
-	}
-	if newScopes > 0 {
-		s.scopeCount.Add(newScopes)
-	}
+		shards := s.shardsForScopes(scopeNames)
+		lockShards(shards)
+		defer unlockShards(shards)
 
-	return len(plans), nil
+		// Phase 1.5 — snapshot per-scope b.bytes (under each scope's RLock
+		// so concurrent in-scope writers are observed consistently),
+		// compute the net batch delta, and CAS-reserve it against the
+		// store counter. Per-scope overhead is reserved here for plans
+		// that create a NEW scope (one not yet in its shard); existing
+		// scopes already have their overhead charged from when they were
+		// first allocated.
+		var totalDelta int64
+		for i := range plans {
+			sh := s.shardFor(plans[i].scope)
+			var old int64
+			if buf, ok := sh.scopes[plans[i].scope]; ok {
+				buf.mu.RLock()
+				old = buf.bytes
+				buf.mu.RUnlock()
+			} else {
+				// New scope — Phase 2 will create it. Reserve the
+				// per-scope overhead now so the cap check sees it.
+				totalDelta += scopeBufferOverhead
+			}
+			plans[i].oldBytes = old
+			totalDelta += plans[i].newBytes - old
+		}
+		if ok, current, max := s.reserveBytes(totalDelta); !ok {
+			return 0, &StoreFullError{
+				StoreBytes: current,
+				AddedBytes: totalDelta,
+				Cap:        max,
+			}
+		}
+
+		// Phase 2 — create-on-demand and commit. We hold every relevant
+		// shard in write mode so we can touch shard.scopes directly
+		// (calling getOrCreateScope here would deadlock on its internal
+		// RLock/Lock pair against our held write lock). Neither step can
+		// fail, so either every scope is replaced or (if an earlier phase
+		// aborted) none are.
+		//
+		// scopeCount delta accumulates here for new-scope inserts and is
+		// applied once at the end. totalItems is handled by
+		// commitReplacementPreReserved itself (it computes the per-scope
+		// item delta under b.mu against the post-drift len(b.items)).
+		var newScopes int64
+		for _, p := range plans {
+			sh := s.shardFor(p.scope)
+			buf, ok := sh.scopes[p.scope]
+			if !ok {
+				buf = s.newscopeBuffer()
+				sh.scopes[p.scope] = buf
+				newScopes++
+			}
+			buf.commitReplacementPreReserved(p.replacement, p.newBytes, p.oldBytes)
+		}
+		if newScopes > 0 {
+			s.scopeCount.Add(newScopes)
+		}
+
+		return len(plans), nil
+	}()
+	if err != nil {
+		return n, err
+	}
+	s.emitWarmEvent()
+	return n, nil
 }
 
+// rebuildAll replaces every scope in the store with the supplied input.
+// Same lock discipline as wipe (every shard write-locked in ascending
+// order); same reservation invariants for `_events` and `_inbox` (re-
+// created at the end via initReservedScopesLocked).
+//
+// /rebuild deliberately emits NO entry into `_events`: like /wipe, the
+// rebuild path drops the existing `_events` and recreates it fresh, so
+// any event written here would either land in the about-to-be-wiped old
+// buffer or paradoxically as seq=1 in the freshly-recreated buffer.
+// Drainers detect rebuild via `_events.lastSeq < lastSeenSeq` (cursor-
+// rewind) and reset their state — same shape as /wipe.
 func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// Phase 1 — build every scope buffer off-map and distribute directly
 	// into the per-shard maps that Phase 2 will swap in. If any scope

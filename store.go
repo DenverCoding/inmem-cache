@@ -906,37 +906,51 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 		return 0, false
 	}
 
-	sh := s.shardFor(scope)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	// The locked phase is wrapped in an inline closure so `defer
+	// sh.mu.Unlock()` fires before emitDeleteScopeEvent below — emit
+	// recurses into appendOne(_events) which acquires the _events
+	// shard's lock, and that shard might be the very one we just
+	// released. Without the closure the emit-while-locked path would
+	// either deadlock (when the deleted scope and `_events` hash to
+	// the same shard) or live-lock under heavy /delete_scope traffic.
+	itemCount, ok := func() (int, bool) {
+		sh := s.shardFor(scope)
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
 
-	buf, ok := sh.scopes[scope]
+		buf, ok := sh.scopes[scope]
+		if !ok {
+			return 0, false
+		}
+
+		// Hold buf.mu as a write lock across the whole sequence so an in-flight
+		// mutator on this buf (via a stale pointer obtained before we ran) either
+		// completes before we touch the counter or waits until after we're done.
+		// Crucially we also detach the buffer: any write that wakes up afterwards
+		// returns *ScopeDetachedError instead of silently writing into an orphan
+		// that is unreachable and about to be GC'd. store is cleared too so any
+		// remaining code path that survives the detach check still skips
+		// store-counter accounting.
+		buf.mu.Lock()
+		itemCount := len(buf.items)
+		scopeBytes := buf.bytes
+		delete(sh.scopes, scope)
+		// Release item bytes AND the per-scope overhead reserved at create
+		// time. Combined into one Add so observers never see a transient
+		// state with one released and the other still charged.
+		s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
+		s.totalItems.Add(-int64(itemCount))
+		s.scopeCount.Add(-1)
+		s.bumpLastWriteTS(nowUnixMicro())
+		buf.detached = true
+		buf.store = nil
+		buf.mu.Unlock()
+		return itemCount, true
+	}()
 	if !ok {
-		return 0, false
+		return itemCount, false
 	}
-
-	// Hold buf.mu as a write lock across the whole sequence so an in-flight
-	// mutator on this buf (via a stale pointer obtained before we ran) either
-	// completes before we touch the counter or waits until after we're done.
-	// Crucially we also detach the buffer: any write that wakes up afterwards
-	// returns *ScopeDetachedError instead of silently writing into an orphan
-	// that is unreachable and about to be GC'd. store is cleared too so any
-	// remaining code path that survives the detach check still skips
-	// store-counter accounting.
-	buf.mu.Lock()
-	itemCount := len(buf.items)
-	scopeBytes := buf.bytes
-	delete(sh.scopes, scope)
-	// Release item bytes AND the per-scope overhead reserved at create
-	// time. Combined into one Add so observers never see a transient
-	// state with one released and the other still charged.
-	s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
-	s.totalItems.Add(-int64(itemCount))
-	s.scopeCount.Add(-1)
-	s.bumpLastWriteTS(nowUnixMicro())
-	buf.detached = true
-	buf.store = nil
-	buf.mu.Unlock()
+	s.emitDeleteScopeEvent(scope)
 	return itemCount, true
 }
 

@@ -58,19 +58,30 @@ import "encoding/json"
 //	counter_add  — scope, id, by                (no payload, no ts)
 //	delete       — scope, id|seq                (no payload, no ts)
 //	delete_up_to — scope, max_seq               (no id, no per-item seq, no payload, no ts)
+//	warm         — ts                           (no scope: /warm replaces multiple scopes;
+//	                                             list omitted to avoid wire bloat)
+//	delete_scope — scope, ts                    (the scope being deleted)
+//
+// Notably absent: /wipe and /rebuild. Both ops obliterate `_events`
+// itself as part of their work (the cache is reset to its boot
+// configuration including a fresh empty `_events`), so emitting an
+// event INTO the very scope being wiped is paradoxical. Drainers
+// detect wipe/rebuild via cursor-rewind (`_events.lastSeq` <
+// `lastSeenSeq`) and reset their state accordingly.
 //
 // Optional fields use `omitempty`: a zero Seq is absent (so /update
 // by-id and /delete by-id envelopes don't carry seq:0), a nil Payload
-// is absent (Notify mode strips it), a zero Ts is absent. By is
-// *int64 so by:0 is representable (a literal "increment-by-zero"
-// action) while leaving the field absent for non-counter ops. MaxSeq
-// is uint64 with omitempty — collisions with a literal max_seq=0
-// don't matter because /delete_up_to with max_seq=0 is a no-op
-// (nothing has seq <= 0 since assignments start at 1) and we skip
-// emitting on count=0 anyway.
+// is absent (Notify mode strips it), a zero Ts is absent, a zero-
+// length Scope is absent (so /warm envelope is exactly {op, ts}).
+// By is *int64 so by:0 is representable (a literal "increment-by-
+// zero" action) while leaving the field absent for non-counter ops.
+// MaxSeq is uint64 with omitempty — collisions with a literal
+// max_seq=0 don't matter because /delete_up_to with max_seq=0 is a
+// no-op (nothing has seq <= 0 since assignments start at 1) and we
+// skip emitting on count=0 anyway.
 type writeEvent struct {
 	Op      string          `json:"op"`
-	Scope   string          `json:"scope"`
+	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
 	Seq     uint64          `json:"seq,omitempty"`
 	Ts      int64           `json:"ts,omitempty"`
@@ -221,5 +232,40 @@ func (s *Store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
 	}
 	s.emitEvent(writeEvent{
 		Op: "delete_up_to", Scope: scope, MaxSeq: maxSeq,
+	})
+}
+
+// emitWarmEvent fires after a successful /warm (Store.replaceScopes).
+// Envelope is exactly {op: "warm", ts: nowUs} — no scope list (would
+// bloat the wire on big batches), no item count (a result, not an
+// action input). Drainers needing the list of warmed scopes can
+// /scopelist after waking up; the event is just a "something
+// large-scale happened, you should reconcile" pulse.
+//
+// No eventsEnabled scope check — /warm rejects reserved scopes at the
+// validator (see replaceScopes), so the recursion guard is never
+// reachable. Direct mode-check is enough.
+func (s *Store) emitWarmEvent() {
+	if s.eventsMode == EventsModeOff {
+		return
+	}
+	s.emitEvent(writeEvent{Op: "warm", Ts: nowUnixMicro()})
+}
+
+// emitDeleteScopeEvent fires after a successful /delete_scope on a
+// non-empty user scope. Envelope: {op: "delete_scope", scope: X, ts:
+// nowUs}. The eventsEnabled check is academic here (the validator
+// rejects reserved scopes from /delete_scope upstream) but kept for
+// uniformity with the per-op helpers above.
+//
+// /delete_scope on a missing scope is a no-op; caller (Store.deleteScope)
+// gates the emit on the success bool, so empty/non-existent scopes
+// never reach this helper.
+func (s *Store) emitDeleteScopeEvent(scope string) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
+	s.emitEvent(writeEvent{
+		Op: "delete_scope", Scope: scope, Ts: nowUnixMicro(),
 	})
 }
