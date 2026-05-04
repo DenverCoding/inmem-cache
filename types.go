@@ -115,19 +115,19 @@ type Config struct {
 	Inbox  InboxConfig
 }
 
-// EventMode controls whether the cache auto-populates the reserved
+// EventsMode controls whether the cache auto-populates the reserved
 // `_events` scope on every successful mutation, and how much each
 // event entry contains.
 //
-//   - EventModeOff      — auto-populate disabled. Zero overhead on
+//   - EventsModeOff      — auto-populate disabled. Zero overhead on
 //     the write path; default. Operators opt in
 //     when they have a drainer ready.
-//   - EventModeNotify   — every committed mutation produces a metadata
+//   - EventsModeNotify   — every committed mutation produces a metadata
 //     event (op, scope, id?, seq, ts) with NO
 //     payload. Smallest log entries; sufficient
 //     for drainers that re-fetch from cache state
 //     on wake-up.
-//   - EventModeFull     — every committed mutation produces a full
+//   - EventsModeFull     — every committed mutation produces a full
 //     event including the action-payload. Largest
 //     log entries; sufficient for drainers that
 //     replicate state without re-querying.
@@ -137,60 +137,60 @@ type Config struct {
 // cache logs what was REQUESTED, not what was COMPUTED. This makes
 // the event stream replay-able and matches the WAL discipline most
 // downstream sinks expect.
-type EventMode int
+type EventsMode int
 
 const (
-	EventModeOff    EventMode = iota // 0 — default; no auto-populate
-	EventModeNotify                  // 1 — events without payload
-	EventModeFull                    // 2 — events with payload
+	EventsModeOff    EventsMode = iota // 0 — default; no auto-populate
+	EventsModeNotify                   // 1 — events without payload
+	EventsModeFull                     // 2 — events with payload
 )
 
 // String returns the canonical lowercase string form of m, matching
-// the values accepted by SCOPECACHE_EVENT_MODE / Caddyfile event_mode.
+// the values accepted by SCOPECACHE_EVENTS_MODE / Caddyfile events_mode.
 // Unknown values render as "unknown(N)" so a forgotten new mode is
 // visible in /help and stats output rather than silently rendering
 // as "off".
-func (m EventMode) String() string {
+func (m EventsMode) String() string {
 	switch m {
-	case EventModeOff:
+	case EventsModeOff:
 		return "off"
-	case EventModeNotify:
+	case EventsModeNotify:
 		return "notify"
-	case EventModeFull:
+	case EventsModeFull:
 		return "full"
 	default:
 		return "unknown"
 	}
 }
 
-// ParseEventMode parses the string form (off / notify / full) into
-// the typed enum. The empty string maps to EventModeOff so adapter
+// ParseEventsMode parses the string form (off / notify / full) into
+// the typed enum. The empty string maps to EventsModeOff so adapter
 // code can pass through "unset" without special-casing. Used by
-// SCOPECACHE_EVENT_MODE parsing in cmd/scopecache and by the Caddy
-// module's event_mode directive.
-func ParseEventMode(s string) (EventMode, error) {
+// SCOPECACHE_EVENTS_MODE parsing in cmd/scopecache and by the Caddy
+// module's events_mode directive.
+func ParseEventsMode(s string) (EventsMode, error) {
 	switch s {
 	case "", "off":
-		return EventModeOff, nil
+		return EventsModeOff, nil
 	case "notify":
-		return EventModeNotify, nil
+		return EventsModeNotify, nil
 	case "full":
-		return EventModeFull, nil
+		return EventsModeFull, nil
 	default:
-		return EventModeOff, fmt.Errorf("invalid event_mode %q (expected: off | notify | full)", s)
+		return EventsModeOff, fmt.Errorf("invalid events_mode %q (expected: off | notify | full)", s)
 	}
 }
 
 // EventsConfig holds reserved-scope settings for `_events`.
 //
-// Mode controls auto-populate (off / notify / full); see EventMode.
+// Mode controls auto-populate (off / notify / full); see EventsMode.
 // Per-item byte cap and item-count cap are NOT configurable here —
 // they're derived from `Config.MaxItemBytes` (+ envelope slack) and
 // fully exempt respectively, because per-event cap arithmetic must
 // stay coupled to the user-write that produced the event. See
 // EventsItemEnvelopeOverhead for the rationale.
 type EventsConfig struct {
-	Mode EventMode
+	Mode EventsMode
 }
 
 // InboxConfig holds operator-tunable settings for the reserved `_inbox`

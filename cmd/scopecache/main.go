@@ -127,17 +127,17 @@ func inboxMaxItemBytesFromEnv() int64 {
 	return int64(n) << 10
 }
 
-// eventModeFromEnv returns the SCOPECACHE_EVENT_MODE setting parsed
-// into the typed scopecache.EventMode. Empty string maps to
-// EventModeOff (the default — auto-populate disabled). Any other
-// invalid value logs a warning and falls back to EventModeOff so a
+// eventsModeFromEnv returns the SCOPECACHE_EVENTS_MODE setting parsed
+// into the typed scopecache.EventsMode. Empty string maps to
+// EventsModeOff (the default — auto-populate disabled). Any other
+// invalid value logs a warning and falls back to EventsModeOff so a
 // fat-fingered env var doesn't prevent the server from starting.
-func eventModeFromEnv() scopecache.EventMode {
-	raw := os.Getenv("SCOPECACHE_EVENT_MODE")
-	mode, err := scopecache.ParseEventMode(raw)
+func eventsModeFromEnv() scopecache.EventsMode {
+	raw := os.Getenv("SCOPECACHE_EVENTS_MODE")
+	mode, err := scopecache.ParseEventsMode(raw)
 	if err != nil {
-		log.Printf("SCOPECACHE_EVENT_MODE=%q is invalid; falling back to off (valid: off | notify | full)", raw)
-		return scopecache.EventModeOff
+		log.Printf("SCOPECACHE_EVENTS_MODE=%q is invalid; falling back to off (valid: off | notify | full)", raw)
+		return scopecache.EventsModeOff
 	}
 	return mode
 }
@@ -194,7 +194,7 @@ func main() {
 		MaxStoreBytes: maxStoreBytesFromEnv(),
 		MaxItemBytes:  maxItemBytesFromEnv(),
 		Events: scopecache.EventsConfig{
-			Mode: eventModeFromEnv(),
+			Mode: eventsModeFromEnv(),
 		},
 		Inbox: scopecache.InboxConfig{
 			MaxItems:     inboxMaxItemsFromEnv(),
@@ -205,7 +205,7 @@ func main() {
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store, scopecache.APIConfig{})
 
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item; event_mode=%s",
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item; events_mode=%s",
 		cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20,
 		cfg.Inbox.MaxItems, cfg.Inbox.MaxItemBytes>>10,
 		cfg.Events.Mode)

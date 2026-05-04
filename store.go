@@ -65,14 +65,14 @@ type Store struct {
 	inboxMaxItems      int
 	inboxMaxItemBytes  int64
 
-	// eventMode controls auto-populate of the reserved `_events` scope.
-	// See types.go EventMode for the three states. Resolved from
+	// eventsMode controls auto-populate of the reserved `_events` scope.
+	// See types.go EventsMode for the three states. Resolved from
 	// Config.Events.Mode at NewStore time. The auto-populate paths
 	// (Phase A "Subscribe + event drain architecture", landing in
-	// follow-up steps) consult this field; with eventMode ==
-	// EventModeOff (the default) those paths are no-ops and the cache
+	// follow-up steps) consult this field; with eventsMode ==
+	// EventsModeOff (the default) those paths are no-ops and the cache
 	// behaves identically to a pre-Phase-A build.
-	eventMode EventMode
+	eventsMode EventsMode
 
 	// totalBytes tracks the running sum of every store-byte reservation:
 	// approxItemSize per item plus scopeBufferOverhead per allocated
@@ -336,7 +336,7 @@ func NewStore(c Config) *Store {
 		eventsMaxItemBytes: c.MaxItemBytes + EventsItemEnvelopeOverhead,
 		inboxMaxItems:      c.Inbox.MaxItems,
 		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
-		eventMode:          c.Events.Mode,
+		eventsMode:         c.Events.Mode,
 	}
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)

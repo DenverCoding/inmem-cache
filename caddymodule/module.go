@@ -31,12 +31,12 @@ import (
 // binary reads from env vars (SCOPECACHE_SCOPE_MAX_ITEMS,
 // SCOPECACHE_MAX_STORE_MB, SCOPECACHE_MAX_ITEM_MB,
 // SCOPECACHE_INBOX_MAX_ITEMS, SCOPECACHE_INBOX_MAX_ITEM_KB,
-// SCOPECACHE_EVENT_MODE). Zero / empty values fall back to the
+// SCOPECACHE_EVENTS_MODE). Zero / empty values fall back to the
 // compile-time defaults declared in the core package.
 //
 // MaxStoreMB and MaxItemMB are MiB-facing (matching the env-var
 // convention); InboxMaxItemKB is KiB-facing because its default
-// (64 KiB) reads awkwardly as MiB. EventMode is a string enum
+// (64 KiB) reads awkwardly as MiB. EventsMode is a string enum
 // (off / notify / full). All are converted at the boundary before
 // being handed to the core.
 type Handler struct {
@@ -52,10 +52,10 @@ type Handler struct {
 	// InboxMaxItemKB caps a single `_inbox` item's approxItemSize in
 	// KiB. 0 = use scopecache.InboxMaxItemBytes (64 KiB).
 	InboxMaxItemKB int `json:"inbox_max_item_kb,omitempty"`
-	// EventMode controls auto-populate of the reserved `_events`
+	// EventsMode controls auto-populate of the reserved `_events`
 	// scope. Valid values: "off" (default), "notify" (events without
 	// payload), "full" (events with payload). Empty string = "off".
-	EventMode string `json:"event_mode,omitempty"`
+	EventsMode string `json:"events_mode,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -79,7 +79,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	if err := h.validateConfig(); err != nil {
 		return err
 	}
-	mode, err := scopecache.ParseEventMode(h.EventMode)
+	mode, err := scopecache.ParseEventsMode(h.EventsMode)
 	if err != nil {
 		return err
 	}
@@ -123,7 +123,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    max_item_mb         1
 //	    inbox_max_items     100000
 //	    inbox_max_item_kb   64
-//	    event_mode          off
+//	    events_mode          off
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -139,11 +139,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 			// String-valued directives go first; integer parsing
 			// would otherwise fail before the switch saw "off"/etc.
-			if key == "event_mode" {
-				if _, err := scopecache.ParseEventMode(value); err != nil {
+			if key == "events_mode" {
+				if _, err := scopecache.ParseEventsMode(value); err != nil {
 					return d.Err(err.Error())
 				}
-				h.EventMode = value
+				h.EventsMode = value
 				continue
 			}
 
@@ -173,7 +173,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // validateConfig rejects values the standalone binary's env-var parsers
 // would have ignored with a warning (negative integers, unknown
-// event_mode strings).
+// events_mode strings).
 func (h *Handler) validateConfig() error {
 	for _, e := range []struct {
 		key   string
@@ -189,7 +189,7 @@ func (h *Handler) validateConfig() error {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)
 		}
 	}
-	if _, err := scopecache.ParseEventMode(h.EventMode); err != nil {
+	if _, err := scopecache.ParseEventsMode(h.EventsMode); err != nil {
 		return err
 	}
 	return nil

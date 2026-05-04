@@ -139,47 +139,47 @@ func TestConfig_WithDefaults(t *testing.T) {
 	})
 }
 
-// EventMode parses the four documented adapter strings (off / notify /
+// EventsMode parses the four documented adapter strings (off / notify /
 // full / "") into the typed enum, and rejects everything else with a
 // helpful error. The empty string is the documented sentinel for "use
 // the default" so adapters can pass through unset values without
-// special-casing; the default itself is EventModeOff.
-func TestParseEventMode(t *testing.T) {
+// special-casing; the default itself is EventsModeOff.
+func TestParseEventsMode(t *testing.T) {
 	cases := []struct {
 		in        string
-		want      EventMode
+		want      EventsMode
 		expectErr bool
 	}{
-		{"", EventModeOff, false},
-		{"off", EventModeOff, false},
-		{"notify", EventModeNotify, false},
-		{"full", EventModeFull, false},
-		{"verbose", EventModeOff, true},
-		{"OFF", EventModeOff, true}, // case-sensitive — operators must use lowercase
-		{" off", EventModeOff, true},
+		{"", EventsModeOff, false},
+		{"off", EventsModeOff, false},
+		{"notify", EventsModeNotify, false},
+		{"full", EventsModeFull, false},
+		{"verbose", EventsModeOff, true},
+		{"OFF", EventsModeOff, true}, // case-sensitive — operators must use lowercase
+		{" off", EventsModeOff, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
-			got, err := ParseEventMode(tc.in)
+			got, err := ParseEventsMode(tc.in)
 			if (err != nil) != tc.expectErr {
-				t.Fatalf("ParseEventMode(%q) err=%v, expectErr=%v", tc.in, err, tc.expectErr)
+				t.Fatalf("ParseEventsMode(%q) err=%v, expectErr=%v", tc.in, err, tc.expectErr)
 			}
 			if got != tc.want {
-				t.Errorf("ParseEventMode(%q) = %v, want %v", tc.in, got, tc.want)
+				t.Errorf("ParseEventsMode(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}
 }
 
-// EventMode.String roundtrips through ParseEventMode for every defined
+// EventsMode.String roundtrips through ParseEventsMode for every defined
 // value. Unknown ints render as "unknown" so a forgotten case in
 // future code is visible rather than silently masquerading as off.
-func TestEventMode_StringRoundtrip(t *testing.T) {
-	for _, m := range []EventMode{EventModeOff, EventModeNotify, EventModeFull} {
+func TestEventsMode_StringRoundtrip(t *testing.T) {
+	for _, m := range []EventsMode{EventsModeOff, EventsModeNotify, EventsModeFull} {
 		s := m.String()
-		got, err := ParseEventMode(s)
+		got, err := ParseEventsMode(s)
 		if err != nil {
-			t.Errorf("ParseEventMode(%q) failed roundtrip from %v: %v", s, m, err)
+			t.Errorf("ParseEventsMode(%q) failed roundtrip from %v: %v", s, m, err)
 		}
 		if got != m {
 			t.Errorf("roundtrip %v -> %q -> %v", m, s, got)
@@ -187,34 +187,34 @@ func TestEventMode_StringRoundtrip(t *testing.T) {
 	}
 	// Sanity-check on the unknown rendering — unknown values must
 	// render as a non-empty string distinguishable from valid modes.
-	if got := EventMode(99).String(); got == "" || got == "off" || got == "notify" || got == "full" {
-		t.Errorf("EventMode(99).String() = %q; want a non-empty unknown sentinel", got)
+	if got := EventsMode(99).String(); got == "" || got == "off" || got == "notify" || got == "full" {
+		t.Errorf("EventsMode(99).String() = %q; want a non-empty unknown sentinel", got)
 	}
 }
 
-// NewStore copies the resolved EventMode onto the Store so write-path
+// NewStore copies the resolved EventsMode onto the Store so write-path
 // hooks (when wired in steps 5b+) can read it without going back
 // through Config. Today the field is accepted but not consulted —
 // this test exists to catch a future breakage where the Mode config
 // stops propagating from Config to Store.
-func TestNewStore_PropagatesEventMode(t *testing.T) {
-	for _, mode := range []EventMode{EventModeOff, EventModeNotify, EventModeFull} {
+func TestNewStore_PropagatesEventsMode(t *testing.T) {
+	for _, mode := range []EventsMode{EventsModeOff, EventsModeNotify, EventsModeFull} {
 		s := NewStore(Config{Events: EventsConfig{Mode: mode}})
-		if s.eventMode != mode {
-			t.Errorf("eventMode=%v want %v", s.eventMode, mode)
+		if s.eventsMode != mode {
+			t.Errorf("eventsMode=%v want %v", s.eventsMode, mode)
 		}
 	}
 }
 
-// Default Config (Config{}) has EventMode == Off because that's the
-// zero-value of the EventMode int and the documented default.
+// Default Config (Config{}) has EventsMode == Off because that's the
+// zero-value of the EventsMode int and the documented default.
 // WithDefaults must not promote the zero-value to anything else for
 // this field — operators who omit it get "no auto-populate", not
 // surprise side-effects on every write.
-func TestConfig_WithDefaults_EventModeStaysOff(t *testing.T) {
+func TestConfig_WithDefaults_EventsModeStaysOff(t *testing.T) {
 	got := Config{}.WithDefaults()
-	if got.Events.Mode != EventModeOff {
-		t.Errorf("Config{}.WithDefaults().Events.Mode = %v, want EventModeOff",
+	if got.Events.Mode != EventsModeOff {
+		t.Errorf("Config{}.WithDefaults().Events.Mode = %v, want EventsModeOff",
 			got.Events.Mode)
 	}
 }

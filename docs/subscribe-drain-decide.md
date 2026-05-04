@@ -265,7 +265,7 @@ These should NOT need re-litigation in the implementation phase:
 
 16. **Reserved scope renamed: `_log` → `_events`.** The `_log` name was overloaded (Caddy logs, app logs, OS logs all compete for the term) and asymmetric with `_inbox`. `_events` describes what the scope contains (drainer events) without committing to a transport direction (which `_outbox` would have done — we considered it but the email-flavor connotation made the name promise "leaves the system" semantics that are not actually required). Pre-1.0 breaking change applied to constants (`EventsScopeName`, `EventsItemEnvelopeOverhead`), Store fields (`eventsMaxItemBytes`), Config (`Events EventsConfig`), tests, RFC §2.6, and this document. **Implemented in step 5a.**
 
-17. **Tri-state `EventMode` enum, default `Off`.** Resolves Q1 + Q2 with one knob instead of two. Values: `EventModeOff` (default — no auto-populate, zero overhead on the write path; opt-in when an operator has a drainer ready), `EventModeNotify` (events without payload — addressing only: op, scope, id?, seq, ts), `EventModeFull` (events with action-payload). Adapter strings: `off`/`notify`/`full`; env `SCOPECACHE_EVENT_MODE`; Caddyfile `event_mode notify`. Default = `Off` because the cost (extra write per operation) is paid 24/7 even without a drainer; the benefit only materialises when a drainer is consuming. **Config-shape implemented in step 5a; auto-populate behaviour wires in step 5b+.**
+17. **Tri-state `EventsMode` enum, default `Off`.** Resolves Q1 + Q2 with one knob instead of two. Values: `EventsModeOff` (default — no auto-populate, zero overhead on the write path; opt-in when an operator has a drainer ready), `EventsModeNotify` (events without payload — addressing only: op, scope, id?, seq, ts), `EventsModeFull` (events with action-payload). Adapter strings: `off`/`notify`/`full`; env `SCOPECACHE_EVENTS_MODE`; Caddyfile `events_mode notify`. Default = `Off` because the cost (extra write per operation) is paid 24/7 even without a drainer; the benefit only materialises when a drainer is consuming. **Config-shape implemented in step 5a; auto-populate behaviour wires in step 5b+.**
 
 18. **Action-logging, not result-logging.** Resolves Q11 + Q12. Each event entry contains the inputs the caller sent plus the addressing the cache assigned (seq for newly-created or resolved-from-id paths). Never the result-side data: not "created vs replaced", not the new counter value, not deletion counts. Per endpoint, the `Full`-mode envelope is:
 
@@ -365,7 +365,7 @@ Already shipped (foundation):
 - ✅ HTTP response cap derived from `MaxStoreBytes` (settled 14).
 - ✅ External `/append` to reserved scopes allowed with normal
   hard-fail-on-cap semantics (settled 15).
-- ✅ Step 5a: rename `_log` → `_events` (settled 16); `EventMode`
+- ✅ Step 5a: rename `_log` → `_events` (settled 16); `EventsMode`
   tri-state config (settled 17); action-logging envelope shape
   (settled 18); hardcoded reserved-scope names (settled 19).
   No auto-populate behaviour wired yet — `Mode` stored on Store
