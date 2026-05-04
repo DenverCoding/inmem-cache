@@ -2459,3 +2459,202 @@ func TestReservedScopes_EventsDerivedItemBytesCap(t *testing.T) {
 		t.Errorf("/append _events with payload past derived cap: code=%d body=%s want 400", code, raw)
 	}
 }
+
+// eventsTailCount is a tiny helper for the auto-populate tests that
+// follow: hits /tail on `_events`, asserts the response is OK, and
+// returns the count + items list. Mirrors the inlined pattern used
+// elsewhere in this file but factored out because the auto-populate
+// tests all need the same probe.
+func eventsTailCount(t *testing.T, h http.Handler) (int, []map[string]interface{}) {
+	t.Helper()
+	code, out, raw := doRequest(t, h, "GET", "/tail?scope=_events&limit=100", "")
+	if code != 200 {
+		t.Fatalf("/tail _events: code=%d body=%s", code, raw)
+	}
+	count := int(mustFloat(t, out, "count"))
+	rawItems, _ := out["items"].([]interface{})
+	items := make([]map[string]interface{}, 0, len(rawItems))
+	for _, ri := range rawItems {
+		if m, ok := ri.(map[string]interface{}); ok {
+			items = append(items, m)
+		}
+	}
+	return count, items
+}
+
+// EventsModeOff is the default and zero-value: a fresh Config{} with
+// no Events field set must produce an empty `_events` regardless of
+// how many user-scope writes happen.
+func TestEvents_AutoPopulate_Off(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		// Events.Mode left at zero-value = EventsModeOff.
+	})
+
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","id":"p-%d","payload":{"v":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	if count, _ := eventsTailCount(t, h); count != 0 {
+		t.Errorf("EventsModeOff: _events count=%d want 0", count)
+	}
+}
+
+// EventsModeNotify produces one event per /append. Each event's
+// payload is a JSON object with the action-vector (op, scope, id,
+// seq, ts) but NO `payload` field — Notify mode strips the user
+// payload. Drainers re-fetching from cache state on wake-up don't
+// need the inline payload; addressing is sufficient.
+func TestEvents_AutoPopulate_Notify(t *testing.T) {
+	h, api := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeNotify},
+	})
+
+	for i := 0; i < 3; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","id":"p-%d","payload":{"v":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 3 {
+		t.Fatalf("Notify mode: _events count=%d want 3", count)
+	}
+	for i, evt := range items {
+		evtPayload, ok := evt["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: payload not an object: %v", i, evt["payload"])
+		}
+		if evtPayload["op"] != "append" {
+			t.Errorf("event %d: op=%v want append", i, evtPayload["op"])
+		}
+		if evtPayload["scope"] != "posts" {
+			t.Errorf("event %d: scope=%v want posts", i, evtPayload["scope"])
+		}
+		if _, hasUserPayload := evtPayload["payload"]; hasUserPayload {
+			t.Errorf("event %d: Notify mode must omit user payload, got %v", i, evtPayload)
+		}
+		// id and seq must be carried in the event envelope.
+		if evtPayload["id"] == nil {
+			t.Errorf("event %d: id missing", i)
+		}
+		if evtPayload["seq"] == nil {
+			t.Errorf("event %d: seq missing", i)
+		}
+	}
+
+	if drops := api.store.eventsDropsTotal.Load(); drops != 0 {
+		t.Errorf("Notify mode (no cap pressure): eventsDropsTotal=%d want 0", drops)
+	}
+}
+
+// EventsModeFull adds the user payload to the event envelope. The
+// inner JSON object is what /tail returns under "payload"; inside
+// that, a nested "payload" field carries the original user-write.
+func TestEvents_AutoPopulate_Full(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	body := `{"scope":"posts","id":"hello","payload":{"title":"Hi","n":42}}`
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+		t.Fatalf("/append: code=%d body=%s", code, raw)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 1 {
+		t.Fatalf("Full mode: _events count=%d want 1", count)
+	}
+	evtPayload, ok := items[0]["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("event payload not an object: %v", items[0]["payload"])
+	}
+	userPayload, ok := evtPayload["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Full mode must include user payload as nested object, got %v", evtPayload)
+	}
+	if userPayload["title"] != "Hi" {
+		t.Errorf("user payload title=%v want Hi", userPayload["title"])
+	}
+	if userPayload["n"] != float64(42) { // JSON numbers decode to float64
+		t.Errorf("user payload n=%v want 42", userPayload["n"])
+	}
+}
+
+// Recursion guard: an external /append directly to `_events`
+// (allowed but unusual per RFC §2.6 + decide-doc settled #15) must
+// NOT trigger the auto-populate machinery to write a SECOND event
+// for "the cache observed the previous write to _events". Without
+// the guard the cache would loop, doubling _events on every
+// external write.
+func TestEvents_AutoPopulate_RecursionGuard(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	body := `{"scope":"_events","id":"manual","payload":{"v":1}}`
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+		t.Fatalf("/append _events: code=%d body=%s", code, raw)
+	}
+
+	// Exactly 1 entry — the manual write — and zero auto-populated.
+	if count, _ := eventsTailCount(t, h); count != 1 {
+		t.Errorf("recursion guard broken: _events count=%d want 1 (only the manual write)", count)
+	}
+}
+
+// Drop-on-overflow: when `_events` cannot accept the auto-populated
+// event because the store byte budget is saturated, the underlying
+// user-write STILL succeeds (the user-scope commit happened first)
+// and Store.eventsDropsTotal is bumped. Operators see the drop via
+// /stats once that enrichment lands; for now the test reads the
+// counter directly.
+func TestEvents_AutoPopulate_DropsOnOverflow(t *testing.T) {
+	// Tight byte budget: reserved-scope overhead for _events +
+	// _inbox (2 KiB) + scope-buffer overhead for "posts" (1 KiB) +
+	// just enough room for a tiny user item, but NOT for the event
+	// the auto-populate path would emit (Full mode events are larger
+	// than the user item because they wrap the payload in an envelope
+	// with op/scope/id/seq/ts).
+	cfg := Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: reservedScopesOverhead + scopeBufferOverhead + 100,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	}
+	api := NewAPI(NewStore(cfg), APIConfig{})
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// Tiny user payload — fits in the 100-byte slack after reserved
+	// + posts-buffer overhead.
+	if code, _, raw := doRequest(t, mux, "POST", "/append",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("user /append: code=%d body=%s want 200 (event drop must not affect user-write)",
+			code, raw)
+	}
+
+	if drops := api.store.eventsDropsTotal.Load(); drops == 0 {
+		t.Errorf("eventsDropsTotal=0; expected at least one drop on tight cap (Full mode event > 100 bytes slack)")
+	}
+
+	// Cross-check: the user-scope item really is in place.
+	if code, out, _ := doRequest(t, mux, "GET", "/get?scope=posts&id=a", ""); code != 200 || !mustBool(t, out, "hit") {
+		t.Errorf("user-write not reachable post-drop: code=%d hit=%v", code, out["hit"])
+	}
+}

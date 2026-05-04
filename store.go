@@ -67,12 +67,27 @@ type Store struct {
 
 	// eventsMode controls auto-populate of the reserved `_events` scope.
 	// See types.go EventsMode for the three states. Resolved from
-	// Config.Events.Mode at NewStore time. The auto-populate paths
-	// (Phase A "Subscribe + event drain architecture", landing in
-	// follow-up steps) consult this field; with eventsMode ==
-	// EventsModeOff (the default) those paths are no-ops and the cache
-	// behaves identically to a pre-Phase-A build.
+	// Config.Events.Mode at NewStore time. The auto-populate hooks
+	// (Phase A "Subscribe + event drain architecture") consult this
+	// field; with eventsMode == EventsModeOff (the default) the
+	// hooks short-circuit immediately and the cache behaves
+	// identically to a pre-Phase-A build.
 	eventsMode EventsMode
+
+	// eventsDropsTotal counts events that the cache attempted to
+	// auto-populate into `_events` but had to drop because the byte
+	// budget was already saturated (or, defensively, because
+	// json.Marshal of the writeEvent failed). Incremented atomically
+	// inside emitAppendEvent (and future per-op emit helpers) when
+	// the inner s.appendOne to `_events` returns any error.
+	// Surfaced on /stats by the future enrichment step (Phase A
+	// roadmap §5e); read by tests directly today.
+	//
+	// A drop here NEVER affects the user-visible result of the
+	// underlying mutation: the user-write already committed before
+	// the emit ran. The drop is a degraded observability signal,
+	// not a degraded primary operation.
+	eventsDropsTotal atomic.Int64
 
 	// totalBytes tracks the running sum of every store-byte reservation:
 	// approxItemSize per item plus scopeBufferOverhead per allocated
@@ -594,16 +609,29 @@ func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 // back the empty scope on item-reservation failure so a 507 cannot
 // leak per-scope overhead onto the store-byte cap. See
 // cleanupIfEmptyAndUnused for the rollback semantics.
+//
+// On a successful commit the method invokes emitAppendEvent to
+// auto-populate `_events` (Phase A step 5b). The emit happens
+// AFTER buf.appendItem has returned (b.mu released): this is the
+// "capture-under-lock, emit-outside-lock" pattern. With
+// Config.Events.Mode == Off (the default) the emit is a one-branch
+// no-op; with Notify or Full it does a second appendOne into the
+// `_events` scope, which is recursion-guarded inside the helper.
+// See events.go for the full discipline.
 func (s *Store) appendOne(item Item) (Item, error) {
 	buf, created, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
 		return Item{}, err
 	}
 	result, appendErr := buf.appendItem(item)
-	if appendErr != nil && created {
-		s.cleanupIfEmptyAndUnused(item.Scope, buf)
+	if appendErr != nil {
+		if created {
+			s.cleanupIfEmptyAndUnused(item.Scope, buf)
+		}
+		return result, appendErr
 	}
-	return result, appendErr
+	s.emitAppendEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
+	return result, nil
 }
 
 // upsertOne is the atomic /upsert write-path; same rollback contract
