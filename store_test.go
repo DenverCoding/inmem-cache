@@ -1245,6 +1245,88 @@ func TestStore_LastWriteTS_StartsAtZero(t *testing.T) {
 	}
 }
 
+// TestNewStore_PreCreatesReservedScopes pins the boot-time init contract:
+// after NewStore, every entry in reservedScopeNames must exist as a
+// scopeBuffer with zero items, lastWriteTS=0 (bootstrap is not activity),
+// and the store-wide counters must reflect exactly the reserved-scope
+// overhead — no more, no less.
+//
+// This is the explicit contract that subscribers, drainer addons, and
+// the auto-populate hooks (Phase A) all rely on. If a future refactor
+// forgets to wire init or moves it past a returning code path, this
+// test fails with the offending invariant.
+func TestNewStore_PreCreatesReservedScopes(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	// Each reserved scope exists, is empty, and has lastWriteTS=0.
+	for _, name := range reservedScopeNames {
+		buf, ok := s.getScope(name)
+		if !ok {
+			t.Errorf("reserved scope %q not pre-created", name)
+			continue
+		}
+		buf.mu.RLock()
+		itemCount := len(buf.items)
+		bufLastWrite := buf.lastWriteTS
+		bufBytes := buf.bytes
+		buf.mu.RUnlock()
+		if itemCount != 0 {
+			t.Errorf("reserved scope %q has %d items at boot, want 0", name, itemCount)
+		}
+		if bufLastWrite != 0 {
+			t.Errorf("reserved scope %q lastWriteTS=%d at boot, want 0 (bootstrap is not activity)", name, bufLastWrite)
+		}
+		if bufBytes != 0 {
+			t.Errorf("reserved scope %q b.bytes=%d at boot, want 0 (no items)", name, bufBytes)
+		}
+	}
+
+	// Store-wide counters: scope_count == len(reservedScopeNames),
+	// total_items == 0, totalBytes == reservedScopesOverhead, and
+	// lastWriteTS == 0 (the "fresh boot" sentinel).
+	if got := s.scopeCount.Load(); got != int64(len(reservedScopeNames)) {
+		t.Errorf("fresh store scope_count=%d want %d", got, len(reservedScopeNames))
+	}
+	if got := s.totalItems.Load(); got != 0 {
+		t.Errorf("fresh store total_items=%d want 0", got)
+	}
+	if got := s.totalBytes.Load(); got != reservedScopesOverhead {
+		t.Errorf("fresh store totalBytes=%d want %d (reserved-scope overhead only)",
+			got, reservedScopesOverhead)
+	}
+	if got := s.lastWriteTS.Load(); got != 0 {
+		t.Errorf("fresh store lastWriteTS=%d want 0 (bootstrap is not activity)", got)
+	}
+
+	// And the same invariant the assertion helper enforces everywhere
+	// else: counters agree with the per-shard ground truth.
+	assertStatsCountersInvariant(t, s, "fresh store")
+}
+
+// TestNewStore_PreCreatesReservedScopes_NonReserved verifies the negative
+// half of the init contract: NewStore creates exactly the reserved scopes,
+// nothing else. Probes a handful of names that are NOT in the
+// reservedScopeNames list (including underscore-prefixed names that
+// might be confused with reserved-by-prefix) to make sure they don't
+// exist on a fresh store.
+func TestNewStore_PreCreatesReservedScopes_NonReserved(t *testing.T) {
+	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+
+	for _, name := range []string{
+		"thread:42",   // ordinary user scope
+		"events",      // ordinary user scope
+		"_tokens",     // addon-convention prefix; NOT reserved by core
+		"_counters_x", // same
+		"_log_extra",  // close to reserved name but not exactly
+		"_inbox2",     // same
+		"_",           // underscore alone
+	} {
+		if _, ok := s.getScope(name); ok {
+			t.Errorf("scope %q exists on fresh store; only the reserved names should be pre-created", name)
+		}
+	}
+}
+
 // TestStore_LastWriteTS_BumpsOnEveryWritePath drives every path that
 // is supposed to bump s.lastWriteTS and asserts each one strictly
 // advances the counter. If a future change forgets to wire the bump
