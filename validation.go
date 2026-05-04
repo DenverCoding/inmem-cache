@@ -189,6 +189,9 @@ func validateUpsertItem(item Item, maxItemBytes int64) error {
 	if err := validateScope(item.Scope, "/upsert"); err != nil {
 		return err
 	}
+	if isReservedScope(item.Scope) {
+		return errors.New("scope '" + item.Scope + "' is reserved; in-place mutation (/upsert) is not supported on the drain-stream scopes (use /append)")
+	}
 	if err := requireID(item.ID, "/upsert"); err != nil {
 		return err
 	}
@@ -207,6 +210,9 @@ func validateUpsertItem(item Item, maxItemBytes int64) error {
 func validateUpdateItem(item Item, maxItemBytes int64) error {
 	if err := validateScope(item.Scope, "/update"); err != nil {
 		return err
+	}
+	if isReservedScope(item.Scope) {
+		return errors.New("scope '" + item.Scope + "' is reserved; in-place mutation (/update) is not supported on the drain-stream scopes")
 	}
 	hasID := item.ID != ""
 	hasSeq := item.Seq != 0
@@ -233,6 +239,9 @@ func validateUpdateItem(item Item, maxItemBytes int64) error {
 func validateCounterAddRequest(req CounterAddRequest) (int64, error) {
 	if err := validateScope(req.Scope, "/counter_add"); err != nil {
 		return 0, err
+	}
+	if isReservedScope(req.Scope) {
+		return 0, errors.New("scope '" + req.Scope + "' is reserved; counters are not supported on the drain-stream scopes")
 	}
 	if err := requireID(req.ID, "/counter_add"); err != nil {
 		return 0, err
@@ -266,7 +275,13 @@ func validateDeleteRequest(req DeleteRequest) error {
 }
 
 func validateDeleteScopeRequest(req DeleteScopeRequest) error {
-	return validateScope(req.Scope, "/delete_scope")
+	if err := validateScope(req.Scope, "/delete_scope"); err != nil {
+		return err
+	}
+	if isReservedScope(req.Scope) {
+		return errors.New("scope '" + req.Scope + "' is reserved and cannot be deleted")
+	}
+	return nil
 }
 
 func validateDeleteUpToRequest(req DeleteUpToRequest) error {

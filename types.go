@@ -17,6 +17,23 @@ const (
 	MaxScopeBytes  = 256
 	MaxIDBytes     = 256
 
+	// LogScopeName is the well-known scope name for the auto-populated
+	// write-event log (Phase A "Subscribe + log-scope drain
+	// architecture"). Pre-created at NewStore time and re-created at
+	// /wipe / /rebuild time. Scope-level destructive operations
+	// (/delete_scope, /warm-target, /rebuild-input) reject this name;
+	// item-level operations (/append, /delete, /delete_up_to, /get,
+	// /head, /tail, /render) work normally so the drainer pattern
+	// (subscribe → tail → process → delete_up_to) functions.
+	LogScopeName = "_log"
+
+	// InboxScopeName is the well-known scope name for application-side
+	// fan-in ingestion. Pre-created and re-created the same way as
+	// LogScopeName, with the same scope-level reservation. Apps may
+	// freely /append into _inbox; the cache itself never auto-writes
+	// to it.
+	InboxScopeName = "_inbox"
+
 	// SingleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
 	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to,

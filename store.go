@@ -148,6 +148,94 @@ func (s *Store) bumpLastWriteTS(nowUs int64) {
 	}
 }
 
+// reservedScopeNames lists the cache-reserved scope names that are
+// pre-created at boot, re-created after /wipe and /rebuild, and
+// protected from scope-level destruction. Item-level operations
+// (/append, /delete, /delete_up_to, /get, /head, /tail, /render)
+// remain open on these scopes — the drainer pattern requires
+// /delete_up_to and /tail on _log to function, and apps freely
+// /append into _inbox. See types.go for per-scope rationale and
+// CLAUDE.md "Two reserved scopes" for the principle.
+var reservedScopeNames = [...]string{LogScopeName, InboxScopeName}
+
+// reservedScopesOverhead is the byte cost of pre-creating every
+// reserved scope. Used by rebuildAll's cap check so a /rebuild input
+// that fills the cache exactly doesn't blow past the cap when init
+// re-creates the reserved scopes after the swap.
+const reservedScopesOverhead = int64(len(reservedScopeNames)) * scopeBufferOverhead
+
+// isReservedScope reports whether scope is a cache-reserved name.
+// Used by /delete_scope, /warm and /rebuild to reject scope-level
+// destructive operations targeting reserved scopes. See
+// reservedScopeNames for the full discipline.
+func isReservedScope(scope string) bool {
+	for _, name := range reservedScopeNames {
+		if scope == name {
+			return true
+		}
+	}
+	return false
+}
+
+// initReservedScopes pre-creates every entry in reservedScopeNames at
+// NewStore time. Idempotent and safe to call from NewStore (single-
+// threaded, no contention). For paths that already hold all-shard
+// write locks (wipe, rebuildAll), use initReservedScopesLocked
+// instead — calling this version under those locks would deadlock on
+// the per-shard write lock acquisition.
+//
+// Boot-time pre-creation is NOT counted as cache activity:
+// s.lastWriteTS is NOT bumped, and the per-scope buf.lastWriteTS is
+// reset to 0. A polling client that uses lastWriteTS as a "have I
+// seen this cache before" sentinel should see 0 on a fresh boot;
+// the invariant `s.lastWriteTS >= max(buf.lastWriteTS)` requires
+// every scope's tick to also be 0 in that pristine state. The first
+// real write is what advances both counters.
+func (s *Store) initReservedScopes() {
+	for _, name := range reservedScopeNames {
+		sh := s.shardFor(name)
+		sh.mu.Lock()
+		if _, exists := sh.scopes[name]; !exists {
+			if ok, _, _ := s.reserveBytes(scopeBufferOverhead); ok {
+				buf := s.newscopeBuffer()
+				buf.lastWriteTS = 0 // bootstrap: no writes yet
+				sh.scopes[name] = buf
+				s.scopeCount.Add(1)
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
+// initReservedScopesLocked re-creates the reserved scopes assuming the
+// caller holds every shard's write lock (wipe, rebuildAll). Mirrors
+// the create path of ensureScope but skips the lock dance since the
+// caller already owns every shard. Idempotent: a scope that somehow
+// survived the caller's reset (defensive against rebuildAll input
+// slipping through validation) is left alone, no double-reserve.
+//
+// Like initReservedScopes, this path does NOT bump s.lastWriteTS:
+// the surrounding wipe()/rebuildAll() already bumped store-wide for
+// the destructive event itself. The per-scope buf.lastWriteTS is
+// likewise NOT advanced beyond the surrounding-event tick — re-
+// creating the scopes in lockstep is part of the same logical
+// operation, not a separate one. We therefore keep buf.lastWriteTS
+// at the surrounding-event value (which the wipe/rebuild call
+// already established as s.lastWriteTS).
+func (s *Store) initReservedScopesLocked() {
+	for _, name := range reservedScopeNames {
+		sh := s.shardFor(name)
+		if _, exists := sh.scopes[name]; exists {
+			continue
+		}
+		buf := s.newscopeBuffer()
+		buf.lastWriteTS = s.lastWriteTS.Load() // align with surrounding event
+		sh.scopes[name] = buf
+		s.totalBytes.Add(scopeBufferOverhead)
+		s.scopeCount.Add(1)
+	}
+}
+
 func NewStore(c Config) *Store {
 	c = c.WithDefaults()
 	s := &Store{
@@ -159,6 +247,11 @@ func NewStore(c Config) *Store {
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
+	// Pre-create reserved scopes so subscribers can attach immediately
+	// at boot (before any writes happen) and so the future log-scope
+	// auto-populate hooks (Phase A "Subscribe + log-scope drain
+	// architecture") have a destination ready.
+	s.initReservedScopes()
 	return s
 }
 

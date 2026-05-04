@@ -108,6 +108,11 @@ func (s *Store) wipe() (int, int, int64) {
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
+	// Re-create reserved scopes under the same all-shard write lock so
+	// subscribers don't observe a gap. /wipe means "drop user-managed
+	// state and reset to the cache's default boot configuration"; the
+	// cache's default configuration includes the reserved scopes.
+	s.initReservedScopesLocked()
 
 	return scopeCount, totalItems, freedBytes
 }
@@ -130,6 +135,9 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 	for scope, items := range grouped {
 		if scope == "" {
 			return 0, errors.New("the 'scope' field is required")
+		}
+		if isReservedScope(scope) {
+			return 0, errors.New("scope '" + scope + "' is reserved and cannot be the target of /warm")
 		}
 		if len(items) > s.defaultMaxItems {
 			offenders = append(offenders, ScopeCapacityOffender{
@@ -256,6 +264,9 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	var offenders []ScopeCapacityOffender
 
 	for scope, items := range grouped {
+		if isReservedScope(scope) {
+			return 0, 0, errors.New("scope '" + scope + "' is reserved and cannot appear in /rebuild input")
+		}
 		if len(items) > s.defaultMaxItems {
 			offenders = append(offenders, ScopeCapacityOffender{
 				Scope: scope,
@@ -291,11 +302,14 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	}
 
 	// Rebuild wipes the store, so the cap check is against the new total
-	// (not a delta on top of the current counter).
-	if totalNewBytes > s.maxStoreBytes {
+	// (not a delta on top of the current counter). Include the
+	// reserved-scope overhead because initReservedScopesLocked will
+	// re-create those after the swap; otherwise an input that fills the
+	// cap exactly would push past the cap once init runs.
+	if totalNewBytes+reservedScopesOverhead > s.maxStoreBytes {
 		return 0, 0, &StoreFullError{
 			StoreBytes: 0,
-			AddedBytes: totalNewBytes,
+			AddedBytes: totalNewBytes + reservedScopesOverhead,
 			Cap:        s.maxStoreBytes,
 		}
 	}
@@ -328,6 +342,11 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// and never goes through commitReplacement, so the per-scope bumps
 	// don't fire here. Stamp store-wide explicitly.
 	s.bumpLastWriteTS(nowUnixMicro())
+	// Re-create reserved scopes under the same all-shard write lock so
+	// subscribers don't observe a gap, mirroring wipe(). The input was
+	// already validated to not contain reserved scopes, so init's
+	// idempotent guard is purely defensive.
+	s.initReservedScopesLocked()
 
 	return totalScopes, totalItems, nil
 }

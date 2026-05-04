@@ -764,8 +764,11 @@ func TestWipe_EmptyStore(t *testing.T) {
 	if !mustBool(t, out, "ok") {
 		t.Error("ok=false")
 	}
-	if mustFloat(t, out, "deleted_scopes") != 0 {
-		t.Errorf("deleted_scopes=%v want 0", out["deleted_scopes"])
+	// "Empty" still has the two reserved scopes (_log, _inbox) pre-created
+	// at boot. /wipe drops them (counted in deleted_scopes) then immediately
+	// re-creates them, so the cache lands back at its boot baseline.
+	if mustFloat(t, out, "deleted_scopes") != float64(len(reservedScopeNames)) {
+		t.Errorf("deleted_scopes=%v want %d (reserved scopes were dropped + re-created)", out["deleted_scopes"], len(reservedScopeNames))
 	}
 	if mustFloat(t, out, "deleted_items") != 0 {
 		t.Errorf("deleted_items=%v want 0", out["deleted_items"])
@@ -782,8 +785,10 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	if mustFloat(t, out, "deleted_scopes") != 2 {
-		t.Errorf("deleted_scopes=%v want 2", out["deleted_scopes"])
+	// 2 user scopes + 2 reserved scopes (_log, _inbox) all dropped by /wipe.
+	wantDeleted := float64(2 + len(reservedScopeNames))
+	if mustFloat(t, out, "deleted_scopes") != wantDeleted {
+		t.Errorf("deleted_scopes=%v want %v", out["deleted_scopes"], wantDeleted)
 	}
 	if mustFloat(t, out, "deleted_items") != 3 {
 		t.Errorf("deleted_items=%v want 3", out["deleted_items"])
@@ -792,13 +797,10 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 		t.Errorf("freed_mb=%v want >0", out["freed_mb"])
 	}
 
-	// Both scopes must now be gone — /stats no longer surfaces a per-scope
-	// map (moved to /scopelist), so we verify via the aggregate counter
-	// plus a direct store walk to make the "no scope named a or b" check
-	// explicit.
+	// User scopes must be gone; reserved scopes were re-created by post-wipe init.
 	_, out, _ = doAdminRequest(t, h, "/stats", "")
-	if got := mustFloat(t, out, "scope_count"); got != 0 {
-		t.Errorf("scope_count=%v want 0 after /wipe", got)
+	if got := mustFloat(t, out, "scope_count"); got != float64(len(reservedScopeNames)) {
+		t.Errorf("scope_count=%v want %d after /wipe (reserved scopes restored)", got, len(reservedScopeNames))
 	}
 	for _, scope := range []string{"a", "b"} {
 		if _, ok := api.store.getScope(scope); ok {
@@ -816,14 +818,19 @@ func TestWipe_StatsReportEmptyAfterwards(t *testing.T) {
 	_, _, _ = doAdminRequest(t, h, "/wipe", "")
 
 	_, out, _ := doAdminRequest(t, h, "/stats", "")
-	if mustFloat(t, out, "scope_count") != 0 {
-		t.Errorf("scope_count=%v want 0", out["scope_count"])
+	// Post-wipe baseline: reserved scopes are immediately re-created, so
+	// scope_count = len(reservedScopeNames), approx_store_mb = the
+	// reserved-scope overhead (still very small but non-zero).
+	if mustFloat(t, out, "scope_count") != float64(len(reservedScopeNames)) {
+		t.Errorf("scope_count=%v want %d", out["scope_count"], len(reservedScopeNames))
 	}
 	if mustFloat(t, out, "total_items") != 0 {
 		t.Errorf("total_items=%v want 0", out["total_items"])
 	}
-	if mustFloat(t, out, "approx_store_mb") != 0 {
-		t.Errorf("approx_store_mb=%v want 0", out["approx_store_mb"])
+	// approx_store_mb is the reserved-scope overhead (2 × 1024 bytes = 2048
+	// bytes ≈ 0.0020 MiB). Just assert it's non-negative and small.
+	if got := mustFloat(t, out, "approx_store_mb"); got < 0 || got > 0.01 {
+		t.Errorf("approx_store_mb=%v want a small reserved-scope baseline (0.001..0.005)", got)
 	}
 }
 
@@ -1177,8 +1184,9 @@ func TestStats_Structure(t *testing.T) {
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","payload":{"v":1}}`)
 
 	_, out, _ := doAdminRequest(t, h, "/stats", "")
-	if mustFloat(t, out, "scope_count") != 1 {
-		t.Errorf("scope_count=%v want 1", out["scope_count"])
+	// 1 user scope ("s") + reserved scopes (_log, _inbox).
+	if got := mustFloat(t, out, "scope_count"); got != float64(1+len(reservedScopeNames)) {
+		t.Errorf("scope_count=%v want %d (user + reserved)", got, 1+len(reservedScopeNames))
 	}
 	if mustFloat(t, out, "total_items") != 1 {
 		t.Errorf("total_items=%v want 1", out["total_items"])
@@ -1261,15 +1269,17 @@ func TestScopelist_AlphaSortAndShape(t *testing.T) {
 	if !mustBool(t, out, "hit") {
 		t.Error("hit=false with non-empty scopes (must be count>0)")
 	}
-	if mustFloat(t, out, "count") != 4 {
-		t.Errorf("count=%v want 4", out["count"])
+	// 4 user scopes + 2 reserved scopes (_log, _inbox) = 6 total.
+	// Reserved scopes sort before user scopes because '_' (0x5F) < 'a' (0x61).
+	if mustFloat(t, out, "count") != float64(4+len(reservedScopeNames)) {
+		t.Errorf("count=%v want %d (4 user + %d reserved)", out["count"], 4+len(reservedScopeNames), len(reservedScopeNames))
 	}
 	if mustBool(t, out, "truncated") {
 		t.Error("truncated=true with limit > scope count")
 	}
 
 	got := mustScopeNames(t, out)
-	want := []string{"alpha", "events", "thread:1", "thread:42"}
+	want := []string{"_inbox", "_log", "alpha", "events", "thread:1", "thread:42"}
 	if len(got) != len(want) {
 		t.Fatalf("scopes=%v want %v", got, want)
 	}
@@ -1307,10 +1317,11 @@ func TestScopelist_PrefixFilter(t *testing.T) {
 		t.Errorf("prefix=thread: got=%v want %v", got, want)
 	}
 
-	// Empty prefix is treated as "no filter" — must equal the unfiltered call.
+	// Empty prefix is treated as "no filter" — must equal the unfiltered
+	// call (4 user scopes + 2 reserved).
 	_, out2, _ := doRequest(t, h, "GET", "/scopelist?prefix=", "")
-	if mustFloat(t, out2, "count") != 4 {
-		t.Errorf("empty prefix: count=%v want 4", out2["count"])
+	if got := mustFloat(t, out2, "count"); got != float64(4+len(reservedScopeNames)) {
+		t.Errorf("empty prefix: count=%v want %d", got, 4+len(reservedScopeNames))
 	}
 
 	// No matches → empty array, not null.
@@ -1329,6 +1340,11 @@ func TestScopelist_PrefixFilter(t *testing.T) {
 // Cursor pagination: limit + after is the only paging mode shipped.
 // `truncated` flips when more matching scopes exist past the page,
 // and resuming with after=<last scope> walks the next page.
+//
+// Reserved scopes (_log, _inbox) sort before every user scope because
+// '_' (0x5F) < 'a' (0x61). This test uses after=_zzz as the initial
+// cursor to skip past reserved scopes and exercise pagination on the
+// user-managed scopes alone.
 func TestScopelist_LimitAndAfterCursor(t *testing.T) {
 	h, _ := newTestHandler(10)
 	scopes := []string{"a", "b", "c", "d", "e"}
@@ -1337,7 +1353,7 @@ func TestScopelist_LimitAndAfterCursor(t *testing.T) {
 		_, _, _ = doRequest(t, h, "POST", "/append", body)
 	}
 
-	_, out, _ := doRequest(t, h, "GET", "/scopelist?limit=2", "")
+	_, out, _ := doRequest(t, h, "GET", "/scopelist?limit=2&after=_zzz", "")
 	if !mustBool(t, out, "truncated") {
 		t.Error("truncated=false on limit=2 with 5 scopes")
 	}
@@ -1429,10 +1445,12 @@ func TestScopelist_MethodNotAllowed(t *testing.T) {
 }
 
 // Empty store → empty array, count=0, truncated=false. Wire-format check
-// that no client sees null instead of [].
+// that no client sees null instead of []. Uses after=_zzz to skip past
+// the reserved scopes (_log, _inbox) that NewStore pre-creates so the
+// "empty" assertion exercises the empty-result code path.
 func TestScopelist_EmptyStore(t *testing.T) {
 	h, _ := newTestHandler(10)
-	_, out, _ := doRequest(t, h, "GET", "/scopelist", "")
+	_, out, _ := doRequest(t, h, "GET", "/scopelist?after=_zzz", "")
 	if mustFloat(t, out, "count") != 0 {
 		t.Errorf("count=%v want 0", out["count"])
 	}
@@ -1594,8 +1612,10 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	// --- Assertions on /stats ---
 	_, stats, _ := doAdminRequest(t, h, "/stats", "")
 
-	if got := mustFloat(t, stats, "scope_count"); got != 2 {
-		t.Errorf("scope_count=%v want 2 (rejected too-long-scope must not register)", got)
+	// 2 user scopes (x, y) + reserved scopes (_log, _inbox).
+	wantScopeCount := float64(2 + len(reservedScopeNames))
+	if got := mustFloat(t, stats, "scope_count"); got != wantScopeCount {
+		t.Errorf("scope_count=%v want %v (rejected too-long-scope must not register; reserved baseline)", got, wantScopeCount)
 	}
 	// x: 100 rebuilt − 1 deleted (item_050) − 30 (delete_up_to) = 69
 	// y: 50 warmed + 100 appended − 1 deleted (seq 75)         = 149

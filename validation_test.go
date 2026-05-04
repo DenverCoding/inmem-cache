@@ -395,3 +395,86 @@ func TestGroupItemsByScope(t *testing.T) {
 		t.Errorf("scope b: got %d items", len(grouped["b"]))
 	}
 }
+
+// TestReservedScopes_RejectsScopeLevelAndMutationOps pins the
+// reservation contract for `_log` and `_inbox`:
+//
+//   - Scope-level destructive ops (/delete_scope, /warm-target,
+//     /rebuild-input) reject the reserved names — handled in bulk.go
+//     and validation.go.
+//   - In-place item mutations (/upsert, /update, /counter_add) reject
+//     the reserved names — drain-stream scopes are append + drain
+//     only, no in-place mutation makes sense.
+//
+// Item-level operations that DO make sense for the drain pattern
+// (/append + reads + /delete + /delete_up_to) remain allowed and
+// are exercised elsewhere; this test focuses on the rejection
+// contract.
+func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
+	const maxItem = 1 << 20
+
+	for _, scope := range reservedScopeNames {
+		scope := scope // capture for subtest
+		t.Run("scope="+scope, func(t *testing.T) {
+			payload := json.RawMessage(`{"v":1}`)
+
+			if err := validateUpsertItem(Item{Scope: scope, ID: "x", Payload: payload}, maxItem); err == nil {
+				t.Errorf("validateUpsertItem on %q: expected reservation error, got nil", scope)
+			}
+			if err := validateUpdateItem(Item{Scope: scope, ID: "x", Payload: payload}, maxItem); err == nil {
+				t.Errorf("validateUpdateItem on %q: expected reservation error, got nil", scope)
+			}
+			by := int64(1)
+			if _, err := validateCounterAddRequest(CounterAddRequest{Scope: scope, ID: "c", By: &by}); err == nil {
+				t.Errorf("validateCounterAddRequest on %q: expected reservation error, got nil", scope)
+			}
+			if err := validateDeleteScopeRequest(DeleteScopeRequest{Scope: scope}); err == nil {
+				t.Errorf("validateDeleteScopeRequest on %q: expected reservation error, got nil", scope)
+			}
+
+			// /append on reserved must still succeed at the validator level —
+			// apps write to _inbox, the cache later auto-populates _log.
+			if err := validateWriteItem(Item{Scope: scope, Payload: payload}, "/append", maxItem); err != nil {
+				t.Errorf("validateWriteItem on %q: append must be allowed, got %v", scope, err)
+			}
+			// /delete on reserved must succeed (drainer single-item cleanup).
+			if err := validateDeleteRequest(DeleteRequest{Scope: scope, ID: "x"}); err != nil {
+				t.Errorf("validateDeleteRequest on %q: delete-by-id must be allowed, got %v", scope, err)
+			}
+			if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: scope, MaxSeq: 1}); err != nil {
+				t.Errorf("validateDeleteUpToRequest on %q: must be allowed (drainer cleanup), got %v", scope, err)
+			}
+		})
+	}
+}
+
+// TestReservedScopes_BulkPathRejections covers the rejections that
+// live in bulk.go (not validation.go): /warm and /rebuild reject
+// reserved scope names in their inputs at the Store-method layer.
+// Tests via the public NewStore + bulk methods so the integration
+// is exercised end-to-end.
+func TestReservedScopes_BulkPathRejections(t *testing.T) {
+	for _, scope := range reservedScopeNames {
+		scope := scope
+		t.Run("warm/"+scope, func(t *testing.T) {
+			s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+			grouped := map[string][]Item{
+				scope: {{Scope: scope, ID: "x", Payload: json.RawMessage(`"v"`)}},
+			}
+			_, err := s.replaceScopes(grouped)
+			if err == nil {
+				t.Errorf("replaceScopes(%q): expected reservation error, got nil", scope)
+			}
+		})
+		t.Run("rebuild/"+scope, func(t *testing.T) {
+			s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+			grouped := map[string][]Item{
+				scope: {{Scope: scope, ID: "x", Payload: json.RawMessage(`"v"`)}},
+			}
+			_, _, err := s.rebuildAll(grouped)
+			if err == nil {
+				t.Errorf("rebuildAll(%q): expected reservation error, got nil", scope)
+			}
+		})
+	}
+}

@@ -189,8 +189,7 @@ Both `scope` and `id` are free-form strings of up to 256 bytes
 (see §4.1). The core imposes no structure beyond the size and
 encoding limits: names like `thread:42`, `user:alice:inbox`, or
 HMAC-derived prefixes are equally valid. The core does not parse
-them, does not split on `:`, and does not interpret leading
-underscores as reserved.
+them and does not split on `:`.
 
 Lookup by `scope`, `id`, or `seq` runs against in-memory hashmaps
 and is independent of both name length and scope size — the
@@ -200,10 +199,15 @@ commodity hardware (`BenchmarkStore_GetByID` and
 `BenchmarkStore_GetBySeq`; 100 scopes × 1,000 items × 512-byte
 payloads, ~57 MiB store).
 
-Some addons follow a naming convention where their state-scopes
-start with an underscore (`_tokens`, `_counters_*`, etc.). The
-core does not parse or interpret these prefixes — see §9.2 for
-the protection model.
+The core makes **two specific exceptions** to the "names are
+opaque, no special interpretation" rule: the scope names `_log`
+and `_inbox` are reserved infrastructure scopes that the cache
+pre-creates at boot and protects from scope-level destruction
+(see §2.6). Other underscore-prefixed names (`_tokens`,
+`_counters_*`, `_guarded:*`, …) remain pure naming convention
+that addons follow for operator recognisability; the core does
+not parse or interpret those prefixes — see §9.2 for the
+addon-state protection model.
 
 ### 2.4 Per-scope metadata
 
@@ -280,6 +284,92 @@ The CAS-max update guarantees the counter only ever advances, so a
 strict `>` comparison is enough; concurrent writes from different
 scopes can't reorder the counter backwards even when their wall
 clocks advance out of order across CPUs.
+
+### 2.6 Reserved scopes and boot-time initialisation
+
+The cache reserves exactly two scope names: `_log` and `_inbox`.
+Both are pre-created at `NewStore` time so subscribers and apps
+can attach to a known-stable target without a "scope-doesn't-
+exist-yet" race, and both are re-created automatically after
+`/wipe` and `/rebuild` so the cache always lands on a consistent
+post-event baseline.
+
+| Reserved scope | Role | Writer | Reader |
+|---|---|---|---|
+| `_log` | Cache-managed write-event log (Phase A "Subscribe + log-scope drain architecture") | The cache itself, on every successful mutation to any non-reserved scope | Drainer addons via `Subscribe` + `Tail` |
+| `_inbox` | Application-side fan-in ingestion scope | External clients via `/append` | Drainer addons via `Subscribe` + `Tail` |
+
+**Operations on reserved scopes** follow the
+append-only-drain-stream pattern. The cache allows the operations
+that fit that pattern and rejects the operations that don't:
+
+| Operation | On `_log` / `_inbox` | Rationale |
+|---|---|---|
+| `/append` | ✅ allowed | Apps write to `_inbox`; cache auto-populates `_log` |
+| `/delete`, `/delete_up_to` | ✅ allowed | Drainer cleanup — releasing items the consumer has handled |
+| `/get`, `/head`, `/tail`, `/render` | ✅ allowed | Drainers and observers must be able to read |
+| `/stats`, `/scopelist` | ✅ allowed | Operators must see infrastructure scopes for capacity planning |
+| `/upsert`, `/update`, `/counter_add` | ❌ 400 | Drain-stream semantics: there is no "in-flight item to update" — entries are either still in the buffer or already drained. |
+| `/delete_scope` | ❌ 400 | Would break the reservation invariant (subscribers attached to a vanished scope) |
+| `/warm` (target = reserved) | ❌ 400 | Idem |
+| `/rebuild` (input contains reserved) | ❌ 400 | Idem |
+| `/wipe` | ✅ drops + immediately re-creates | Atomic under all-shard write lock; subscribers don't see a gap |
+
+The reservation is **scope-level only** — item-level cleanup
+(`/delete`, `/delete_up_to`) and item-level reads work normally,
+because the drainer pattern fundamentally requires them.
+
+**Boot-time initialisation.** `NewStore` calls
+`s.initReservedScopes()` after the per-shard maps are allocated.
+This pre-creates `_log` and `_inbox` via `ensureScope`-equivalent
+logic, charges `len(reservedScopeNames) × scopeBufferOverhead`
+(2 × 1024 = 2048 bytes by default) against the store byte budget,
+and bumps `scope_count` by 2. Boot-time pre-creation does NOT bump
+`s.lastWriteTS` — a fresh store still reports `last_write_ts = 0`
+so the "have I seen this cache before" sentinel works for polling
+clients.
+
+**Lifecycle interactions.**
+
+- `/wipe` drops every scope (including the reserved ones), then —
+  under the same all-shard write lock, before releasing —
+  re-creates the reserved scopes via `s.initReservedScopesLocked()`.
+  The re-creation is atomic with the wipe: subscribers attached to
+  `_log` or `_inbox` never observe a moment where their scope
+  doesn't exist. Post-wipe baseline is `scope_count = 2`,
+  `total_items = 0`, `approx_store_mb = reservedScopesOverhead`.
+
+- `/rebuild` validates input first (rejects the call with 400 if
+  any input scope is reserved), then under all-shard write lock
+  detaches every existing buffer, swaps in the new shard maps,
+  resets the store-wide counters to the new totals, and finally
+  calls `s.initReservedScopesLocked()` to re-create the reserved
+  scopes. The cap check includes `reservedScopesOverhead` in the
+  expected post-rebuild byte total so an input that fills the cap
+  exactly doesn't blow past it once init runs.
+
+- `/delete_scope` on a reserved name is rejected at the validator
+  layer (400). To release the items in a reserved scope without
+  removing the scope itself, use `/delete_up_to` with a
+  sufficiently-large `max_seq` — the standard drainer cleanup
+  pattern.
+
+- `/append`, `/delete`, `/delete_up_to`, and reads operate on
+  reserved scopes with no additional bookkeeping — same paths as
+  user-managed scopes.
+
+**Implementation locus.** Constants `LogScopeName` and
+`InboxScopeName` live in `types.go`. The `reservedScopeNames`
+array, the `reservedScopesOverhead` constant, the
+`isReservedScope(scope)` helper, and the `initReservedScopes` /
+`initReservedScopesLocked` methods all live in `store.go`. The
+validators in `validation.go` and the bulk paths in `bulk.go`
+consult `isReservedScope` to enforce the rejection contract.
+Future addon-convention scopes that need pre-creation (e.g.
+`_tokens` for the `guarded` addon) are not part of the core's
+reservation list — they are operator-side concerns and will land
+via the planned config-driven init-script (see CLAUDE.md
+"Pre-1.0 TODO operational" for the deferred design).
 
 ---
 
@@ -614,6 +704,12 @@ distinguishes create from replace via `created`.
 keeps its original value; on create, `seq` is freshly assigned.
 `ts` is always refreshed.
 
+**Endpoint-specific errors**
+
+| status | error                                  | when                          |
+|--------|----------------------------------------|-------------------------------|
+| 400    | `scope '<name>' is reserved …`         | `scope` is `_log` or `_inbox` (§2.6) |
+
 **Example**
 
 ```bash
@@ -657,6 +753,12 @@ is larger than the old one and would push the store past
 `MaxStoreBytes`, the request is rejected with 507 and no change is
 applied.
 
+**Endpoint-specific errors**
+
+| status | error                                  | when                          |
+|--------|----------------------------------------|-------------------------------|
+| 400    | `scope '<name>' is reserved …`         | `scope` is `_log` or `_inbox` (§2.6) |
+
 **Example**
 
 ```bash
@@ -699,6 +801,7 @@ bytes.
 | status | error                                                      | when                                              |
 |--------|------------------------------------------------------------|---------------------------------------------------|
 | 400    | `the counter operation would exceed the allowed range of ±(2^53-1)` | result would overflow the JS-safe integer range |
+| 400    | `scope '<name>' is reserved …`                             | `scope` is `_log` or `_inbox` (§2.6)              |
 | 409    | `payload is not a JSON integer` (or similar)               | existing item's payload is not a valid integer    |
 
 **Side effects**
@@ -821,6 +924,12 @@ In-flight writes against the scope detach (return 409 to their
 callers); the scope's bytes are released back to the store-wide
 budget.
 
+**Endpoint-specific errors**
+
+| status | error                                  | when                          |
+|--------|----------------------------------------|-------------------------------|
+| 400    | `scope '<name>' is reserved …`         | `scope` is `_log` or `_inbox` (§2.6); use `/delete_up_to` to release items without removing the scope |
+
 **Example**
 
 ```bash
@@ -851,8 +960,13 @@ at 1 KiB to prevent memory abuse.
 
 **Side effects**
 
-In-flight writes against any scope detach (409). After the call,
-`approx_store_mb` reads as 0 in `/stats`.
+In-flight writes against any scope detach (409). The reserved
+scopes `_log` and `_inbox` (§2.6) are dropped along with everything
+else, then immediately re-created under the same all-shard write
+lock — subscribers attached to either reserved scope do not observe
+a gap. Post-call baseline is `scope_count = 2`,
+`total_items = 0`, `approx_store_mb` ≈ `reservedScopesOverhead /
+1 MiB` (~0.002 MiB by default).
 
 This is **not** an eviction policy: the cache never wipes itself.
 `/wipe` exists so operators can clear-and-rebuild atomically rather
@@ -902,6 +1016,12 @@ single-item writes — large enough that a fully-loaded store can
 always be expressed as one bulk call. In-flight writes against any
 replaced scope detach (409).
 
+**Endpoint-specific errors**
+
+| status | error                                  | when                          |
+|--------|----------------------------------------|-------------------------------|
+| 400    | `scope '<name>' is reserved …`         | any item's `scope` is `_log` or `_inbox` (§2.6) |
+
 **Example**
 
 ```bash
@@ -931,6 +1051,7 @@ single atomic operation.
 | status | error                                              | when                  |
 |--------|----------------------------------------------------|-----------------------|
 | 400    | `the 'items' array must not be empty for the '/rebuild' endpoint` | empty `items[]`       |
+| 400    | `scope '<name>' is reserved …`                     | any item's `scope` is `_log` or `_inbox` (§2.6) |
 
 An empty `items[]` is rejected explicitly because it would silently
 wipe the store — almost always a client bug. Operators that really
@@ -941,6 +1062,15 @@ want to clear the store should call `/wipe`.
 ```json
 {"ok": true, "count": 100, "rebuilt_scopes": 3, "rebuilt_items": 100, "duration_us": 42}
 ```
+
+**Side effects**
+
+After the swap, the cache re-creates the reserved scopes (`_log`,
+`_inbox`) under the same all-shard write lock so subscribers don't
+observe a gap (§2.6). The post-rebuild byte total is `Σ items +
+Σ scopeBufferOverhead + reservedScopesOverhead`; the cap check
+includes the reserved overhead so an input that fills the cap
+exactly does not blow past it once init runs.
 
 **Example**
 
