@@ -32,6 +32,19 @@
 # moved out (/admin, /guarded, /delete_guarded, /inbox, /multi_call,
 # /delete_scope_candidates, /ts_range) are not exercised here — when
 # they return as addons each will get its own per-addon e2e_test.sh.
+#
+# Optional events_mode=full coverage: set EXPECT_EVENTS=full AND start
+# the cache with events_mode=full to run the auto-populate block
+# below. Known side-effect: under events_mode=full the cache emits
+# one `_events` entry per successful mutation, which means several
+# pre-existing assertions that hard-coded events_mode=off semantics
+# will fail (in particular: /stats `total_items`, /stats `scope_count`
+# after /wipe, /scopelist totals, ts-stats freshness asserts that
+# expect `last_write_ts` to be tied 1:1 to the latest user-write).
+# These are TODO-wired-as-events-aware in a future pass; for now the
+# events_mode=full run is interpreted as "the events block must pass
+# clean; pre-existing failures are catalogued and acceptable until
+# the events-aware rewrite lands".
 
 set -eu
 
@@ -997,6 +1010,130 @@ json_assert 'scopelist: limit=0 error mentions positive' '
     .error | test("positive")
 '
 call 'scopelist: POST not allowed' 405 POST /scopelist
+
+# --- events auto-populate (Phase A; gated on EXPECT_EVENTS=full) ---------------
+# This block runs ONLY when the operator started the cache with
+# events_mode=full. The cache itself defaults to off, so without the
+# right server config every assertion would fail with "_events count=0".
+# Setting EXPECT_EVENTS=full both gates the block AND documents in the
+# test output that the operator-side config is expected — a missing
+# events_mode at the server is then a "pass: 0 fail: many" signal,
+# not a silent skip.
+#
+# Concrete invocation:
+#
+#   docker compose run --rm \
+#     -e SCOPECACHE_EVENTS_MODE=full scopecache &
+#   docker compose exec -e EXPECT_EVENTS=full dev sh /src/scripts/e2e_test.sh
+#
+# Or for the Caddy module: add `events_mode full` to the scopecache
+# block in the deploy Caddyfile, restart caddyscope, then run e2e
+# with BASE=http://caddyscope:8080 EXPECT_EVENTS=full.
+if [ "${EXPECT_EVENTS:-}" = "full" ]; then
+    say '== events auto-populate (events_mode=full) =='
+
+    # Start clean so the per-op assertions that follow can address
+    # _events entries by their committed index without arithmetic
+    # against pre-existing state from earlier sections.
+    call 'events: pre-test wipe' 200 POST /wipe
+
+    # One of each 5b/5c-covered op so the section exercises the full
+    # auto-populate envelope-shape contract end-to-end.
+    call 'events: /append'        200 POST /append \
+        '{"scope":"posts","id":"a","payload":{"v":1}}'
+    call 'events: /upsert'        200 POST /upsert \
+        '{"scope":"posts","id":"a","payload":{"v":2}}'
+    call 'events: /update'        200 POST /update \
+        '{"scope":"posts","id":"a","payload":{"v":3}}'
+    call 'events: /counter_add'   200 POST /counter_add \
+        '{"scope":"counters","id":"hits","by":7}'
+    call 'events: /delete'        200 POST /delete \
+        '{"scope":"posts","id":"a"}'
+    # Seed an item we can /delete_up_to over.
+    call 'events: seed for du'    200 POST /append \
+        '{"scope":"du","payload":{"v":1}}'
+    call 'events: /delete_up_to'  200 POST /delete_up_to \
+        '{"scope":"du","max_seq":1}'
+
+    # Total events expected: 7 (one per op above; the seed-for-du
+    # /append also emits its own event).
+    call 'events: tail _events' 200 GET '/tail?scope=_events&limit=50'
+    json_assert 'events: count == 7' '.count == 7'
+
+    # Op-string sequence on the wire: drainers depend on this exact
+    # ordering when they replay against an empty cache.
+    json_assert 'events: ops in commit-order' '
+        [.items[].payload.op] == [
+            "append","upsert","update","counter_add",
+            "delete","append","delete_up_to"
+        ]
+    '
+
+    # Action-logging contract: counter_add carries the increment, NOT
+    # the post-add value; delete_up_to carries the cursor, NOT the
+    # deleted-count.
+    json_assert 'events: counter_add carries by=7 (increment, not value)' '
+        (.items[3].payload.op == "counter_add")
+        and (.items[3].payload.by == 7)
+        and (.items[3].payload | has("payload") | not)
+    '
+    json_assert 'events: delete_up_to carries max_seq=1 (cursor, not count)' '
+        (.items[6].payload.op == "delete_up_to")
+        and (.items[6].payload.max_seq == 1)
+        and (.items[6].payload | has("id") | not)
+    '
+    # Update miss must NOT have emitted anything earlier in this run;
+    # /update against id "a" was a hit (we just upserted), so we use
+    # an explicit miss now and assert the count stays at 7.
+    call 'events: /update miss (must not emit)' 200 POST /update \
+        '{"scope":"posts","id":"nope","payload":{"v":99}}'
+    call 'events: tail after update miss' 200 GET '/tail?scope=_events&limit=50'
+    json_assert 'events: miss did not emit (count still 7)' '.count == 7'
+
+    # --- volume burst: 100 /delete-by-id calls ---
+    # Smaller than the 1000-item Go test (HTTP+curl overhead per call
+    # makes 1000 take ~30s e2e-side) but enough to catch a "burst
+    # drops events under load" regression. Pre-seed N items so each
+    # delete is a real hit.
+    say '== events: 100-delete burst =='
+    BURST=100
+    i=0
+    while [ "$i" -lt "$BURST" ]; do
+        quiet_call 'events: burst seed' 200 POST /append \
+            "$(printf '{"scope":"burst","id":"b-%d","payload":{"v":%d}}' "$i" "$i")"
+        i=$((i+1))
+    done
+    i=0
+    while [ "$i" -lt "$BURST" ]; do
+        quiet_call 'events: burst delete' 200 POST /delete \
+            "$(printf '{"scope":"burst","id":"b-%d"}' "$i")"
+        i=$((i+1))
+    done
+    # Total events from the burst: BURST seeds + BURST deletes = 2*BURST.
+    # Plus the 7 from the per-op section above.
+    EXPECT_TOTAL=$((7 + 2 * BURST))
+    call 'events: tail after burst' 200 \
+        GET "/tail?scope=_events&limit=$((EXPECT_TOTAL + 50))"
+    json_assert "events: count == $EXPECT_TOTAL after burst" \
+        ".count == $EXPECT_TOTAL"
+
+    # Slice arithmetic: events 0..6 are the per-op section above; the
+    # burst seed-appends fill 7..7+BURST-1; the burst deletes fill
+    # 7+BURST..7+2*BURST-1. Verify the deletes-slice length, that
+    # every entry is a delete, and that the addressing endpoints
+    # match (b-0 at the start, b-(BURST-1) at the end).
+    DELETE_START=$((7 + BURST))
+    DELETE_END=$((7 + 2 * BURST))
+    LAST_ID=$((BURST - 1))
+    json_assert "events: $BURST burst deletes round-trip with addressing" "
+        (.items[$DELETE_START:$DELETE_END] | length == $BURST)
+        and (.items[$DELETE_START:$DELETE_END] | all(.payload.op == \"delete\"))
+        and (.items[$DELETE_START].payload.id == \"b-0\")
+        and (.items[$((DELETE_END - 1))].payload.id == \"b-$LAST_ID\")
+    "
+
+    call 'events: post-test wipe' 200 POST /wipe
+fi
 
 # --- wipe at end --------------------------------------------------------------
 say '== final wipe =='

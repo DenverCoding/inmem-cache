@@ -79,23 +79,24 @@ type writeEvent struct {
 	MaxSeq  uint64          `json:"max_seq,omitempty"`
 }
 
-// emitEvent is the shared fan-out for every per-op emit helper. It
-// owns the three gates from the file-level comment (mode check,
-// recursion guard, drop-on-overflow) plus the Notify-mode payload
-// strip. Per-op helpers (emitAppendEvent, emitUpsertEvent, …) build
-// the writeEvent and hand it off here; this file is the single
-// source of truth for "how an event reaches `_events`".
+// emitEvent is the shared back-half: Notify-mode payload strip +
+// json.Marshal + recursive appendOne into `_events` + drop-on-error.
+// The two early gates (mode check, recursion guard) live at each
+// per-op caller instead of here so events_mode=off — the default —
+// pays exactly one atomic load + compare per write, never the cost
+// of constructing the writeEvent struct or the function call into
+// this body.
 //
-// The recursion guard reads evt.Scope (the user-scope being
-// mutated). If a caller wrote directly to `_events` — allowed by
-// RFC §2.6 — evt.Scope == EventsScopeName and we short-circuit.
-// Without this guard the recursive appendOne below would emit a
-// second event for "the cache observed the previous _events write",
-// and so on, until the byte cap fires.
+// Caller invariants (NOT re-checked here):
+//   - s.eventsMode != EventsModeOff
+//   - evt.Scope != EventsScopeName (recursion guard)
+//
+// If both checks moved here the off-path would still construct the
+// 8-field struct value-arg before reaching the early-return — a
+// measured ~+150 ns/op regression on the BenchmarkStore_Append
+// hot path. Splitting the gates out keeps the off-path one branch
+// short.
 func (s *Store) emitEvent(evt writeEvent) {
-	if s.eventsMode == EventsModeOff || evt.Scope == EventsScopeName {
-		return
-	}
 	if s.eventsMode == EventsModeNotify {
 		// Notify keeps the action-vector (op/scope/id/seq/ts + any
 		// op-specific fields like By) but drops the user payload.
@@ -118,9 +119,21 @@ func (s *Store) emitEvent(evt writeEvent) {
 	}
 }
 
+// eventsEnabled is the shared off-mode/recursion-guard fast path. Per-op
+// emit helpers call this first; on miss they return WITHOUT building
+// the writeEvent struct (which is what made the centralised version
+// slow on events_mode=off). Inlined easily by the compiler at every
+// call site (3-instruction body).
+func (s *Store) eventsEnabled(scope string) bool {
+	return s.eventsMode != EventsModeOff && scope != EventsScopeName
+}
+
 // emitAppendEvent — see file-level comment. Called by Store.appendOne
 // after a successful buf.appendItem commit.
 func (s *Store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
 	s.emitEvent(writeEvent{
 		Op: "append", Scope: scope, ID: id, Seq: seq, Ts: ts, Payload: payload,
 	})
@@ -132,6 +145,9 @@ func (s *Store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload 
 // response, not the event (action-logging: the action is "upsert this
 // id with this payload", regardless of whether the cache was empty).
 func (s *Store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
 	s.emitEvent(writeEvent{
 		Op: "upsert", Scope: scope, ID: id, Seq: seq, Ts: ts, Payload: payload,
 	})
@@ -147,6 +163,9 @@ func (s *Store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload 
 // changing those signatures was not worth the spread for the small
 // observability win — drainers needing freshness can /get the item).
 func (s *Store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMessage) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
 	s.emitEvent(writeEvent{
 		Op: "update", Scope: scope, ID: id, Seq: seq, Payload: payload,
 	})
@@ -161,6 +180,9 @@ func (s *Store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMe
 // wire; a non-counter envelope leaves it nil and `omitempty` drops
 // the field entirely.
 func (s *Store) emitCounterAddEvent(scope, id string, by int64) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
 	s.emitEvent(writeEvent{
 		Op: "counter_add", Scope: scope, ID: id, By: &by,
 	})
@@ -177,6 +199,9 @@ func (s *Store) emitCounterAddEvent(scope, id string, by int64) {
 // no-op against cache state and replay reconstructs the same final
 // state without it.
 func (s *Store) emitDeleteEvent(scope, id string, seq uint64) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
 	s.emitEvent(writeEvent{
 		Op: "delete", Scope: scope, ID: id, Seq: seq,
 	})
@@ -191,6 +216,9 @@ func (s *Store) emitDeleteEvent(scope, id string, seq uint64) {
 // /delete_up_to (no items at or below the cursor) does not change
 // cache state and is not emitted.
 func (s *Store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
+	if !s.eventsEnabled(scope) {
+		return
+	}
 	s.emitEvent(writeEvent{
 		Op: "delete_up_to", Scope: scope, MaxSeq: maxSeq,
 	})

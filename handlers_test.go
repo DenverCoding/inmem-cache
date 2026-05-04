@@ -3025,6 +3025,107 @@ func TestEvents_AutoPopulate_Delete(t *testing.T) {
 	}
 }
 
+// High-volume verification: 1000 /append + 1000 /delete, all 2000
+// events round-trip correctly into `_events` in commit-order, with
+// the right op + id per envelope. Catches regressions where:
+//   - emit drops silently under load (eventsDropsTotal would tick up;
+//     we assert it stays 0 on this configured-roomy budget)
+//   - envelope ordering desyncs (e.g. emits land in a wrong order due
+//     to a future async-emit refactor that broke commit-order)
+//   - per-op envelope shape regresses for either /append or /delete
+//     under volume (per-op tests above use small N; this catches
+//     "first N work but Nth+1 drifts" cliff regressions).
+//
+// Pre-seeded user-scope cap is generous (10k items) and store byte
+// cap is 256 MiB — well above 1000 items × ~50 bytes each plus 2000
+// events × ~150 bytes each. eventsDropsTotal must stay 0; any non-
+// zero value here is a regression.
+func TestEvents_AutoPopulate_HighVolume_AppendThenDelete(t *testing.T) {
+	cfg := Config{
+		ScopeMaxItems: 10_000,
+		MaxStoreBytes: 256 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	}
+	api := NewAPI(NewStore(cfg), APIConfig{})
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	const N = 1000
+
+	for i := 0; i < N; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","id":"p-%d","payload":{"v":%d}}`, i, i)
+		if code, _, raw := doRequest(t, mux, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+	for i := 0; i < N; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","id":"p-%d"}`, i)
+		if code, _, raw := doRequest(t, mux, "POST", "/delete", body); code != 200 {
+			t.Fatalf("/delete #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	if drops := api.store.eventsDropsTotal.Load(); drops != 0 {
+		t.Errorf("eventsDropsTotal=%d want 0 (cap is generous, no drops expected)", drops)
+	}
+
+	// Pull the full _events tail. limit is 2*N+50 slack; at 256 MiB
+	// cap the response cap is well above the resulting body size.
+	code, out, raw := doRequest(t, mux, "GET",
+		fmt.Sprintf("/tail?scope=_events&limit=%d", 2*N+50), "")
+	if code != 200 {
+		t.Fatalf("/tail _events: code=%d body=%s", code, raw)
+	}
+	count := int(mustFloat(t, out, "count"))
+	if count != 2*N {
+		t.Fatalf("after %d appends + %d deletes: _events count=%d want %d", N, N, count, 2*N)
+	}
+	rawItems, _ := out["items"].([]interface{})
+	if len(rawItems) != 2*N {
+		t.Fatalf("items len=%d want %d", len(rawItems), 2*N)
+	}
+
+	// First N events are the appends (commit-order: append 0..N-1).
+	for i := 0; i < N; i++ {
+		envelope, _ := rawItems[i].(map[string]interface{})
+		evt, ok := envelope["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("append event %d: envelope payload not object: %v", i, envelope["payload"])
+		}
+		if evt["op"] != "append" {
+			t.Fatalf("event %d: op=%v want append at this position", i, evt["op"])
+		}
+		wantID := fmt.Sprintf("p-%d", i)
+		if evt["id"] != wantID {
+			t.Fatalf("append event %d: id=%v want %s", i, evt["id"], wantID)
+		}
+	}
+
+	// Next N events are the deletes, in delete-order (which matches
+	// append-order in this test: we delete p-0 through p-N-1).
+	for i := 0; i < N; i++ {
+		envelope, _ := rawItems[N+i].(map[string]interface{})
+		evt, ok := envelope["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("delete event %d: envelope payload not object: %v", N+i, envelope["payload"])
+		}
+		if evt["op"] != "delete" {
+			t.Fatalf("event %d: op=%v want delete at this position", N+i, evt["op"])
+		}
+		wantID := fmt.Sprintf("p-%d", i)
+		if evt["id"] != wantID {
+			t.Fatalf("delete event %d: id=%v want %s", N+i, evt["id"], wantID)
+		}
+		// Delete events must NOT carry payload (and we asserted the
+		// shape in the per-op tests above, but verify it survives
+		// volume too).
+		if _, hasPayload := evt["payload"]; hasPayload {
+			t.Fatalf("delete event %d carries payload (violates op shape): %v", N+i, evt["payload"])
+		}
+	}
+}
+
 // /delete_up_to auto-populate: envelope carries scope + max_seq.
 // Hit emits one event; a no-op cursor (max_seq below any stored item)
 // does NOT emit.
