@@ -201,6 +201,55 @@ func isReservedScope(scope string) bool {
 	return false
 }
 
+// maxItemBytesFor returns the per-item byte cap that applies to writes
+// against scope. The reserved scopes have caps decoupled from the
+// global one (see types.go LogConfig / InboxConfig and RFC §2.6):
+//
+//   - `_log`   uses logMaxItemBytes   (= MaxItemBytes + LogItemEnvelopeOverhead)
+//   - `_inbox` uses inboxMaxItemBytes (operator-tunable, default 64 KiB)
+//   - everything else uses maxItemBytes (the global Config.MaxItemBytes)
+//
+// Called by handlers that mutate items (currently /append) right before
+// the validator's checkItemSize. Other write handlers (/upsert,
+// /update, /counter_add) reject reserved scopes at the validator
+// before reaching this path, so they always see the global cap.
+func (s *Store) maxItemBytesFor(scope string) int64 {
+	switch scope {
+	case LogScopeName:
+		return s.logMaxItemBytes
+	case InboxScopeName:
+		return s.inboxMaxItemBytes
+	default:
+		return s.maxItemBytes
+	}
+}
+
+// maxItemsFor returns the per-scope item-count cap to install on a
+// freshly-created buffer for scope. Mirrors maxItemBytesFor's
+// per-reserved-scope dispatch, with one extra wrinkle: `_log` returns
+// the unboundedScopeMaxItems sentinel so its appendItem path skips the
+// count cap entirely (best-effort observability — only the global
+// byte budget gates writes there). Used by initReservedScopes(Locked)
+// to install the right cap at boot / after wipe / after rebuild.
+func (s *Store) maxItemsFor(scope string) int {
+	switch scope {
+	case LogScopeName:
+		return unboundedScopeMaxItems
+	case InboxScopeName:
+		return s.inboxMaxItems
+	default:
+		return s.defaultMaxItems
+	}
+}
+
+// unboundedScopeMaxItems is the sentinel value for "no item-count cap
+// on this scope" stored in scopeBuffer.maxItems. The write paths in
+// buffer_write.go treat 0 as "skip the count check" — only the
+// reserved `_log` scope is created with this sentinel because best-
+// effort observability writes are gated by the global byte budget,
+// not by an arbitrary item-count cap.
+const unboundedScopeMaxItems = 0
+
 // initReservedScopes pre-creates every entry in reservedScopeNames at
 // NewStore time. Idempotent and safe to call from NewStore (single-
 // threaded, no contention). For paths that already hold all-shard
@@ -222,6 +271,10 @@ func (s *Store) initReservedScopes() {
 		if _, exists := sh.scopes[name]; !exists {
 			if ok, _, _ := s.reserveBytes(scopeBufferOverhead); ok {
 				buf := s.newscopeBuffer()
+				// Per-scope cap dispatch: _log gets the unbounded
+				// sentinel, _inbox gets the operator-tunable cap.
+				// See maxItemsFor for the rationale.
+				buf.maxItems = s.maxItemsFor(name)
 				buf.lastWriteTS = 0 // bootstrap: no writes yet
 				sh.scopes[name] = buf
 				s.scopeCount.Add(1)
@@ -253,6 +306,9 @@ func (s *Store) initReservedScopesLocked() {
 			continue
 		}
 		buf := s.newscopeBuffer()
+		// Per-scope cap dispatch matches initReservedScopes; see
+		// maxItemsFor for the rationale.
+		buf.maxItems = s.maxItemsFor(name)
 		buf.lastWriteTS = s.lastWriteTS.Load() // align with surrounding event
 		sh.scopes[name] = buf
 		s.totalBytes.Add(scopeBufferOverhead)

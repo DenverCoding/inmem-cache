@@ -2280,3 +2280,182 @@ func TestReservedScopes_RebuildRestoresBaseline(t *testing.T) {
 		t.Fatalf("/append _log after rebuild: code=%d body=%s", code, raw)
 	}
 }
+
+// newReservedScopesTestHandler constructs a Store + API with a custom
+// Config so the per-reserved-scope cap tests can drive the knobs that
+// the default newTestHandler doesn't expose. Same shape as that helper
+// — accepts Config, hands you (mux, api).
+func newReservedScopesTestHandler(t *testing.T, cfg Config) (http.Handler, *API) {
+	t.Helper()
+	api := NewAPI(NewStore(cfg), APIConfig{})
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+	return mux, api
+}
+
+// _log is exempt from ScopeMaxItems: best-effort observability gated
+// only by the global byte budget, never by an arbitrary item-count.
+// Cross-checks that the same store still enforces ScopeMaxItems on
+// user-scopes — the exemption must be scoped to `_log` alone, not
+// leaked store-wide.
+func TestReservedScopes_LogExemptFromScopeMaxItems(t *testing.T) {
+	// Tiny ScopeMaxItems = 3. _log should accept far more than that;
+	// a regular scope should 507 on the 4th item.
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 3,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+	})
+
+	// Append 10 items to _log — all must succeed even though
+	// ScopeMaxItems = 3 globally.
+	for i := 0; i < 10; i++ {
+		body := fmt.Sprintf(`{"scope":"_log","id":"e-%d","payload":{"i":%d}}`, i, i)
+		code, _, raw := doRequest(t, h, "POST", "/append", body)
+		if code != 200 {
+			t.Fatalf("append #%d to _log: code=%d body=%s (cap exemption broken)", i, code, raw)
+		}
+	}
+
+	// Cross-check: the same store still 507s a user-scope at the 4th
+	// item, proving the exemption is scoped to _log only.
+	for i := 0; i < 3; i++ {
+		body := fmt.Sprintf(`{"scope":"user","id":"u-%d","payload":{"i":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("append #%d to user-scope: code=%d body=%s (under cap, must succeed)", i, code, raw)
+		}
+	}
+	body := `{"scope":"user","id":"u-overflow","payload":{"i":3}}`
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 507 {
+		t.Errorf("4th append to user-scope: code=%d (want 507) body=%s", code, raw)
+	}
+}
+
+// _inbox enforces an operator-tunable per-item byte cap that defaults
+// to 64 KiB and is independent of MaxItemBytes (which targets user-
+// scopes). A payload below the inbox cap succeeds; above it produces
+// 400. The same payload must still succeed against a user-scope that
+// only has to clear the larger global cap — proves the cap is scoped
+// to _inbox.
+func TestReservedScopes_InboxRespectsCustomItemBytes(t *testing.T) {
+	// Inbox cap deliberately smaller than the global MaxItemBytes so
+	// the test can construct a payload that's legal globally but
+	// rejected by _inbox.
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 1000,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,                                            // 1 MiB
+		Inbox:         InboxConfig{MaxItems: 1000, MaxItemBytes: 4 << 10}, // 4 KiB
+	})
+
+	// 8 KiB of opaque bytes — over the 4 KiB inbox cap, well under
+	// the 1 MiB global cap.
+	bigPayload := strings.Repeat("a", 8<<10)
+
+	// Reject on _inbox.
+	body := fmt.Sprintf(`{"scope":"_inbox","id":"big","payload":"%s"}`, bigPayload)
+	code, out, raw := doRequest(t, h, "POST", "/append", body)
+	if code != 400 {
+		t.Fatalf("/append _inbox with 8 KiB payload: code=%d body=%s want 400", code, raw)
+	}
+	if errMsg, _ := out["error"].(string); !strings.Contains(errMsg, "size") {
+		t.Errorf("expected size-related error, got %q", errMsg)
+	}
+
+	// Same payload to a user-scope succeeds (global cap is 1 MiB).
+	body = fmt.Sprintf(`{"scope":"user","id":"big","payload":"%s"}`, bigPayload)
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+		t.Errorf("/append user with 8 KiB payload: code=%d body=%s want 200 (under global cap)", code, raw)
+	}
+
+	// Small payload to _inbox succeeds (under inbox cap).
+	body = `{"scope":"_inbox","id":"small","payload":{"v":1}}`
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+		t.Errorf("/append _inbox with small payload: code=%d body=%s want 200", code, raw)
+	}
+}
+
+// _inbox enforces an operator-tunable per-scope item-count cap that
+// defaults to ScopeMaxItems but can be tuned independently. With a
+// custom small Inbox.MaxItems, /append to _inbox 507s past the cap
+// while user-scopes are still bounded by the (different) global
+// ScopeMaxItems.
+func TestReservedScopes_InboxRespectsCustomItemCount(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Inbox:         InboxConfig{MaxItems: 3, MaxItemBytes: 64 << 10},
+	})
+
+	// Three appends fit; the fourth 507s.
+	for i := 0; i < 3; i++ {
+		body := fmt.Sprintf(`{"scope":"_inbox","id":"i-%d","payload":{"i":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d _inbox: code=%d body=%s", i, code, raw)
+		}
+	}
+	body := `{"scope":"_inbox","id":"i-overflow","payload":{"i":3}}`
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 507 {
+		t.Errorf("4th /append _inbox: code=%d body=%s want 507 (Inbox.MaxItems=3)", code, raw)
+	}
+
+	// Cross-check: user-scope tracks the global ScopeMaxItems = 100,
+	// so a 4th user-write succeeds where the inbox 507'd.
+	for i := 0; i < 4; i++ {
+		body := fmt.Sprintf(`{"scope":"user","id":"u-%d","payload":{"i":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d user: code=%d body=%s (global cap is 100)", i, code, raw)
+		}
+	}
+}
+
+// _log's per-item byte cap is derived (MaxItemBytes + 1 KiB envelope
+// slack) so the cap is always at least as wide as any user-write. A
+// payload that's accepted by _log but rejected by user-scope proves
+// _log's cap really is the global cap plus the slack — and a payload
+// past the derived cap is still rejected on _log itself.
+//
+// The test uses a JSON-object payload (not a top-level string)
+// deliberately: top-level JSON-string payloads pre-render at write
+// time and are charged for both the raw bytes AND the decoded form
+// in approxItemSize, so payload-byte arithmetic doubles. Objects
+// skip renderBytes; len(Payload) is the only payload cost the cap
+// sees.
+func TestReservedScopes_LogDerivedItemBytesCap(t *testing.T) {
+	const globalCap = 8 << 10 // 8 KiB; _log derives globalCap + 1 KiB.
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 1000,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  globalCap,
+	})
+
+	// Object payload: `{"d":"<filler>"}` — 8 bytes of JSON framing
+	// plus the filler. Envelope (scope+id+seq+ts+base) adds ~56 B
+	// for the short scope/id strings used here, so 200 B of
+	// headroom is comfortable.
+	mkPayload := func(totalBytes int) string {
+		filler := strings.Repeat("a", totalBytes-8) // -len(`{"d":""}`)
+		return fmt.Sprintf(`{"d":"%s"}`, filler)
+	}
+
+	// Fits _log's derived 9 KiB cap (with envelope ≈ 8556 B), past
+	// the user's 8 KiB cap.
+	logOnly := mkPayload(globalCap + 256)
+
+	body := fmt.Sprintf(`{"scope":"user","id":"big","payload":%s}`, logOnly)
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 400 {
+		t.Errorf("/append user with payload > global cap: code=%d body=%s want 400", code, raw)
+	}
+	body = fmt.Sprintf(`{"scope":"_log","id":"big","payload":%s}`, logOnly)
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+		t.Errorf("/append _log with same payload: code=%d body=%s want 200 (within derived cap)", code, raw)
+	}
+
+	// Past _log's derived cap (global + 1 KiB) — even _log says no.
+	overLogCap := mkPayload(globalCap + (1 << 10) + 256)
+	body = fmt.Sprintf(`{"scope":"_log","id":"too-big","payload":%s}`, overLogCap)
+	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 400 {
+		t.Errorf("/append _log with payload past derived cap: code=%d body=%s want 400", code, raw)
+	}
+}

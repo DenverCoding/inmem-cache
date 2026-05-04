@@ -49,7 +49,13 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateWriteItem(item, "/append", api.store.maxItemBytes); err != nil {
+	// /append is the only single-item write that can target reserved
+	// scopes (the others reject reserved scopes at the validator), so
+	// it must resolve the per-item byte cap per scope: `_log` allows
+	// MaxItemBytes + 1 KiB envelope slack, `_inbox` is capped at the
+	// operator-tunable Inbox.MaxItemBytes (default 64 KiB), everything
+	// else uses the global MaxItemBytes. See store.go maxItemBytesFor.
+	if err := validateWriteItem(item, "/append", api.store.maxItemBytesFor(item.Scope)); err != nil {
 		badRequest(w, started, err.Error())
 		return
 	}

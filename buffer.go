@@ -61,6 +61,14 @@ type scopeBuffer struct {
 	byID     map[string]Item
 	bySeq    map[uint64]Item
 	lastSeq  uint64
+	// maxItems caps the number of items this scope may hold; writes
+	// past it produce *ScopeFullError. The unboundedScopeMaxItems
+	// sentinel (= 0) means "no count cap" — the write paths skip the
+	// check entirely. Only the reserved `_log` scope is created with
+	// the sentinel (best-effort observability gated by the global byte
+	// budget alone); every other scope, including `_inbox`, gets a
+	// concrete positive cap installed at create time. See
+	// Store.maxItemsFor in store.go for the per-scope dispatch.
 	maxItems int
 	// bytes is the running sum of approxItemSize(item) over items. Only
 	// mutated under b.mu; the store-level total is kept in sync via
