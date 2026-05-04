@@ -211,9 +211,13 @@ call 'wrong method on /help'            405 POST   /help
 say '== /stats aggregate counters =='
 call 'stats agg: wipe'                  200 POST   /wipe
 call 'stats agg: stats after wipe'      200 GET    /stats
-json_assert 'stats agg: scope_count == 0 after wipe' '.scope_count == 0'
+# Reserved scopes (`_events` and `_inbox`) are pre-created at boot and
+# re-created after every /wipe / /rebuild (settled #10). So scope_count
+# and approx_store_mb both have a non-zero baseline after wipe — the
+# byte cost is just the per-scope overhead × 2 (~2 KiB).
+json_assert 'stats agg: scope_count == reserved baseline after wipe' '.scope_count == 2'
 json_assert 'stats agg: total_items == 0 after wipe' '.total_items == 0'
-json_assert 'stats agg: approx_store_mb == 0 after wipe' '.approx_store_mb == 0'
+json_assert 'stats agg: approx_store_mb is small reserved overhead' '.approx_store_mb > 0 and .approx_store_mb < 0.01'
 # /wipe is itself a state-changing event, so last_write_ts must be
 # strictly greater than 0 right after — even though scope_count is 0.
 # This is the contract that lets a polling client distinguish "cache
@@ -237,7 +241,8 @@ quiet_call 'stats agg: upsert stat_b id=u1 (replace)' 200 POST /upsert \
     '{"scope":"stat_b","id":"u1","payload":"v2"}'
 
 call 'stats agg: stats after appends'   200 GET    /stats
-json_assert 'stats agg: scope_count == 2' '.scope_count == 2'
+# 2 user scopes (stat_a, stat_b) + 2 reserved (_events, _inbox).
+json_assert 'stats agg: scope_count == 4 (2 user + 2 reserved)' '.scope_count == 4'
 json_assert 'stats agg: total_items == 7' '.total_items == 7'
 json_assert 'stats agg: approx_store_mb > 0' '.approx_store_mb > 0'
 # Configured caps no longer appear on /stats (they're static config —
@@ -287,7 +292,9 @@ call 'fresh: wipe baseline' 200 POST /wipe
 call 'fresh: stats post-wipe' 200 GET /stats
 FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
 json_assert 'fresh: total_items == 0 post-wipe' '.total_items == 0'
-json_assert 'fresh: scope_count == 0 post-wipe' '.scope_count == 0'
+# Reserved scopes (_events + _inbox) are recreated immediately on /wipe
+# (settled #10) so scope_count baseline is 2, not 0.
+json_assert 'fresh: scope_count == 2 (reserved baseline) post-wipe' '.scope_count == 2'
 
 # Single /append: /stats.last_write_ts must equal the item.ts that
 # came back from the same call. Both are set from one nowUs() inside
@@ -299,7 +306,8 @@ call 'fresh: single /append' 200 POST /append \
 APPEND_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
 call 'fresh: stats after single /append' 200 GET /stats
 json_assert 'fresh: total_items == 1 after one /append' '.total_items == 1'
-json_assert 'fresh: scope_count == 1 after one /append' '.scope_count == 1'
+# 1 user scope ("fresh") + 2 reserved.
+json_assert 'fresh: scope_count == 3 after one /append' '.scope_count == 3'
 json_assert 'fresh: last_write_ts strictly > wipe-stamp' \
     ".last_write_ts > $FRESH_TS_PREV"
 json_assert 'fresh: last_write_ts == item.ts of the only write' \
@@ -323,7 +331,8 @@ call 'fresh: read x10 (last appended)' 200 GET '/get?scope=fresh&id=x10'
 LAST_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
 call 'fresh: stats after 10 appends' 200 GET /stats
 json_assert 'fresh: total_items == 11 after 1 + 10 appends' '.total_items == 11'
-json_assert 'fresh: scope_count still 1 (same scope)' '.scope_count == 1'
+# Still 1 user scope; reserved baseline brings total to 3.
+json_assert 'fresh: scope_count still 3 (same user scope + reserved)' '.scope_count == 3'
 json_assert 'fresh: last_write_ts strictly > pre-loop' \
     ".last_write_ts > $FRESH_TS_PREV"
 json_assert 'fresh: last_write_ts == latest-item.ts' \
@@ -338,7 +347,8 @@ call 'fresh: append into a second scope' 200 POST /append \
 SECOND_SCOPE_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
 call 'fresh: stats after second-scope append' 200 GET /stats
 json_assert 'fresh: total_items == 12 after second-scope append' '.total_items == 12'
-json_assert 'fresh: scope_count == 2 after second-scope append' '.scope_count == 2'
+# 2 user scopes (fresh, fresh2) + 2 reserved.
+json_assert 'fresh: scope_count == 4 after second-scope append' '.scope_count == 4'
 json_assert 'fresh: last_write_ts == y1.ts (latest write)' \
     ".last_write_ts == $SECOND_SCOPE_ITEM_TS"
 FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
@@ -356,7 +366,7 @@ call 'fresh: read x5 to get refreshed ts' 200 GET '/get?scope=fresh&id=x5'
 UPDATE_ITEM_TS=$(printf '%s' "$LAST_BODY" | jq '.item.ts')
 call 'fresh: stats after /update' 200 GET /stats
 json_assert 'fresh: total_items unchanged after /update' '.total_items == 12'
-json_assert 'fresh: scope_count unchanged after /update' '.scope_count == 2'
+json_assert 'fresh: scope_count unchanged after /update' '.scope_count == 4'
 json_assert 'fresh: last_write_ts strictly > pre-update' \
     ".last_write_ts > $FRESH_TS_PREV"
 json_assert 'fresh: last_write_ts == updated-item.ts' \
@@ -384,7 +394,7 @@ call 'fresh: /delete one item' 200 POST /delete \
     '{"scope":"fresh","id":"x1"}'
 call 'fresh: stats after /delete' 200 GET /stats
 json_assert 'fresh: total_items == 11 after /delete (-1)' '.total_items == 11'
-json_assert 'fresh: scope_count still 2 (fresh still has items)' '.scope_count == 2'
+json_assert 'fresh: scope_count still 4 (fresh still has items)' '.scope_count == 4'
 json_assert 'fresh: last_write_ts strictly > pre-delete' \
     ".last_write_ts > $FRESH_TS_PREV"
 FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
@@ -402,7 +412,7 @@ call 'fresh: /delete_up_to seq=4' 200 POST /delete_up_to \
 json_assert 'fresh: /delete_up_to deleted_count == 3' '.deleted_count == 3'
 call 'fresh: stats after /delete_up_to' 200 GET /stats
 json_assert 'fresh: total_items == 8 after /delete_up_to (-3)' '.total_items == 8'
-json_assert 'fresh: scope_count still 2' '.scope_count == 2'
+json_assert 'fresh: scope_count still 4' '.scope_count == 4'
 json_assert 'fresh: last_write_ts strictly > pre-trim' \
     ".last_write_ts > $FRESH_TS_PREV"
 FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
@@ -415,7 +425,8 @@ call 'fresh: /delete_scope fresh' 200 POST /delete_scope \
 json_assert 'fresh: /delete_scope deleted_items == 7' '.deleted_items == 7'
 call 'fresh: stats after /delete_scope' 200 GET /stats
 json_assert 'fresh: total_items == 1 after /delete_scope (-7)' '.total_items == 1'
-json_assert 'fresh: scope_count == 1 after /delete_scope (-1)' '.scope_count == 1'
+# fresh deleted; fresh2 + 2 reserved remain.
+json_assert 'fresh: scope_count == 3 after /delete_scope (-1)' '.scope_count == 3'
 json_assert 'fresh: last_write_ts strictly > pre-delete-scope' \
     ".last_write_ts > $FRESH_TS_PREV"
 FRESH_TS_PREV=$(printf '%s' "$LAST_BODY" | jq '.last_write_ts')
@@ -427,7 +438,8 @@ sleep 1
 call 'fresh: /wipe (final, after one-scope state)' 200 POST /wipe
 call 'fresh: stats after final /wipe' 200 GET /stats
 json_assert 'fresh: total_items == 0 after /wipe' '.total_items == 0'
-json_assert 'fresh: scope_count == 0 after /wipe' '.scope_count == 0'
+# Reserved scopes recreated immediately, so baseline is 2.
+json_assert 'fresh: scope_count == 2 after /wipe (reserved baseline)' '.scope_count == 2'
 json_assert 'fresh: last_write_ts strictly > pre-wipe' \
     ".last_write_ts > $FRESH_TS_PREV"
 
@@ -905,7 +917,7 @@ say '== mega: stats final state =='
 call 'mega: stats final' 200 GET /stats
 json_assert 'mega: /stats aggregate counters exact' '
     .ok == true and
-    .scope_count == 3 and
+    .scope_count == 5 and
     .total_items == 94
 '
 
@@ -924,14 +936,16 @@ json_assert 'mega: /stats aggregate counters exact' '
 # Per-row numbers cross-checked against the mega state machine above.
 say '== /scopelist: per-scope detail =='
 
-# Default page returns every scope, alphabetically.
+# Default page returns every scope, alphabetically. Reserved scopes
+# (`_events`, `_inbox`) appear first because underscore sorts before
+# lowercase letters; user scopes follow.
 call 'scopelist: default' 200 GET /scopelist
-json_assert 'scopelist: ok=true hit=true count=3 truncated=false' '
-    .ok == true and .hit == true and .count == 3 and .truncated == false and
-    (.scopes | length) == 3
+json_assert 'scopelist: ok=true hit=true count=5 truncated=false (3 user + 2 reserved)' '
+    .ok == true and .hit == true and .count == 5 and .truncated == false and
+    (.scopes | length) == 5
 '
-json_assert 'scopelist: alphabetical order' '
-    (.scopes | map(.scope)) == ["mega_data","mega_extra","mega_other"]
+json_assert 'scopelist: alphabetical order (reserved first)' '
+    (.scopes | map(.scope)) == ["_events","_inbox","mega_data","mega_extra","mega_other"]
 '
 # Every row must carry the seven primitives + scope name. Just check
 # they're present (numeric ranges are checked below per row).
@@ -978,9 +992,9 @@ json_assert 'scopelist: prefix narrowed to mega_other only' '
     .count == 1 and (.scopes | map(.scope)) == ["mega_other"]
 '
 
-# Empty prefix is the no-filter case.
+# Empty prefix is the no-filter case — same 5 scopes as default.
 call 'scopelist: prefix= empty' 200 GET '/scopelist?prefix='
-json_assert 'scopelist: empty prefix == no filter' '.count == 3'
+json_assert 'scopelist: empty prefix == no filter' '.count == 5'
 
 # No-match prefix returns empty array (NOT null) and hit=false.
 call 'scopelist: prefix=zzz' 200 GET '/scopelist?prefix=zzz'
@@ -988,13 +1002,17 @@ json_assert 'scopelist: no-match prefix is empty array, hit=false' '
     .hit == false and .count == 0 and .truncated == false and .scopes == []
 '
 
-# Cursor pagination: limit + after. Walking the three scopes one page
-# at a time must reconstruct the full alphabetical sequence.
-call 'scopelist: page1 limit=2' 200 GET '/scopelist?limit=2'
+# Cursor pagination: limit + after. Walking the three user scopes one
+# page at a time must reconstruct the full alphabetical sequence. The
+# `?prefix=mega_` filter excludes reserved scopes so the page boundaries
+# are deterministic regardless of how many reserved scopes the cache
+# adds in the future — the test stays focused on the pagination
+# mechanics, not on the reserved-scope baseline.
+call 'scopelist: page1 limit=2' 200 GET '/scopelist?limit=2&prefix=mega_'
 json_assert 'scopelist: page1 = [mega_data, mega_extra], truncated=true' '
     .truncated == true and (.scopes | map(.scope)) == ["mega_data","mega_extra"]
 '
-call 'scopelist: page2 after=mega_extra' 200 GET '/scopelist?limit=2&after=mega_extra'
+call 'scopelist: page2 after=mega_extra' 200 GET '/scopelist?limit=2&prefix=mega_&after=mega_extra'
 json_assert 'scopelist: page2 = [mega_other], truncated=false' '
     .truncated == false and (.scopes | map(.scope)) == ["mega_other"]
 '
@@ -1145,8 +1163,11 @@ else
     bad "wipe body missing deleted_scopes: $LAST_BODY"
 fi
 call 'stats after wipe' 200 GET /stats
-if printf '%s' "$LAST_BODY" | grep -q '"scope_count":0'; then
-    okmsg 'stats shows empty store'
+# Reserved scopes (`_events` + `_inbox`) are recreated immediately on
+# /wipe (settled #10), so post-wipe baseline is scope_count=2 with
+# total_items=0.
+if printf '%s' "$LAST_BODY" | grep -q '"scope_count":2'; then
+    okmsg 'stats shows reserved-baseline empty store'
 else
     bad "stats post-wipe: $LAST_BODY"
 fi
