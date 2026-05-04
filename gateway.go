@@ -21,13 +21,13 @@ package scopecache
 //
 // Pre-1.0: signatures may shift. Post-1.0: semver-stable.
 type Gateway struct {
-	store *Store
+	store *store
 }
 
 // NewGateway constructs a Gateway around a fresh Store. Single
 // entry-point external callers use; *Store is not exposed.
 func NewGateway(c Config) *Gateway {
-	return &Gateway{store: NewStore(c)}
+	return &Gateway{store: newStore(c)}
 }
 
 // Stats is the public name for the typed /stats snapshot.

@@ -13,9 +13,9 @@ import (
 // events_mode=full so writes that happen during subscribe tests trigger
 // auto-populate to _events (which is what the drainer wakes up on in
 // realistic deployments). Inbox-only tests can ignore events_mode.
-func newTestStoreForSubscribe(t *testing.T) *Store {
+func newTestStoreForSubscribe(t *testing.T) *store {
 	t.Helper()
-	return NewStore(Config{
+	return newStore(Config{
 		ScopeMaxItems: 1000,
 		MaxStoreBytes: 100 << 20,
 		MaxItemBytes:  1 << 20,

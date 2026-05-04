@@ -107,7 +107,7 @@ type writeEvent struct {
 // measured ~+150 ns/op regression on the BenchmarkStore_Append
 // hot path. Splitting the gates out keeps the off-path one branch
 // short.
-func (s *Store) emitEvent(evt writeEvent) {
+func (s *store) emitEvent(evt writeEvent) {
 	if s.eventsMode == EventsModeNotify {
 		// Notify keeps the action-vector (op/scope/id/seq/ts + any
 		// op-specific fields like By) but drops the user payload.
@@ -135,13 +135,13 @@ func (s *Store) emitEvent(evt writeEvent) {
 // the writeEvent struct (which is what made the centralised version
 // slow on events_mode=off). Inlined easily by the compiler at every
 // call site (3-instruction body).
-func (s *Store) eventsEnabled(scope string) bool {
+func (s *store) eventsEnabled(scope string) bool {
 	return s.eventsMode != EventsModeOff && scope != EventsScopeName
 }
 
 // emitAppendEvent — see file-level comment. Called by Store.appendOne
 // after a successful buf.appendItem commit.
-func (s *Store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
+func (s *store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
@@ -155,7 +155,7 @@ func (s *Store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload 
 // distinguish create-vs-replace by the `created` field on the HTTP
 // response, not the event (action-logging: the action is "upsert this
 // id with this payload", regardless of whether the cache was empty).
-func (s *Store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
+func (s *store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
@@ -173,7 +173,7 @@ func (s *Store) emitUpsertEvent(scope, id string, seq uint64, ts int64, payload 
 // post-update Ts is not carried (updateByID/Seq don't return it and
 // changing those signatures was not worth the spread for the small
 // observability win — drainers needing freshness can /get the item).
-func (s *Store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMessage) {
+func (s *store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
@@ -190,7 +190,7 @@ func (s *Store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMe
 // By is *int64 so by:0 (a no-op action) is still representable on the
 // wire; a non-counter envelope leaves it nil and `omitempty` drops
 // the field entirely.
-func (s *Store) emitCounterAddEvent(scope, id string, by int64) {
+func (s *store) emitCounterAddEvent(scope, id string, by int64) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
@@ -209,7 +209,7 @@ func (s *Store) emitCounterAddEvent(scope, id string, by int64) {
 // Caller (Store.deleteOne) emits only on hit (count > 0); a miss is a
 // no-op against cache state and replay reconstructs the same final
 // state without it.
-func (s *Store) emitDeleteEvent(scope, id string, seq uint64) {
+func (s *store) emitDeleteEvent(scope, id string, seq uint64) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
@@ -226,7 +226,7 @@ func (s *Store) emitDeleteEvent(scope, id string, seq uint64) {
 // Caller (Store.deleteUpTo) emits only on hit (count > 0); a no-op
 // /delete_up_to (no items at or below the cursor) does not change
 // cache state and is not emitted.
-func (s *Store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
+func (s *store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
 	if !s.eventsEnabled(scope) {
 		return
 	}
@@ -245,7 +245,7 @@ func (s *Store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
 // No eventsEnabled scope check — /warm rejects reserved scopes at the
 // validator (see replaceScopes), so the recursion guard is never
 // reachable. Direct mode-check is enough.
-func (s *Store) emitWarmEvent() {
+func (s *store) emitWarmEvent() {
 	if s.eventsMode == EventsModeOff {
 		return
 	}
@@ -261,7 +261,7 @@ func (s *Store) emitWarmEvent() {
 // /delete_scope on a missing scope is a no-op; caller (Store.deleteScope)
 // gates the emit on the success bool, so empty/non-existent scopes
 // never reach this helper.
-func (s *Store) emitDeleteScopeEvent(scope string) {
+func (s *store) emitDeleteScopeEvent(scope string) {
 	if !s.eventsEnabled(scope) {
 		return
 	}

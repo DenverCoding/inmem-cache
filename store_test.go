@@ -13,14 +13,14 @@ import (
 // --- Store --------------------------------------------------------------------
 
 func TestStore_GetOrCreateScope_RequiresScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	if _, err := s.getOrCreateScope(""); err == nil {
 		t.Fatal("expected error for empty scope")
 	}
 }
 
 func TestStore_GetOrCreateScope_ReturnsSameBuffer(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	b1, _ := s.getOrCreateScope("x")
 	b2, _ := s.getOrCreateScope("x")
 	if b1 != b2 {
@@ -33,8 +33,8 @@ func TestStore_GetOrCreateScope_ReturnsSameBuffer(t *testing.T) {
 // so any positive write failed with StoreFullError or worse — the public
 // package was effectively dead-on-arrival for library users.
 func TestNewStore_ZeroConfigUsesDefaults(t *testing.T) {
-	s := NewStore(Config{})
-	api := NewAPI(s, APIConfig{})
+	s := newStore(Config{})
+	api := NewAPI(&Gateway{store: s}, APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -199,7 +199,7 @@ func TestEventsMode_StringRoundtrip(t *testing.T) {
 // stops propagating from Config to Store.
 func TestNewStore_PropagatesEventsMode(t *testing.T) {
 	for _, mode := range []EventsMode{EventsModeOff, EventsModeNotify, EventsModeFull} {
-		s := NewStore(Config{Events: EventsConfig{Mode: mode}})
+		s := newStore(Config{Events: EventsConfig{Mode: mode}})
 		if s.eventsMode != mode {
 			t.Errorf("eventsMode=%v want %v", s.eventsMode, mode)
 		}
@@ -226,7 +226,7 @@ func TestConfig_WithDefaults_EventsModeStaysOff(t *testing.T) {
 // shifting the production caps.
 func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 	t.Run("default config", func(t *testing.T) {
-		s := NewStore(Config{})
+		s := newStore(Config{})
 		wantEvents := int64(MaxItemBytes) + EventsItemEnvelopeOverhead
 		if s.eventsMaxItemBytes != wantEvents {
 			t.Errorf("eventsMaxItemBytes=%d want %d (= MaxItemBytes + EventsItemEnvelopeOverhead)",
@@ -241,7 +241,7 @@ func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 	})
 
 	t.Run("custom MaxItemBytes propagates to eventsMaxItemBytes", func(t *testing.T) {
-		s := NewStore(Config{MaxItemBytes: 256 << 10})
+		s := newStore(Config{MaxItemBytes: 256 << 10})
 		want := int64(256<<10) + EventsItemEnvelopeOverhead
 		if s.eventsMaxItemBytes != want {
 			t.Errorf("eventsMaxItemBytes=%d want %d", s.eventsMaxItemBytes, want)
@@ -249,7 +249,7 @@ func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 	})
 
 	t.Run("custom InboxConfig is honoured", func(t *testing.T) {
-		s := NewStore(Config{Inbox: InboxConfig{MaxItems: 5000, MaxItemBytes: 8 << 10}})
+		s := newStore(Config{Inbox: InboxConfig{MaxItems: 5000, MaxItemBytes: 8 << 10}})
 		if s.inboxMaxItems != 5000 {
 			t.Errorf("inboxMaxItems=%d want 5000", s.inboxMaxItems)
 		}
@@ -266,8 +266,8 @@ func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 // cap. Operators tune MaxStoreBytes; the response cap follows.
 func TestNewAPI_DerivesMaxResponseBytesFromStore(t *testing.T) {
 	t.Run("default store", func(t *testing.T) {
-		s := NewStore(Config{})
-		api := NewAPI(s, APIConfig{})
+		s := newStore(Config{})
+		api := NewAPI(&Gateway{store: s}, APIConfig{})
 		if api.maxResponseBytes != s.maxStoreBytes {
 			t.Errorf("maxResponseBytes=%d want %d (= store.maxStoreBytes)",
 				api.maxResponseBytes, s.maxStoreBytes)
@@ -275,8 +275,8 @@ func TestNewAPI_DerivesMaxResponseBytesFromStore(t *testing.T) {
 	})
 
 	t.Run("custom store cap propagates", func(t *testing.T) {
-		s := NewStore(Config{MaxStoreBytes: 7 << 20})
-		api := NewAPI(s, APIConfig{})
+		s := newStore(Config{MaxStoreBytes: 7 << 20})
+		api := NewAPI(&Gateway{store: s}, APIConfig{})
 		if api.maxResponseBytes != int64(7<<20) {
 			t.Errorf("maxResponseBytes=%d want %d", api.maxResponseBytes, 7<<20)
 		}
@@ -293,7 +293,7 @@ func TestStore_EmptyScopeSpam_HitsByteCap(t *testing.T) {
 	// Cap big enough for reserved scopes (_events, _inbox) + ~10 attacker
 	// scopes' worth of overhead, no item room.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead)*10
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	created := 0
 	var lastErr error
@@ -334,7 +334,7 @@ func TestStore_EmptyScopeSpam_HitsByteCap(t *testing.T) {
 func TestStore_DeleteScope_ReleasesOverhead(t *testing.T) {
 	// Cap fits reserved scopes (_events, _inbox) + 5 attacker scopes.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead)*5
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	// Fill the cap with empty user scopes — 5 scopes × overhead = remaining cap.
 	for i := 0; i < 5; i++ {
@@ -364,7 +364,7 @@ func TestStore_DeleteScope_ReleasesOverhead(t *testing.T) {
 }
 
 func TestStore_GetScope_Miss(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	if _, ok := s.getScope("nope"); ok {
 		t.Fatal("expected miss")
 	}
@@ -377,7 +377,7 @@ func TestStore_GetScope_Miss(t *testing.T) {
 // for what should be a 200 miss response.
 
 func TestStore_updateOne_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	item := Item{Scope: "nope", ID: "x", Payload: json.RawMessage(`"v"`)}
 	n, err := s.updateOne(item)
 	if err != nil {
@@ -389,7 +389,7 @@ func TestStore_updateOne_MissingScope(t *testing.T) {
 }
 
 func TestStore_deleteOne_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	n, err := s.deleteOne("nope", "x", 0)
 	if err != nil {
 		t.Fatalf("err=%v; want nil", err)
@@ -400,7 +400,7 @@ func TestStore_deleteOne_MissingScope(t *testing.T) {
 }
 
 func TestStore_deleteUpTo_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	n, err := s.deleteUpTo("nope", 100)
 	if err != nil {
 		t.Fatalf("err=%v; want nil", err)
@@ -418,7 +418,7 @@ func TestStore_deleteUpTo_MissingScope(t *testing.T) {
 // misses through writeItemsHit (different wire shape).
 
 func TestStore_head_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	items, truncated, found := s.head("nope", 0, 10)
 	if found {
 		t.Error("found=true; want false")
@@ -432,7 +432,7 @@ func TestStore_head_MissingScope(t *testing.T) {
 }
 
 func TestStore_tail_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	items, truncated, found := s.tail("nope", 10, 0)
 	if found {
 		t.Error("found=true; want false")
@@ -446,14 +446,14 @@ func TestStore_tail_MissingScope(t *testing.T) {
 }
 
 func TestStore_get_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	if _, found := s.get("nope", "x", 0); found {
 		t.Error("found=true; want false")
 	}
 }
 
 func TestStore_render_MissingScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	if _, found := s.render("nope", "x", 0); found {
 		t.Error("found=true; want false")
 	}
@@ -463,7 +463,7 @@ func TestStore_render_MissingScope(t *testing.T) {
 // store-level invariant that handleRender used to enforce inline.
 // Pin it on the Store boundary now that the handler is dumb.
 func TestStore_render_PeelsJSONString(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	_, err := s.appendOne(Item{Scope: "s", ID: "html", Payload: json.RawMessage(`"<h1>hi</h1>"`)})
 	if err != nil {
 		t.Fatalf("appendOne: %v", err)
@@ -502,7 +502,7 @@ func TestStore_appendOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 	// first, then the item-bytes reservation overflows — scope must be
 	// rolled back so the overhead is released.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + 50
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	bigItem := Item{Scope: "victim", ID: "x", Payload: bigPayload(200)}
 	_, err := s.appendOne(bigItem)
@@ -523,7 +523,7 @@ func TestStore_appendOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 
 func TestStore_upsertOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + 50
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	bigItem := Item{Scope: "victim", ID: "x", Payload: bigPayload(200)}
 	_, _, err := s.upsertOne(bigItem)
@@ -546,7 +546,7 @@ func TestStore_counterAddOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 	// overflows on the item-bytes reservation after the per-scope
 	// overhead has been claimed.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + 1
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	_, _, err := s.counterAddOne("victim", "c1", 42)
 	var stfe *StoreFullError
@@ -568,7 +568,7 @@ func TestStore_counterAddOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
 // scopes, after which all legitimate writes 507.
 func TestStore_appendOne_DoSPathStaysClean(t *testing.T) {
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + 50
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	for i := 0; i < 1000; i++ {
 		item := Item{Scope: fmt.Sprintf("attempt_%d", i), ID: "x", Payload: bigPayload(200)}
@@ -607,7 +607,7 @@ func TestStore_appendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 	// Cap room for N small items + their scope overheads, plus slack
 	// for the oversized writers' interleaving overhead-reservations.
 	capBytes := int64(N) * (int64(scopeBufferOverhead) + 256)
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
@@ -680,7 +680,7 @@ func TestStore_appendOne_DetachRaceErrorContract(t *testing.T) {
 	var caseACommit, caseBDetached, unexpected int
 
 	for iter := 0; iter < iterations; iter++ {
-		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+		s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 		var bErr error
 		var wg sync.WaitGroup
@@ -731,7 +731,7 @@ func TestStore_appendOne_DetachRaceErrorContract(t *testing.T) {
 }
 
 func TestStore_EnsureScope_CreatesEmpty(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	buf := s.ensureScope("_counters_count_calls")
 	if buf == nil {
 		t.Fatal("ensureScope returned nil")
@@ -750,7 +750,7 @@ func TestStore_EnsureScope_CreatesEmpty(t *testing.T) {
 // would underflow totalBytes by 1024 bytes per cycle on these
 // internal counter scopes — bounded, but a real invariant break.
 func TestStore_EnsureScope_ReservesOverheadAndRoundTrips(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	before := s.totalBytes.Load()
 	buf := s.ensureScope("_counters_count_calls")
@@ -775,7 +775,7 @@ func TestStore_EnsureScope_ReservesOverheadAndRoundTrips(t *testing.T) {
 // /guarded calls.
 func TestStore_EnsureScope_NilOnCapExhausted(t *testing.T) {
 	// Cap = 100 bytes, well below scopeBufferOverhead (1024).
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
 
 	if buf := s.ensureScope("_counters_count_calls"); buf != nil {
 		t.Errorf("ensureScope returned %p with cap below overhead; want nil", buf)
@@ -789,7 +789,7 @@ func TestStore_EnsureScope_NilOnCapExhausted(t *testing.T) {
 }
 
 func TestStore_EnsureScope_Idempotent(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	b1 := s.ensureScope("_counters_count_calls")
 	b2 := s.ensureScope("_counters_count_calls")
 	if b1 != b2 {
@@ -799,7 +799,7 @@ func TestStore_EnsureScope_Idempotent(t *testing.T) {
 
 // ensureScope under concurrent access must not double-create or panic.
 func TestStore_EnsureScope_Concurrent(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	const N = 50
 	bufs := make([]*scopeBuffer, N)
@@ -823,7 +823,7 @@ func TestStore_EnsureScope_Concurrent(t *testing.T) {
 
 // ensureScope on already-existing scope must not wipe its items.
 func TestStore_EnsureScope_PreservesExisting(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("_counters_count_calls")
 	if _, _, err := buf.counterAdd("_counters_count_calls", "cap1", 42); err != nil {
 		t.Fatalf("counterAdd: %v", err)
@@ -846,7 +846,7 @@ func TestStore_EnsureScope_PreservesExisting(t *testing.T) {
 }
 
 func TestStore_DeleteScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("x")
 	_, _ = buf.appendItem(newItem("x", "a", nil))
 	_, _ = buf.appendItem(newItem("x", "b", nil))
@@ -882,7 +882,7 @@ func TestStore_DeleteScope(t *testing.T) {
 // still present. The fix returns *ScopeDetachedError; the handlers
 // surface it as 409 Conflict, matching every other write path.
 func TestScopeBuffer_DeletesDetectDetached(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	buf, _ := s.getOrCreateScope("s")
 	it1, _ := buf.appendItem(newItem("s", "a", nil))
@@ -933,7 +933,7 @@ func TestStore_Append_RejectsAtByteCap(t *testing.T) {
 	// Cap fits reserved scopes (_events, _inbox) + 1 user-scope overhead + 3 items.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
 
 	for i := 0; i < 3; i++ {
@@ -973,7 +973,7 @@ func TestStore_Delete_FreesBytes(t *testing.T) {
 	// Cap fits reserved + 1 user-scope overhead + 2 items.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*2
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
 	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
 		t.Fatalf("append a: %v", err)
@@ -1004,7 +1004,7 @@ func TestStore_DeleteUpTo_FreesBytes(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
 	for i := 0; i < 3; i++ {
 		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
@@ -1031,7 +1031,7 @@ func TestStore_DeleteScope_FreesBytes(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*4
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
 	for i := 0; i < 4; i++ {
 		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
@@ -1058,7 +1058,7 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 	// (no room for the large replacement payload).
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + approxItemSize(small) + 8
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
 	if _, err := buf.appendItem(small); err != nil {
 		t.Fatalf("append small: %v", err)
@@ -1091,7 +1091,7 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 // cap; negative deltas always succeed. A CAS loop isn't directly observable,
 // so this test just validates the return-value contract.
 func TestStore_ReserveBytes_RejectsPositiveOverCap(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
 	if ok, _, _ := s.reserveBytes(80); !ok {
 		t.Fatal("reserve 80/100 should succeed")
 	}
@@ -1120,7 +1120,7 @@ func TestStore_ReserveBytes_RejectsPositiveOverCap(t *testing.T) {
 // parallel append/delete on the same scope and asserts the final counter
 // matches the items that survived in s.scopes.
 func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 1000, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 1000, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	const rounds = 200
 	for i := 0; i < rounds; i++ {
@@ -1185,7 +1185,7 @@ func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
 // Takes per-scope read locks during the walk; safe to call from tests
 // that have other goroutines mutating the store, but any concurrent
 // mutation observed mid-walk is the caller's tolerance to weigh.
-func assertStatsCountersInvariant(t *testing.T, s *Store, ctx string) {
+func assertStatsCountersInvariant(t *testing.T, s *store, ctx string) {
 	t.Helper()
 
 	var sumItems int64
@@ -1224,7 +1224,7 @@ func assertStatsCountersInvariant(t *testing.T, s *Store, ctx string) {
 // context string — much friendlier than chasing a "scope_count=42 but
 // got=43" report from production.
 func TestStore_StatsCounters_Invariant_AcrossPaths(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	assertStatsCountersInvariant(t, s, "fresh store")
 
 	// appendOne — single-item write into a freshly created scope.
@@ -1353,7 +1353,7 @@ func TestStore_StatsCounters_Invariant_DoSCleanup(t *testing.T) {
 	// MaxItemBytes large enough to allow scope creation but small enough
 	// that the item itself fails on the per-item cap. Actually easier:
 	// fill the store cap with overhead first, then try one more append.
-	s := NewStore(Config{
+	s := newStore(Config{
 		ScopeMaxItems: 10,
 		// Cap fits reserved scopes (_events, _inbox) + one user scope + a tiny item.
 		MaxStoreBytes: reservedScopesOverhead + int64(scopeBufferOverhead) + 100,
@@ -1400,7 +1400,7 @@ func TestStore_StatsCounters_Invariant_DoSCleanup(t *testing.T) {
 // client can use 0 as the unambiguous "I've never seen this cache
 // before" marker.
 func TestStore_LastWriteTS_StartsAtZero(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	if got := s.lastWriteTS.Load(); got != 0 {
 		t.Errorf("fresh store lastWriteTS=%d want 0", got)
 	}
@@ -1417,7 +1417,7 @@ func TestStore_LastWriteTS_StartsAtZero(t *testing.T) {
 // forgets to wire init or moves it past a returning code path, this
 // test fails with the offending invariant.
 func TestNewStore_PreCreatesReservedScopes(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	// Each reserved scope exists, is empty, and has lastWriteTS=0.
 	for _, name := range reservedScopeNames {
@@ -1471,7 +1471,7 @@ func TestNewStore_PreCreatesReservedScopes(t *testing.T) {
 // might be confused with reserved-by-prefix) to make sure they don't
 // exist on a fresh store.
 func TestNewStore_PreCreatesReservedScopes_NonReserved(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	for _, name := range []string{
 		"thread:42",     // ordinary user scope
@@ -1493,7 +1493,7 @@ func TestNewStore_PreCreatesReservedScopes_NonReserved(t *testing.T) {
 // advances the counter. If a future change forgets to wire the bump
 // into one path, this test fails with the path's name in the context.
 func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	// step runs `op` and asserts s.lastWriteTS strictly advances. The
 	// helper sleeps a microsecond first so the post-op time.Now() value
@@ -1592,7 +1592,7 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 // counter ops on an existing-scope path where no other bump source
 // exists.
 func TestStore_LastWriteTS_NotBumpedByCounterAdd(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	// Seed the scope via /append so getOrCreateScope's structural bump
 	// has fired before we measure counter activity.
@@ -1655,7 +1655,7 @@ func TestStore_LastWriteTS_MonotonicUnderRace(t *testing.T) {
 		workers      = 16
 		opsPerWorker = 200
 	)
-	s := NewStore(Config{ScopeMaxItems: 1000, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 1000, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	maxObserved := make([]int64, workers)
 	var wg sync.WaitGroup

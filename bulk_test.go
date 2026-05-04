@@ -24,7 +24,7 @@ func TestStore_ReplaceScopes_RaceVsWipe(t *testing.T) {
 	const iterations = 5000
 
 	for i := 0; i < iterations; i++ {
-		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+		s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 		// Seed multiple scopes so /warm has multiple oldBytes snapshots and
 		// a wider Phase 1.5 → Phase 2 window for /wipe to slip into.
@@ -69,7 +69,7 @@ func TestStore_ReplaceScopes_RaceVsRebuild(t *testing.T) {
 	const iterations = 5000
 
 	for i := 0; i < iterations; i++ {
-		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+		s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 		seed := map[string][]Item{}
 		for s2 := 0; s2 < 5; s2++ {
@@ -108,7 +108,7 @@ func TestStore_ReplaceScopes_RaceVsRebuild(t *testing.T) {
 	}
 }
 
-func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
+func assertBytesInvariant(t *testing.T, s *store, iter int, label string) {
 	t.Helper()
 
 	var sum int64
@@ -139,7 +139,7 @@ func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
 // --- Store.wipe ---------------------------------------------------------------
 
 func TestStore_Wipe_EmptyStore(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	// "Empty" still has the reserved scopes _events and _inbox pre-created
 	// at boot. /wipe drops those (counted in the return) and immediately
@@ -153,7 +153,7 @@ func TestStore_Wipe_EmptyStore(t *testing.T) {
 }
 
 func TestStore_Wipe_RemovesEveryScopeAndCountsItems(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	for _, name := range []string{"a", "b", "c"} {
 		buf, _ := s.getOrCreateScope(name)
@@ -185,7 +185,7 @@ func TestStore_Wipe_RemovesEveryScopeAndCountsItems(t *testing.T) {
 // reservation starts from a clean baseline. This is the property /wipe
 // promises to clients that are about to /rebuild into a freshly empty store.
 func TestStore_Wipe_ResetsTotalBytes(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	buf, _ := s.getOrCreateScope("s")
 	for i := 0; i < 5; i++ {
@@ -219,7 +219,7 @@ func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 	// The fourth item then exceeds the cap.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	buf, _ := s.getOrCreateScope("s")
 	for i := 0; i < 3; i++ {
 		if _, err := buf.appendItem(newItem("s", "", nil)); err != nil {
@@ -247,7 +247,7 @@ func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 // succeeding into an orphan buffer no reader can reach. The store's byte
 // counter must also remain at zero.
 func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	buf, _ := s.getOrCreateScope("s")
 	if _, err := buf.appendItem(newItem("s", "a", nil)); err != nil {
@@ -273,7 +273,7 @@ func TestStore_Wipe_DetachesOrphanedBuffers(t *testing.T) {
 // lands in an orphan buffer that no reader can reach. Mirrors the wipe and
 // delete_scope guarantees.
 func TestStore_RebuildAll_DetachesOrphanedBuffers(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	buf, _ := s.getOrCreateScope("old")
 	if _, err := buf.appendItem(newItem("old", "a", nil)); err != nil {
@@ -302,7 +302,7 @@ func TestStore_RebuildAll_DetachesOrphanedBuffers(t *testing.T) {
 }
 
 func TestStore_ReplaceScopes_LeavesOtherScopesUntouched(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	keep, _ := s.getOrCreateScope("keep")
 	_, _ = keep.appendItem(newItem("keep", "k1", nil))
@@ -327,7 +327,7 @@ func TestStore_ReplaceScopes_LeavesOtherScopesUntouched(t *testing.T) {
 // (not an offender list), since the empty scope could not have passed the
 // handler's per-item validation.
 func TestStore_ReplaceScopes_RejectsEmptyScope(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 	grouped := map[string][]Item{
 		"": {newItem("", "a", nil)},
 	}
@@ -337,7 +337,7 @@ func TestStore_ReplaceScopes_RejectsEmptyScope(t *testing.T) {
 }
 
 func TestStore_RebuildAll_WipesEverything(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	old, _ := s.getOrCreateScope("old")
 	_, _ = old.appendItem(newItem("old", "", nil))
@@ -364,7 +364,7 @@ func TestStore_RebuildAll_WipesEverything(t *testing.T) {
 // the request exceeds the cap. The error carries every offending scope so a
 // client can fix all at once rather than discovering them one-by-one.
 func TestStore_ReplaceScopes_RejectsOverCapWithAllOffenders(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 3, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 3, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	keep, _ := s.getOrCreateScope("untouched")
 	_, _ = keep.appendItem(newItem("untouched", "k", nil))
@@ -422,7 +422,7 @@ func TestStore_ReplaceScopes_RejectsOverCapWithAllOffenders(t *testing.T) {
 }
 
 func TestStore_RebuildAll_RejectsOverCapWithAllOffenders(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 2, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 2, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	priorScope, _ := s.getOrCreateScope("prior")
 	_, _ = priorScope.appendItem(newItem("prior", "p", nil))
@@ -459,7 +459,7 @@ func TestStore_RebuildAll_RejectsOverCapWithAllOffenders(t *testing.T) {
 }
 
 func TestStore_RebuildAll_RejectsDuplicateIDs(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	s2, _ := s.getOrCreateScope("keep")
 	_, _ = s2.appendItem(newItem("keep", "k1", nil))
@@ -491,7 +491,7 @@ func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 	// the cap of 3 overheads + 3 items.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 	// Pre-seed an unrelated scope so we can assert it survives the reject.
 	pre, _ := s.getOrCreateScope("untouched")
@@ -557,7 +557,7 @@ func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
 	const iterations = 500
 
 	for iter := 0; iter < iterations; iter++ {
-		s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+		s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
 		// Pre-seed "batch" with 2 items; /warm will replace it with 4
 		// items, net delta +2 item-sizes.
@@ -634,7 +634,7 @@ func TestStore_RebuildAll_RejectsAtByteCap(t *testing.T) {
 	// 1 itemSize.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*2
 
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 	pre, _ := s.getOrCreateScope("prior")
 	if _, err := pre.appendItem(newItem("prior", "p", nil)); err != nil {
 		t.Fatalf("pre-seed: %v", err)
@@ -664,7 +664,7 @@ func TestStore_RebuildAll_RejectsAtByteCap(t *testing.T) {
 // A successful /rebuild replaces the store entirely: totalBytes must match
 // the sum of the newly installed items, not be additive to the prior state.
 func TestStore_RebuildAll_ResetsByteCounter(t *testing.T) {
-	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	pre, _ := s.getOrCreateScope("old")
 	for i := 0; i < 5; i++ {

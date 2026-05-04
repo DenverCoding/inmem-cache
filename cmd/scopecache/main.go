@@ -202,8 +202,8 @@ func main() {
 		},
 	}
 	cfg = cfg.WithDefaults()
-	store := scopecache.NewStore(cfg)
-	api := scopecache.NewAPI(store, scopecache.APIConfig{})
+	gw := scopecache.NewGateway(cfg)
+	api := scopecache.NewAPI(gw, scopecache.APIConfig{})
 
 	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item; events_mode=%s",
 		cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20,

@@ -83,7 +83,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	if err != nil {
 		return err
 	}
-	store := scopecache.NewStore(scopecache.Config{
+	gw := scopecache.NewGateway(scopecache.Config{
 		ScopeMaxItems: h.ScopeMaxItems,
 		MaxStoreBytes: int64(h.MaxStoreMB) << 20,
 		MaxItemBytes:  int64(h.MaxItemMB) << 20,
@@ -95,7 +95,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 			MaxItemBytes: int64(h.InboxMaxItemKB) << 10,
 		},
 	})
-	h.api = scopecache.NewAPI(store, scopecache.APIConfig{})
+	h.api = scopecache.NewAPI(gw, scopecache.APIConfig{})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
 	return nil

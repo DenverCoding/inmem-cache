@@ -15,11 +15,11 @@ import (
 // of filler JSON. A 100-scope × 1000-item dataset with ~512-byte payloads
 // produces roughly 57 MiB of approxItemSize — well above the 50 MiB floor
 // we want to measure against.
-func benchStore(b *testing.B, numScopes, itemsPerScope, payloadBytes int) (*Store, []string, []string) {
+func benchStore(b *testing.B, numScopes, itemsPerScope, payloadBytes int) (*store, []string, []string) {
 	b.Helper()
 
 	// Cap tall enough for the dataset: 1 GiB store, 1M items per scope.
-	store := NewStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20})
+	store := newStore(Config{ScopeMaxItems: 1_000_000, MaxStoreBytes: 1 << 30, MaxItemBytes: 1 << 20})
 
 	payloadFiller := make([]byte, payloadBytes)
 	for i := range payloadFiller {
@@ -156,7 +156,7 @@ func BenchmarkStore_Append_EventsFull(b *testing.B) {
 
 func benchAppendWithEventsMode(b *testing.B, mode EventsMode) {
 	b.Helper()
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 1_000_000,
 		MaxStoreBytes: 8 << 30,
 		MaxItemBytes:  1 << 20,
@@ -192,7 +192,7 @@ func benchAppendWithEventsMode(b *testing.B, mode EventsMode) {
 // scope-map mutex was sharded: candidates are atomic-CAS contention on
 // totalBytes, *scopeBuffer alloc + map header alloc, and fmt formatting.
 func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 50_000,    // matches phase4 Caddyfile setting
 		MaxStoreBytes: 128 << 30, // 128 GiB; b.N is open-ended so don't risk a 507 mid-bench
 		MaxItemBytes:  1 << 20,
@@ -226,7 +226,7 @@ func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
 //	go tool pprof -top cpu.prof
 //	go tool pprof -top -alloc_space mem.prof
 func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 1_000_000,
 		MaxStoreBytes: 8 << 30,
 		MaxItemBytes:  1 << 20,
@@ -257,7 +257,7 @@ func BenchmarkStore_AppendUniqueScope_Parallel(b *testing.B) {
 // most of this difference into the request-handling floor — this
 // bench is the cleaner read of the per-call cache-side savings.
 func BenchmarkStore_RenderStringPayload_Parallel(b *testing.B) {
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 100_000,
 		MaxStoreBytes: 1 << 30,
 		MaxItemBytes:  1 << 20,
@@ -308,7 +308,7 @@ func BenchmarkStore_RenderStringPayload_Parallel(b *testing.B) {
 // ~5000-vs-13 comparisons per call. Counter and update workloads that
 // hot-loop on a handful of scopes with many items see this directly.
 func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 100_000,
 		MaxStoreBytes: 1 << 30,
 		MaxItemBytes:  1 << 20,
@@ -477,7 +477,7 @@ func BenchmarkStore_Head_Parallel(b *testing.B) {
 // Compare against _Append32Scopes_Parallel: the throughput delta is the
 // upper bound on how much buf.mu costs us.
 func BenchmarkStore_Append1Scope_Parallel(b *testing.B) {
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 100_000_000, // far above any realistic b.N
 		MaxStoreBytes: 128 << 30,
 		MaxItemBytes:  1 << 20,
@@ -513,7 +513,7 @@ func BenchmarkStore_Append1Scope_Parallel(b *testing.B) {
 // to _AppendUniqueScope_Parallel (adds shard-write-lock + scope-create
 // + struct-alloc overhead on top of the same totalBytes CAS).
 func BenchmarkStore_Append32Scopes_Parallel(b *testing.B) {
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 100_000_000,
 		MaxStoreBytes: 128 << 30,
 		MaxItemBytes:  1 << 20,
@@ -566,7 +566,7 @@ func BenchmarkStore_AppendNearCap_Parallel(b *testing.B) {
 	// + 8 (Seq) + 8 (Ts slot) + 1 (payload "1") = 61.
 	const anchorSize = 61
 	capBytes := int64(scopeBufferOverhead) + anchorSize
-	store := NewStore(Config{
+	store := newStore(Config{
 		ScopeMaxItems: 100_000_000,
 		MaxStoreBytes: capBytes,
 		MaxItemBytes:  1 << 20,

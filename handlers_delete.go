@@ -25,7 +25,7 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req DeleteRequest
+	var req deleteRequest
 	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
@@ -61,7 +61,7 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req DeleteUpToRequest
+	var req deleteUpToRequest
 	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
@@ -93,7 +93,7 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req DeleteScopeRequest
+	var req deleteScopeRequest
 	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return

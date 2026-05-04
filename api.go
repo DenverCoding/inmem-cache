@@ -26,7 +26,7 @@ type APIConfig struct{}
 // caps. Multi-tenancy, batching and operator-policy concerns live in
 // addon packages built on top of the public *API surface.
 type API struct {
-	store *Store
+	store *store
 	// maxBulkBytes is the per-request body cap for /warm and /rebuild,
 	// derived from store.maxStoreBytes via bulkRequestBytesFor so a
 	// fully-loaded store can always be expressed as a single bulk
@@ -50,15 +50,26 @@ type API struct {
 	maxResponseBytes int64
 }
 
-// NewAPI wires the HTTP API to a Store and an APIConfig. Every byte
-// cap on this layer is derived from the store's configuration so the
-// HTTP guardrails always track the underlying cache budget without
-// the operator having to keep two sets of knobs in sync.
-func NewAPI(store *Store, _ APIConfig) *API {
+// NewAPI wires the HTTP API to a Gateway and an APIConfig. Adapters
+// (cmd/scopecache, caddymodule) call NewGateway(cfg) → NewAPI(gw, ...)
+// → RegisterRoutes(mux) to mount the HTTP surface. Every byte cap on
+// this layer is derived from the underlying store's configuration so
+// the HTTP guardrails always track the cache budget without the
+// operator keeping two sets of knobs in sync.
+//
+// Why *Gateway, not *store: Gateway is the public type — addons,
+// adapters, tests, all hold *Gateway. NewAPI taking *store would
+// force every adapter to know the (private) store type or pass a
+// gateway-extracted store via a getter, both worse than just taking
+// the gateway directly. The HTTP layer reaches into gw.store for
+// validation-cap reads and dispatches every handler through
+// gw.store.* (post-step-6.6 the validator lives at the store entry,
+// so handlers don't validate themselves).
+func NewAPI(gw *Gateway, _ APIConfig) *API {
 	return &API{
-		store:            store,
-		maxBulkBytes:     bulkRequestBytesFor(store.maxStoreBytes),
-		maxSingleBytes:   singleRequestBytesFor(store.maxItemBytes),
-		maxResponseBytes: store.maxStoreBytes,
+		store:            gw.store,
+		maxBulkBytes:     bulkRequestBytesFor(gw.store.maxStoreBytes),
+		maxSingleBytes:   singleRequestBytesFor(gw.store.maxItemBytes),
+		maxResponseBytes: gw.store.maxStoreBytes,
 	}
 }

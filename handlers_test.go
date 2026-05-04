@@ -17,7 +17,7 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// payloads; dedicated byte-cap behaviour tests construct stores with a
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
 	api := NewAPI(
-		NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
+		NewGateway(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
 		APIConfig{},
 	)
 	mux := http.NewServeMux()
@@ -1249,7 +1249,7 @@ func TestStats_EventsDropsTotal_TicksOnDrops(t *testing.T) {
 		MaxItemBytes:  1 << 20,
 		Events:        EventsConfig{Mode: EventsModeFull},
 	}
-	api := NewAPI(NewStore(cfg), APIConfig{})
+	api := NewAPI(NewGateway(cfg), APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -2470,7 +2470,7 @@ func TestReservedScopes_RebuildRestoresBaseline(t *testing.T) {
 // — accepts Config, hands you (mux, api).
 func newReservedScopesTestHandler(t *testing.T, cfg Config) (http.Handler, *API) {
 	t.Helper()
-	api := NewAPI(NewStore(cfg), APIConfig{})
+	api := NewAPI(NewGateway(cfg), APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 	return mux, api
@@ -2915,7 +2915,7 @@ func TestEvents_AutoPopulate_DropsOnOverflow(t *testing.T) {
 		MaxItemBytes:  1 << 20,
 		Events:        EventsConfig{Mode: EventsModeFull},
 	}
-	api := NewAPI(NewStore(cfg), APIConfig{})
+	api := NewAPI(NewGateway(cfg), APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -3230,7 +3230,7 @@ func TestEvents_AutoPopulate_HighVolume_AppendThenDelete(t *testing.T) {
 		MaxItemBytes:  1 << 20,
 		Events:        EventsConfig{Mode: EventsModeFull},
 	}
-	api := NewAPI(NewStore(cfg), APIConfig{})
+	api := NewAPI(NewGateway(cfg), APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -3444,7 +3444,7 @@ func TestEvents_AutoPopulate_WipeNoEmit(t *testing.T) {
 		MaxItemBytes:  1 << 20,
 		Events:        EventsConfig{Mode: EventsModeFull},
 	}
-	api := NewAPI(NewStore(cfg), APIConfig{})
+	api := NewAPI(NewGateway(cfg), APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
@@ -3501,7 +3501,7 @@ func TestEvents_AutoPopulate_RebuildNoEmit(t *testing.T) {
 		MaxItemBytes:  1 << 20,
 		Events:        EventsConfig{Mode: EventsModeFull},
 	}
-	api := NewAPI(NewStore(cfg), APIConfig{})
+	api := NewAPI(NewGateway(cfg), APIConfig{})
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 

@@ -264,7 +264,7 @@ func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
 // validateCounterAddRequest returns the parsed `by` on success so the handler
 // can pass it straight to the store without re-dereferencing the pointer.
 // Missing `by` is distinguished from an explicit zero by the pointer type.
-func validateCounterAddRequest(req CounterAddRequest) (by int64, returnErr error) {
+func validateCounterAddRequest(req counterAddRequest) (by int64, returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/counter_add"); err != nil {
 		return 0, err
@@ -288,7 +288,7 @@ func validateCounterAddRequest(req CounterAddRequest) (by int64, returnErr error
 	return by, nil
 }
 
-func validateDeleteRequest(req DeleteRequest) (returnErr error) {
+func validateDeleteRequest(req deleteRequest) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete"); err != nil {
 		return err
@@ -304,7 +304,7 @@ func validateDeleteRequest(req DeleteRequest) (returnErr error) {
 	return nil
 }
 
-func validateDeleteScopeRequest(req DeleteScopeRequest) (returnErr error) {
+func validateDeleteScopeRequest(req deleteScopeRequest) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete_scope"); err != nil {
 		return err
@@ -315,7 +315,7 @@ func validateDeleteScopeRequest(req DeleteScopeRequest) (returnErr error) {
 	return nil
 }
 
-func validateDeleteUpToRequest(req DeleteUpToRequest) (returnErr error) {
+func validateDeleteUpToRequest(req deleteUpToRequest) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete_up_to"); err != nil {
 		return err

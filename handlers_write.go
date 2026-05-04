@@ -129,7 +129,7 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req CounterAddRequest
+	var req counterAddRequest
 	if err := decodeBody(w, r, api.maxSingleBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return

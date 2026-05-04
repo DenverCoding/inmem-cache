@@ -50,7 +50,7 @@ type scopeBuffer struct {
 	// store is set when the buffer is owned by a Store. When nil (orphan
 	// buffers used in unit tests) byte-budget accounting is skipped — the
 	// tests exercise item-count and seq logic without spinning up a store.
-	store *Store
+	store *store
 	// detached is set true when the buffer has been unlinked from its Store
 	// by /delete_scope, /wipe or /rebuild. Writes that reach a detached
 	// buffer via a stale pointer return *ScopeDetachedError so the caller

@@ -25,7 +25,7 @@ type scopeShard struct {
 	scopes map[string]*scopeBuffer
 }
 
-type Store struct {
+type store struct {
 	// shards splits the scope map into numShards independently-locked
 	// buckets. Per-scope hot paths (getOrCreate, lookup, delete) take
 	// only one shard's lock; multi-shard ops (/wipe, /rebuild, /warm,
@@ -200,7 +200,7 @@ type Store struct {
 // b.mu critical sections (which is the common case: write paths
 // stamp b.lastWriteTS = ts under b.mu, then call this with the same
 // ts).
-func (s *Store) bumpLastWriteTS(nowUs int64) {
+func (s *store) bumpLastWriteTS(nowUs int64) {
 	for {
 		cur := s.lastWriteTS.Load()
 		if nowUs <= cur {
@@ -253,7 +253,7 @@ func isReservedScope(scope string) bool {
 // the validator's checkItemSize. Other write handlers (/upsert,
 // /update, /counter_add) reject reserved scopes at the validator
 // before reaching this path, so they always see the global cap.
-func (s *Store) maxItemBytesFor(scope string) int64 {
+func (s *store) maxItemBytesFor(scope string) int64 {
 	switch scope {
 	case EventsScopeName:
 		return s.eventsMaxItemBytes
@@ -272,7 +272,7 @@ func (s *Store) maxItemBytesFor(scope string) int64 {
 // global byte budget gates writes there). Used by
 // initReservedScopes(Locked) to install the right cap at boot /
 // after wipe / after rebuild.
-func (s *Store) maxItemsFor(scope string) int {
+func (s *store) maxItemsFor(scope string) int {
 	switch scope {
 	case EventsScopeName:
 		return unboundedScopeMaxItems
@@ -305,7 +305,7 @@ const unboundedScopeMaxItems = 0
 // the invariant `s.lastWriteTS >= max(buf.lastWriteTS)` requires
 // every scope's tick to also be 0 in that pristine state. The first
 // real write is what advances both counters.
-func (s *Store) initReservedScopes() {
+func (s *store) initReservedScopes() {
 	for _, name := range reservedScopeNames {
 		sh := s.shardFor(name)
 		sh.mu.Lock()
@@ -340,7 +340,7 @@ func (s *Store) initReservedScopes() {
 // operation, not a separate one. We therefore keep buf.lastWriteTS
 // at the surrounding-event value (which the wipe/rebuild call
 // already established as s.lastWriteTS).
-func (s *Store) initReservedScopesLocked() {
+func (s *store) initReservedScopesLocked() {
 	for _, name := range reservedScopeNames {
 		sh := s.shardFor(name)
 		if _, exists := sh.scopes[name]; exists {
@@ -357,9 +357,9 @@ func (s *Store) initReservedScopesLocked() {
 	}
 }
 
-func NewStore(c Config) *Store {
+func newStore(c Config) *store {
 	c = c.WithDefaults()
-	s := &Store{
+	s := &store{
 		hashSeed:           maphash.MakeSeed(),
 		defaultMaxItems:    c.ScopeMaxItems,
 		maxStoreBytes:      c.MaxStoreBytes,
@@ -385,11 +385,11 @@ func NewStore(c Config) *Store {
 // maphash uses a per-process random seed, so distribution is uniform
 // across shards and not predictable from the scope name — adversarial
 // scope-name picking cannot deliberately collide on one shard.
-func (s *Store) shardIdxFor(scope string) uint64 {
+func (s *store) shardIdxFor(scope string) uint64 {
 	return maphash.String(s.hashSeed, scope) & shardMask
 }
 
-func (s *Store) shardFor(scope string) *scopeShard {
+func (s *store) shardFor(scope string) *scopeShard {
 	return &s.shards[s.shardIdxFor(scope)]
 }
 
@@ -402,7 +402,7 @@ func (s *Store) shardFor(scope string) *scopeShard {
 // `seen` is indexed by shard-index, so iterating it in order produces
 // the ascending sequence directly — no sort, no intermediate index
 // slice.
-func (s *Store) shardsForScopes(scopes []string) []*scopeShard {
+func (s *store) shardsForScopes(scopes []string) []*scopeShard {
 	var seen [numShards]bool
 	for _, scope := range scopes {
 		seen[s.shardIdxFor(scope)] = true
@@ -429,14 +429,14 @@ func (s *Store) shardsForScopes(scopes []string) []*scopeShard {
 
 // lockAllShards locks every shard in ascending index order. Used by
 // /wipe, /rebuild, /admin /delete_guarded.
-func (s *Store) lockAllShards() {
+func (s *store) lockAllShards() {
 	for i := range s.shards {
 		s.shards[i].mu.Lock()
 	}
 }
 
 // unlockAllShards is the matching release for lockAllShards.
-func (s *Store) unlockAllShards() {
+func (s *store) unlockAllShards() {
 	for i := range s.shards {
 		s.shards[i].mu.Unlock()
 	}
@@ -462,7 +462,7 @@ func unlockShards(shards []*scopeShard) {
 // the cap for positive deltas. Negative deltas (releases) always succeed.
 // Returns (ok, totalAfterAttempt, cap). Positive deltas use a CAS loop so
 // concurrent /append writers never collectively over-commit the cap.
-func (s *Store) reserveBytes(delta int64) (bool, int64, int64) {
+func (s *store) reserveBytes(delta int64) (bool, int64, int64) {
 	if delta <= 0 {
 		n := s.totalBytes.Add(delta)
 		return true, n, s.maxStoreBytes
@@ -502,13 +502,13 @@ const scopeBufferOverhead = 1024
 // store means every production path creates bound buffers; tests that
 // exercise scopeBuffer in isolation use newscopeBuffer directly and
 // accept that byte tracking is a no-op there.
-func (s *Store) newscopeBuffer() *scopeBuffer {
+func (s *store) newscopeBuffer() *scopeBuffer {
 	b := newscopeBuffer(s.defaultMaxItems)
 	b.store = s
 	return b
 }
 
-func (s *Store) getOrCreateScope(scope string) (*scopeBuffer, error) {
+func (s *store) getOrCreateScope(scope string) (*scopeBuffer, error) {
 	buf, _, err := s.getOrCreateScopeTrackingCreated(scope)
 	return buf, err
 }
@@ -519,7 +519,7 @@ func (s *Store) getOrCreateScope(scope string) (*scopeBuffer, error) {
 // the `created` flag to roll the empty scope back when the subsequent
 // item-byte reservation fails — see cleanupIfEmptyAndUnused. All other
 // callers go through getOrCreateScope, which discards the flag.
-func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, bool, error) {
+func (s *store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, bool, error) {
 	if scope == "" {
 		return nil, false, errors.New("the 'scope' field is required")
 	}
@@ -597,7 +597,7 @@ func (s *Store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, boo
 //     concurrent in-flight writer that wakes up on this buf after we
 //     released the locks returns *ScopeDetachedError, same semantics
 //     as a /delete_scope race.
-func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
+func (s *store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 	sh := s.shardFor(scope)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -635,7 +635,7 @@ func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 // no-op; with Notify or Full it does a second appendOne into the
 // `_events` scope, which is recursion-guarded inside the helper.
 // See events.go for the full discipline.
-func (s *Store) appendOne(item Item) (Item, error) {
+func (s *store) appendOne(item Item) (Item, error) {
 	if err := validateWriteItem(item, "/append", s.maxItemBytesFor(item.Scope)); err != nil {
 		return Item{}, err
 	}
@@ -669,7 +669,7 @@ func (s *Store) appendOne(item Item) (Item, error) {
 // the upsert outcome, not the scope-creation outcome. On success it
 // emits an upsert event into `_events` (Phase A auto-populate; gated
 // on Config.Events.Mode — see events.go).
-func (s *Store) upsertOne(item Item) (Item, bool, error) {
+func (s *store) upsertOne(item Item) (Item, bool, error) {
 	if err := validateUpsertItem(item, s.maxItemBytes); err != nil {
 		return Item{}, false, err
 	}
@@ -694,14 +694,14 @@ func (s *Store) upsertOne(item Item) (Item, bool, error) {
 // success it emits a counter_add event into `_events` carrying the
 // increment `by` — never the post-add value (action-logging, not
 // result-logging; see events.go).
-func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
+func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	// Construct the request shape the validator expects so the same
 	// rules (scope shape + reserved-rejection + by != 0 + range) apply
 	// to both HTTP and Go-API callers. The pointer-nil check
 	// (`by required`) is the HTTP-only concern (JSON missing-field
 	// detection) and stays in the handler — Go callers always pass an
 	// int64.
-	if _, err := validateCounterAddRequest(CounterAddRequest{Scope: scope, ID: id, By: &by}); err != nil {
+	if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: id, By: &by}); err != nil {
 		return 0, false, err
 	}
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
@@ -731,7 +731,7 @@ func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 // logging (the request) rather than action-logging (the change).
 // Drainers replaying `_events` against an empty cache produce the
 // same final state without these noise entries.
-func (s *Store) updateOne(item Item) (int, error) {
+func (s *store) updateOne(item Item) (int, error) {
 	if err := validateUpdateItem(item, s.maxItemBytes); err != nil {
 		return 0, err
 	}
@@ -763,8 +763,8 @@ func (s *Store) updateOne(item Item) (int, error) {
 //
 // Emits a delete event on hit (count > 0); see updateOne for the
 // action-logging-on-effective-change rationale.
-func (s *Store) deleteOne(scope, id string, seq uint64) (int, error) {
-	if err := validateDeleteRequest(DeleteRequest{Scope: scope, ID: id, Seq: seq}); err != nil {
+func (s *store) deleteOne(scope, id string, seq uint64) (int, error) {
+	if err := validateDeleteRequest(deleteRequest{Scope: scope, ID: id, Seq: seq}); err != nil {
 		return 0, err
 	}
 	buf, ok := s.getScope(scope)
@@ -793,8 +793,8 @@ func (s *Store) deleteOne(scope, id string, seq uint64) (int, error) {
 // Returns (deleted_count, err); missing scope reports (0, nil). Emits
 // a delete_up_to event on hit (count > 0); a cursor that selects no
 // items is a no-op against cache state and is not emitted.
-func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
-	if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: scope, MaxSeq: maxSeq}); err != nil {
+func (s *store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
+	if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: scope, MaxSeq: maxSeq}); err != nil {
 		return 0, err
 	}
 	buf, ok := s.getScope(scope)
@@ -817,7 +817,7 @@ func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 // recordRead. A missing scope reports (nil, false, false); a
 // found-but-empty window reports (empty, false, true) — handlers
 // translate that into hit:false / count:0.
-func (s *Store) head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool) {
+func (s *store) head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false, false
@@ -831,7 +831,7 @@ func (s *Store) head(scope string, afterSeq uint64, limit int) ([]Item, bool, bo
 
 // tail returns up to `limit` newest items in the scope, skipping the
 // first `offset`. Same return shape and bookkeeping as head.
-func (s *Store) tail(scope string, limit, offset int) ([]Item, bool, bool) {
+func (s *store) tail(scope string, limit, offset int) ([]Item, bool, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false, false
@@ -846,7 +846,7 @@ func (s *Store) tail(scope string, limit, offset int) ([]Item, bool, bool) {
 // get returns one item by scope+id or scope+seq. (item, found) — the
 // found flag is true only when both the scope and the item exist.
 // recordRead fires on hit only.
-func (s *Store) get(scope, id string, seq uint64) (Item, bool) {
+func (s *store) get(scope, id string, seq uint64) (Item, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return Item{}, false
@@ -869,7 +869,7 @@ func (s *Store) get(scope, id string, seq uint64) (Item, bool) {
 // renderBytes shortcut for JSON-string payloads at the Store boundary
 // so the handler does not need to know the renderBytes field exists.
 // (bytes, found) — same hit semantics as get; recordRead fires on hit.
-func (s *Store) render(scope, id string, seq uint64) ([]byte, bool) {
+func (s *store) render(scope, id string, seq uint64) ([]byte, bool) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return nil, false
@@ -912,7 +912,7 @@ func (s *Store) render(scope, id string, seq uint64) ([]byte, bool) {
 // expected to treat such infrastructure writes as best-effort and
 // silently skip on nil (observability is not auth — losing a counter
 // must never block a legitimate request).
-func (s *Store) ensureScope(scope string) *scopeBuffer {
+func (s *store) ensureScope(scope string) *scopeBuffer {
 	sh := s.shardFor(scope)
 
 	sh.mu.RLock()
@@ -943,7 +943,7 @@ func (s *Store) ensureScope(scope string) *scopeBuffer {
 	return buf
 }
 
-func (s *Store) getScope(scope string) (*scopeBuffer, bool) {
+func (s *store) getScope(scope string) (*scopeBuffer, bool) {
 	sh := s.shardFor(scope)
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
@@ -952,13 +952,13 @@ func (s *Store) getScope(scope string) (*scopeBuffer, bool) {
 	return buf, ok
 }
 
-func (s *Store) deleteScope(scope string) (int, bool, error) {
+func (s *store) deleteScope(scope string) (int, bool, error) {
 	// validateDeleteScopeRequest enforces the same shape rules as
 	// /delete_scope (scope present + non-reserved). Empty scope
 	// triggers the validator's "scope required" reject; reserved scope
 	// triggers the "is reserved" reject — both come back wrapped in
 	// ErrInvalidInput so the handler can map to 400.
-	if err := validateDeleteScopeRequest(DeleteScopeRequest{Scope: scope}); err != nil {
+	if err := validateDeleteScopeRequest(deleteScopeRequest{Scope: scope}); err != nil {
 		return 0, false, err
 	}
 
@@ -1073,7 +1073,7 @@ type reservedScopeEntry struct {
 // shards sequentially, releasing locks between them). /stats has
 // always been an approximation; this version is honest about it
 // without paying the per-scope enumeration cost.
-func (s *Store) stats() storeStats {
+func (s *store) stats() storeStats {
 	return storeStats{
 		ScopeCount:       int(s.scopeCount.Load()),
 		TotalItems:       int(s.totalItems.Load()),
@@ -1098,7 +1098,7 @@ func (s *Store) stats() storeStats {
 // write mode for the whole sweep, so this method either runs entirely
 // before or entirely after the destructive op — never observing a
 // half-wiped state.
-func (s *Store) reservedScopeStats() []reservedScopeEntry {
+func (s *store) reservedScopeStats() []reservedScopeEntry {
 	out := make([]reservedScopeEntry, 0, len(reservedScopeNames))
 	for _, name := range reservedScopeNames {
 		buf, ok := s.getScope(name)
@@ -1118,7 +1118,7 @@ func (s *Store) reservedScopeStats() []reservedScopeEntry {
 	return out
 }
 
-func (s *Store) listScopes() map[string]*scopeBuffer {
+func (s *store) listScopes() map[string]*scopeBuffer {
 	out := make(map[string]*scopeBuffer)
 	for i := range s.shards {
 		sh := &s.shards[i]
@@ -1161,7 +1161,7 @@ type scopeListEntry struct {
 // cannot block writers on its shard for the duration of the listing.
 // A scope deleted between the snapshot and stats() materialises its
 // last-known state — same advisory-snapshot caveat as /stats (§7.3).
-func (s *Store) scopeList(prefix, after string, limit int) ([]scopeListEntry, bool) {
+func (s *store) scopeList(prefix, after string, limit int) ([]scopeListEntry, bool) {
 	type ref struct {
 		name string
 		buf  *scopeBuffer

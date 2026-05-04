@@ -20,7 +20,7 @@ import (
 // The capabilityID is treated as an opaque string (the handler enforces
 // the 64-hex-char shape upstream); the store concatenates the literal
 // prefix and matches with strings.HasPrefix. No validation here.
-func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
+func (s *store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 	prefix := "_guarded:" + capabilityID + ":"
 
 	s.lockAllShards()
@@ -83,7 +83,7 @@ func (s *Store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
 // either land in the about-to-be-wiped old buffer or paradoxically as
 // seq=1 in the freshly-recreated buffer. Drainers detect wipe via
 // `_events.lastSeq < lastSeenSeq` (cursor-rewind) and reset their state.
-func (s *Store) wipe() (int, int, int64) {
+func (s *store) wipe() (int, int, int64) {
 	s.lockAllShards()
 	defer s.unlockAllShards()
 
@@ -124,7 +124,7 @@ func (s *Store) wipe() (int, int, int64) {
 	return scopeCount, totalItems, freedBytes
 }
 
-func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
+func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 	type plan struct {
 		scope       string
 		replacement scopeReplacement
@@ -294,7 +294,7 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 // buffer or paradoxically as seq=1 in the freshly-recreated buffer.
 // Drainers detect rebuild via `_events.lastSeq < lastSeenSeq` (cursor-
 // rewind) and reset their state — same shape as /wipe.
-func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
+func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// Phase 1 — build every scope buffer off-map and distribute directly
 	// into the per-shard maps that Phase 2 will swap in. If any scope
 	// fails validation the existing store is left fully intact. Capacity

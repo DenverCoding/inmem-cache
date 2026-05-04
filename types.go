@@ -333,17 +333,17 @@ type counterCell struct {
 // fixed overhead, increments never touch byte accounting.
 const counterCellOverhead = 24 + 32
 
-type DeleteRequest struct {
+type deleteRequest struct {
 	Scope string `json:"scope"`
 	ID    string `json:"id,omitempty"`
 	Seq   uint64 `json:"seq,omitempty"`
 }
 
-type DeleteScopeRequest struct {
+type deleteScopeRequest struct {
 	Scope string `json:"scope"`
 }
 
-type DeleteUpToRequest struct {
+type deleteUpToRequest struct {
 	Scope  string `json:"scope"`
 	MaxSeq uint64 `json:"max_seq"`
 }
@@ -351,13 +351,13 @@ type DeleteUpToRequest struct {
 // CounterAddRequest is the body of the `/counter_add` endpoint. `By` is a
 // pointer so the handler can distinguish a missing field from an explicit
 // zero — the latter is a client bug and is rejected with 400.
-type CounterAddRequest struct {
+type counterAddRequest struct {
 	Scope string `json:"scope"`
 	ID    string `json:"id"`
 	By    *int64 `json:"by"`
 }
 
-type ItemsRequest struct {
+type itemsRequest struct {
 	Items []Item `json:"items"`
 }
 

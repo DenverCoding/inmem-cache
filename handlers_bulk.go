@@ -30,7 +30,7 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req ItemsRequest
+	var req itemsRequest
 	if err := decodeBody(w, r, api.maxBulkBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return
@@ -67,7 +67,7 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req ItemsRequest
+	var req itemsRequest
 	if err := decodeBody(w, r, api.maxBulkBytes, &req); err != nil {
 		badRequest(w, started, err.Error())
 		return

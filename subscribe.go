@@ -100,7 +100,7 @@ type subscriber struct {
 // Subscribe is the only capitalised method on *Store besides
 // NewStore / NewAPI / RegisterRoutes — see CLAUDE.md "Public API
 // surface" for the rationale.
-func (s *Store) Subscribe(scope string) (<-chan struct{}, func(), error) {
+func (s *store) Subscribe(scope string) (<-chan struct{}, func(), error) {
 	if !isReservedScope(scope) {
 		return nil, nil, ErrInvalidSubscribeScope
 	}
@@ -136,7 +136,7 @@ func (s *Store) Subscribe(scope string) (<-chan struct{}, func(), error) {
 // way it returns before unsub's Lock-acquire even completes. After
 // step 2, no new notify can find the subscriber, so close(ch) in
 // step 3 cannot race with a send.
-func (s *Store) unsubscribe(scope string) {
+func (s *store) unsubscribe(scope string) {
 	s.subsMu.Lock()
 	defer s.subsMu.Unlock()
 
@@ -167,7 +167,7 @@ func (s *Store) unsubscribe(scope string) {
 // (which would close the channel underneath the send and panic). The
 // non-blocking select is microseconds, so holding RLock through it is
 // cheap.
-func (s *Store) notifySubscriber(scope string) {
+func (s *store) notifySubscriber(scope string) {
 	s.subsMu.RLock()
 	if sub, ok := s.subscribers[scope]; ok {
 		select {

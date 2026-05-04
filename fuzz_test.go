@@ -120,7 +120,7 @@ func FuzzValidateCounterAddRequest(f *testing.F) {
 	f.Add("s", "id", MaxCounterValue+1)
 	f.Add("s", "id", -MaxCounterValue-1)
 	f.Fuzz(func(t *testing.T, scope, id string, by int64) {
-		req := CounterAddRequest{Scope: scope, ID: id, By: &by}
+		req := counterAddRequest{Scope: scope, ID: id, By: &by}
 		got, err := validateCounterAddRequest(req)
 		if err != nil {
 			return

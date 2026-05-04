@@ -320,21 +320,21 @@ func TestValidateUpdateItem(t *testing.T) {
 }
 
 func TestValidateDeleteRequest(t *testing.T) {
-	if err := validateDeleteRequest(DeleteRequest{Scope: "s", ID: "a"}); err != nil {
+	if err := validateDeleteRequest(deleteRequest{Scope: "s", ID: "a"}); err != nil {
 		t.Errorf("valid (by id) rejected: %v", err)
 	}
-	if err := validateDeleteRequest(DeleteRequest{Scope: "s", Seq: 3}); err != nil {
+	if err := validateDeleteRequest(deleteRequest{Scope: "s", Seq: 3}); err != nil {
 		t.Errorf("valid (by seq) rejected: %v", err)
 	}
 
 	cases := []struct {
 		name string
-		req  DeleteRequest
+		req  deleteRequest
 	}{
-		{"no scope", DeleteRequest{ID: "a"}},
-		{"neither id nor seq", DeleteRequest{Scope: "s"}},
-		{"both id and seq", DeleteRequest{Scope: "s", ID: "a", Seq: 1}},
-		{"id with control char", DeleteRequest{Scope: "s", ID: "a\x01"}},
+		{"no scope", deleteRequest{ID: "a"}},
+		{"neither id nor seq", deleteRequest{Scope: "s"}},
+		{"both id and seq", deleteRequest{Scope: "s", ID: "a", Seq: 1}},
+		{"id with control char", deleteRequest{Scope: "s", ID: "a\x01"}},
 	}
 	for _, tc := range cases {
 		if err := validateDeleteRequest(tc.req); err == nil {
@@ -344,13 +344,13 @@ func TestValidateDeleteRequest(t *testing.T) {
 }
 
 func TestValidateDeleteUpToRequest(t *testing.T) {
-	if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: "s", MaxSeq: 5}); err != nil {
+	if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: "s", MaxSeq: 5}); err != nil {
 		t.Errorf("valid rejected: %v", err)
 	}
-	if err := validateDeleteUpToRequest(DeleteUpToRequest{MaxSeq: 5}); err == nil {
+	if err := validateDeleteUpToRequest(deleteUpToRequest{MaxSeq: 5}); err == nil {
 		t.Error("empty scope should error")
 	}
-	if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: "s"}); err == nil {
+	if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: "s"}); err == nil {
 		t.Error("zero max_seq should error")
 	}
 }
@@ -425,10 +425,10 @@ func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
 				t.Errorf("validateUpdateItem on %q: expected reservation error, got nil", scope)
 			}
 			by := int64(1)
-			if _, err := validateCounterAddRequest(CounterAddRequest{Scope: scope, ID: "c", By: &by}); err == nil {
+			if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: "c", By: &by}); err == nil {
 				t.Errorf("validateCounterAddRequest on %q: expected reservation error, got nil", scope)
 			}
-			if err := validateDeleteScopeRequest(DeleteScopeRequest{Scope: scope}); err == nil {
+			if err := validateDeleteScopeRequest(deleteScopeRequest{Scope: scope}); err == nil {
 				t.Errorf("validateDeleteScopeRequest on %q: expected reservation error, got nil", scope)
 			}
 
@@ -438,10 +438,10 @@ func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
 				t.Errorf("validateWriteItem on %q: append must be allowed, got %v", scope, err)
 			}
 			// /delete on reserved must succeed (drainer single-item cleanup).
-			if err := validateDeleteRequest(DeleteRequest{Scope: scope, ID: "x"}); err != nil {
+			if err := validateDeleteRequest(deleteRequest{Scope: scope, ID: "x"}); err != nil {
 				t.Errorf("validateDeleteRequest on %q: delete-by-id must be allowed, got %v", scope, err)
 			}
-			if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: scope, MaxSeq: 1}); err != nil {
+			if err := validateDeleteUpToRequest(deleteUpToRequest{Scope: scope, MaxSeq: 1}); err != nil {
 				t.Errorf("validateDeleteUpToRequest on %q: must be allowed (drainer cleanup), got %v", scope, err)
 			}
 		})
@@ -457,7 +457,7 @@ func TestReservedScopes_BulkPathRejections(t *testing.T) {
 	for _, scope := range reservedScopeNames {
 		scope := scope
 		t.Run("warm/"+scope, func(t *testing.T) {
-			s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+			s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 			grouped := map[string][]Item{
 				scope: {{Scope: scope, ID: "x", Payload: json.RawMessage(`"v"`)}},
 			}
@@ -467,7 +467,7 @@ func TestReservedScopes_BulkPathRejections(t *testing.T) {
 			}
 		})
 		t.Run("rebuild/"+scope, func(t *testing.T) {
-			s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+			s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 			grouped := map[string][]Item{
 				scope: {{Scope: scope, ID: "x", Payload: json.RawMessage(`"v"`)}},
 			}
