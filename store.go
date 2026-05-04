@@ -958,17 +958,47 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 // /stats handler can flatten it into orderedFields for the wire, and so any
 // in-package caller (tests, future adapters) can read fields directly.
 //
-// The snapshot is intentionally aggregate-only — no per-scope map. At
-// 100k+ scopes the per-scope enumeration was the dominant cost of
-// /stats (one buffer.stats() call per scope), and the response would
-// routinely exceed practical client and proxy limits. Per-scope
-// enumeration moves to a separate paginated /scopelist endpoint
-// (see Phase A roadmap).
+// The aggregate fields are intentionally not a per-scope map: at
+// 100k+ scopes, per-scope enumeration was the dominant cost of /stats
+// and routinely blew past practical client/proxy response limits.
+// Per-scope enumeration for user-managed scopes lives at /scopelist,
+// which paginates alphabetically.
+//
+// ReservedScopes is the small, fixed exception: `_events` and
+// `_inbox` are cache infrastructure (pre-created at boot, drainer-
+// fed, drainer-consumed), and operators monitoring the cache need
+// their per-scope state — drainer-backlog on `_events`, fan-in queue
+// depth on `_inbox` — without paging /scopelist for two known names.
+// Length is bounded by the reserved-scope set (currently 2), so the
+// O(1) /stats budget is preserved: two getScope() lookups + two
+// buf.stats() calls regardless of total scope count.
 type storeStats struct {
-	ScopeCount    int
-	TotalItems    int
-	ApproxStoreMB MB
-	LastWriteTS   int64
+	ScopeCount     int
+	TotalItems     int
+	ApproxStoreMB  MB
+	LastWriteTS    int64
+	ReservedScopes []reservedScopeEntry
+}
+
+// reservedScopeEntry is one row in /stats's reserved_scopes array.
+// Field set is the (ii)-tier of /scopelist's full row: scope, item
+// count, last seq, byte size, created and last-write timestamps —
+// what operators need to monitor drainer-backlog and fan-in depth.
+// last_access_ts and read_count_total are intentionally omitted:
+// reserved scopes are read by drainers/admins, not user-facing
+// traffic, so those signals are noise on this endpoint. /scopelist
+// still surfaces the full row for anyone who does want them.
+//
+// Field declaration order = wire field order (encoding/json honours
+// it). Mirrors scopeListEntry's field order so a consumer who
+// accepts both shapes can fold them through one parser.
+type reservedScopeEntry struct {
+	Scope         string `json:"scope"`
+	ItemCount     int    `json:"item_count"`
+	LastSeq       uint64 `json:"last_seq"`
+	ApproxScopeMB MB     `json:"approx_scope_mb"`
+	CreatedTS     int64  `json:"created_ts"`
+	LastWriteTS   int64  `json:"last_write_ts"`
 }
 
 // stats returns the store-wide aggregate snapshot in O(1) — four
@@ -988,11 +1018,46 @@ type storeStats struct {
 // without paying the per-scope enumeration cost.
 func (s *Store) stats() storeStats {
 	return storeStats{
-		ScopeCount:    int(s.scopeCount.Load()),
-		TotalItems:    int(s.totalItems.Load()),
-		ApproxStoreMB: MB(s.totalBytes.Load()),
-		LastWriteTS:   s.lastWriteTS.Load(),
+		ScopeCount:     int(s.scopeCount.Load()),
+		TotalItems:     int(s.totalItems.Load()),
+		ApproxStoreMB:  MB(s.totalBytes.Load()),
+		LastWriteTS:    s.lastWriteTS.Load(),
+		ReservedScopes: s.reservedScopeStats(),
 	}
+}
+
+// reservedScopeStats materialises one entry per name in
+// reservedScopeNames. Each entry is the slim-tier scopeStats: item
+// count, last seq, byte size, creation + last-write timestamps. A
+// reserved scope that doesn't exist (impossible during steady state
+// but defensible against init-races / future refactors) is silently
+// skipped — operators see "the scope wasn't there" as an empty entry
+// instead of a hard error or a stale snapshot.
+//
+// getScope takes one shard RLock per call; buf.stats() takes the
+// scope's own buf.mu.RLock briefly for the materialisation. A
+// concurrent destructive op (/wipe or /rebuild) holds every shard in
+// write mode for the whole sweep, so this method either runs entirely
+// before or entirely after the destructive op — never observing a
+// half-wiped state.
+func (s *Store) reservedScopeStats() []reservedScopeEntry {
+	out := make([]reservedScopeEntry, 0, len(reservedScopeNames))
+	for _, name := range reservedScopeNames {
+		buf, ok := s.getScope(name)
+		if !ok {
+			continue
+		}
+		st := buf.stats()
+		out = append(out, reservedScopeEntry{
+			Scope:         name,
+			ItemCount:     st.ItemCount,
+			LastSeq:       st.LastSeq,
+			ApproxScopeMB: st.ApproxScopeMB,
+			CreatedTS:     st.CreatedTS,
+			LastWriteTS:   st.LastWriteTS,
+		})
+	}
+	return out
 }
 
 func (s *Store) listScopes() map[string]*scopeBuffer {

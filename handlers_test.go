@@ -1200,11 +1200,132 @@ func TestStats_Structure(t *testing.T) {
 	if _, present := out["max_store_mb"]; present {
 		t.Errorf("max_store_mb must NOT appear on /stats (config belongs on /help): %v", out["max_store_mb"])
 	}
-	// Regression guard: /stats is intentionally aggregate-only since the
-	// 100k-scope DoS observation. Per-scope enumeration belongs to the
-	// (future) /scopelist endpoint.
+	// Regression guard: /stats is intentionally aggregate-only for
+	// user-managed scopes since the 100k-scope DoS observation. The
+	// `scopes` key (full per-scope enumeration) belongs on /scopelist;
+	// the small fixed `reserved_scopes` block on /stats is the bounded
+	// exception for cache infrastructure scopes.
 	if _, present := out["scopes"]; present {
 		t.Errorf("scopes key must NOT appear on /stats response (moved to /scopelist): %v", out["scopes"])
+	}
+}
+
+// /stats includes a reserved_scopes array — one row per cache-managed
+// reserved scope (currently `_events`, `_inbox`). The row carries the
+// (ii)-tier scope-stats: item_count, last_seq, approx_scope_mb,
+// created_ts, last_write_ts. Behaviour is independent of events_mode:
+// the reserved scopes exist at boot regardless, so /stats surfaces
+// their state always.
+func TestStats_ReservedScopesBlock(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	_, out, _ := doAdminRequest(t, h, "/stats", "")
+	rawList, ok := out["reserved_scopes"]
+	if !ok {
+		t.Fatalf("missing reserved_scopes in /stats response: %+v", out)
+	}
+	list, ok := rawList.([]interface{})
+	if !ok {
+		t.Fatalf("reserved_scopes is not an array: %T", rawList)
+	}
+	if len(list) != len(reservedScopeNames) {
+		t.Fatalf("reserved_scopes len=%d want %d", len(list), len(reservedScopeNames))
+	}
+
+	// Reserved scopes appear in reservedScopeNames declaration order
+	// (currently alphabetical: _events then _inbox). Verify both names
+	// land + every required field is present and well-typed.
+	wantFields := []string{
+		"scope", "item_count", "last_seq",
+		"approx_scope_mb", "created_ts", "last_write_ts",
+	}
+	wantNames := reservedScopeNames
+	for i, raw := range list {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("reserved_scopes[%d] is not an object: %T", i, raw)
+		}
+		if entry["scope"] != wantNames[i] {
+			t.Errorf("reserved_scopes[%d].scope=%v want %v", i, entry["scope"], wantNames[i])
+		}
+		for _, f := range wantFields {
+			if _, present := entry[f]; !present {
+				t.Errorf("reserved_scopes[%d] missing field %q: %+v", i, f, entry)
+			}
+		}
+		// item_count = 0 on a fresh store with no events config and
+		// no /inbox writes; floats by JSON decode.
+		if got := entry["item_count"].(float64); got != 0 {
+			t.Errorf("reserved_scopes[%d].item_count=%v want 0 (fresh store)", i, got)
+		}
+		// created_ts is set at boot, so > 0 always.
+		if got := entry["created_ts"].(float64); got <= 0 {
+			t.Errorf("reserved_scopes[%d].created_ts=%v want > 0", i, got)
+		}
+		// approx_scope_mb is the buffer's overhead — small but positive.
+		if got := entry["approx_scope_mb"].(float64); got <= 0 {
+			t.Errorf("reserved_scopes[%d].approx_scope_mb=%v want > 0 (buffer overhead)", i, got)
+		}
+	}
+
+	// Forbidden fields: last_access_ts and read_count_total are on
+	// /scopelist's full row but intentionally NOT here — reserved scopes
+	// are read by drainers, not user-facing traffic, so those signals
+	// are noise on /stats.
+	for i, raw := range list {
+		entry := raw.(map[string]interface{})
+		for _, f := range []string{"last_access_ts", "read_count_total"} {
+			if _, present := entry[f]; present {
+				t.Errorf("reserved_scopes[%d] must not carry %q on /stats: %+v", i, f, entry)
+			}
+		}
+	}
+}
+
+// reserved_scopes reflects writes: with events_mode=full, every user-
+// scope mutation auto-populates `_events`, so /stats's _events.item_count
+// and last_seq advance in lockstep with the source-of-truth scope state.
+func TestStats_ReservedScopes_TracksEventsMode(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","id":"p-%d","payload":{"v":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	_, out, _ := doRequest(t, h, "GET", "/stats", "")
+	list, _ := out["reserved_scopes"].([]interface{})
+	if len(list) != len(reservedScopeNames) {
+		t.Fatalf("reserved_scopes len=%d want %d", len(list), len(reservedScopeNames))
+	}
+
+	// Find the _events entry by name (don't assume index ordering).
+	var events map[string]interface{}
+	for _, raw := range list {
+		entry := raw.(map[string]interface{})
+		if entry["scope"] == EventsScopeName {
+			events = entry
+			break
+		}
+	}
+	if events == nil {
+		t.Fatalf("reserved_scopes missing _events entry: %+v", list)
+	}
+	if got := events["item_count"].(float64); got != 5 {
+		t.Errorf("_events.item_count=%v want 5 (one event per /append)", got)
+	}
+	if got := events["last_seq"].(float64); got != 5 {
+		t.Errorf("_events.last_seq=%v want 5", got)
+	}
+	if got := events["last_write_ts"].(float64); got <= 0 {
+		t.Errorf("_events.last_write_ts=%v want > 0 (events were written)", got)
 	}
 }
 

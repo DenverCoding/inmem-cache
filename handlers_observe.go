@@ -15,13 +15,17 @@ import (
 // than JSON — it is documentation the cache hands out about itself, not
 // observability data.
 //
-// /stats is intentionally aggregate-only: scope_count, total_items and
-// approx_store_mb. The previous shape included a per-scope map keyed
-// by scope name; at 100k+ scopes that response routinely blew past
-// practical client and proxy limits, and the per-scope enumeration
-// dominated /stats latency. Per-scope detail moved to /scopelist, which
-// pages it via a stable alphabetical cursor so a 100k-scope store costs
-// at most one page worth of buf.stats() materialisation per call.
+// /stats is aggregate-only for user-managed scopes — at 100k+ scopes
+// the per-scope enumeration dominated /stats latency and the response
+// routinely blew past practical client/proxy limits. Per-scope detail
+// for user scopes lives at /scopelist, which pages it via a stable
+// alphabetical cursor.
+//
+// reserved_scopes is the small, fixed exception: `_events` and
+// `_inbox` are cache infrastructure (drainer-backlog and fan-in queue
+// depth) that operators monitor independently of user scopes. The set
+// is bounded by the reserved-scope list (currently 2 entries), so
+// /stats stays O(1) regardless of total scope count.
 
 func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
@@ -34,7 +38,8 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	st := api.store.stats()
 
 	// /stats is a pure state endpoint: aggregate scope/item counts,
-	// current byte usage, and a freshness tick. Static config
+	// current byte usage, a freshness tick, and the per-scope state
+	// of the cache's reserved infrastructure scopes. Static config
 	// (DefaultLimit, MaxLimit, per-scope/per-item/store caps) lives
 	// on /help, not here — those values do not change between calls
 	// and re-emitting them on every poll is pure noise. last_write_ts
@@ -47,6 +52,7 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		{"total_items", st.TotalItems},
 		{"approx_store_mb", st.ApproxStoreMB},
 		{"last_write_ts", st.LastWriteTS},
+		{"reserved_scopes", st.ReservedScopes},
 	}, started)
 }
 
