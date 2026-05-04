@@ -224,7 +224,7 @@ weaker substitute.
 |---|---|---|
 | Drainer crash | `_log` accumulates, eventually 507s on writes | Restart drainer, resume from cursor |
 | Disk full | Drainer can't write file, can't `DeleteUpTo`, log fills | External monitoring (TODO operational) |
-| Drainer slow | `_log` peak exceeds budget, 507s on `_log` writes which cascades to source writes | Increase `LogScopeMaxBytes`, tune drain cadence |
+| Drainer slow | `_log` accumulates, eventually the global `MaxStoreBytes` fires and 507s start; for the auto-populate path that's a silent drop (when wired), for external `/append` it's a real 507 | Bump `MaxStoreBytes`, tune drain cadence, fix drainer |
 | Cache crash | In-memory `_log` lost; whatever wasn't drained is gone | Source-of-truth (DB) replay via `/rebuild` |
 
 ## Decisions made so far (lock-in candidates)
@@ -251,9 +251,21 @@ These should NOT need re-litigation in the implementation phase:
 
 12. **Bootstrap pre-creation does not bump `s.lastWriteTS` or `buf.lastWriteTS`.** `NewStore` leaves both at 0 so the "have I seen this cache before" sentinel still works for fresh boots. After `/wipe` and `/rebuild`, the surrounding destructive op bumps `s.lastWriteTS`, and the reserved-scope re-creation aligns `buf.lastWriteTS` with that store-wide tick (preserving the `s.lastWriteTS >= max(buf.lastWriteTS)` invariant). **Implemented.**
 
+13. **Per-reserved-scope capacity knobs decoupled from globals only where it buys something.** Resolves Q4-Q7. Final shape:
+
+    - `_inbox` is operator-tunable on **two axes**: `Inbox.MaxItems` (default = global `ScopeMaxItems`, env `SCOPECACHE_INBOX_MAX_ITEMS`) and `Inbox.MaxItemBytes` (default 64 KiB, env `SCOPECACHE_INBOX_MAX_ITEM_KB`). Apps writing fan-in events typically need a much smaller per-item cap than user-scopes, and the item-count cap is independently tunable for high-throughput inboxes.
+    - `_log` is **fully derived**, no knobs. Per-item cap = `MaxItemBytes + 1 KiB envelope slack` so a log entry always fits the user-write that produced it (operators tune `MaxItemBytes`; `_log` follows). Item-count cap = unbounded (`_log` is best-effort observability gated only by the global byte budget; an arbitrary count cap on a drain-stream is meaningless).
+    - **No separate byte budget** for either reserved scope. Both share the global `MaxStoreBytes`. A separate budget was considered but adds complexity (two budgets to size, two cap-fire failure modes for operators to reason about) without buying anything: operators who want to give `_log`/`_inbox` more headroom bump `MaxStoreBytes` globally, and the scheduler-addon (TODO operational) covers proactive monitoring.
+
+    Implementation locus: `Store.maxItemBytesFor(scope)` and `Store.maxItemsFor(scope)` in [store.go](../store.go); enforcement at `handleAppend` and inside `appendItem` (sentinel `b.maxItems == 0`). **Implemented.**
+
+14. **HTTP response cap derived, not configured.** Per-response byte cap on `/head`, `/tail`, `/render` equals `MaxStoreBytes` so any single-scope read fits in one response by construction. No separate `MaxResponseBytes` knob — a value below `MaxStoreBytes` is just a misconfiguration that makes drainers flaky on full scopes; a value above is meaningless (no scope can hold more than the store). Resolved in `NewAPI` rather than `APIConfig.WithDefaults` because the derivation crosses structs. **Implemented.**
+
+15. **External `/append` to reserved scopes is allowed (`_log` and `_inbox`).** Resolves Q15. The cache imposes shape rules on items targeting reserved scopes (per-item byte cap from §13, plus item-count cap on `_inbox`) but does not gate writes on caller identity — anyone with mux access can write. The cache itself never recurses (a future cache-internal write to `_log` triggered by an external write to `_log` would loop), so the auto-populate path will explicitly skip when the target scope IS `_log`. External writes to `_log` are unusual but harmless; external writes to `_inbox` are the **expected** path (apps populate `_inbox`; a drainer drains it). Cap-overflow on either reserved scope returns 507 — same hard-fail semantics as user-scopes for *external* writes. The "best-effort drop on overflow" semantics applies only to the future cache-internal auto-populate path (when it lands), and is a per-write-path policy, not a per-scope policy. **Implemented for the external path; auto-populate-side is open until that wires in.**
+
 ## Open design decisions
 
-### Configuration knobs
+### Auto-populate semantics (deferred until auto-populate lands)
 
 - **Q1 — Log policy on/off.** Should there be a master switch
   `EnableLogScope` to disable `_log` auto-populate entirely? Some
@@ -270,24 +282,6 @@ These should NOT need re-litigation in the implementation phase:
 - **Q3 — Drain coalescing delay.** Drainer sleeps before tailing to
   let bursts coalesce. Default 0.5 s? Hardcoded or per-drainer-instance
   config? Per-scope config (different cadence for `_log` vs `_inbox`)?
-
-- **Q4 — `_log` separate byte budget.** Default cache cap is 100 MB.
-  Without separation, a high-write workload's `_log` peak can starve
-  regular scopes. Proposal: `LogScopeMaxBytes` separate knob, default
-  half of `MaxStoreBytes`, NOT counted against `MaxStoreBytes`. Or
-  shared budget with operator responsibility to size accordingly?
-
-- **Q5 — `_inbox` separate byte budget.** Same question for `_inbox`.
-  If apps spam-write to `_inbox`, do they get their own budget or
-  share with the cache? Proposal: separate `InboxScopeMaxBytes` knob,
-  smaller default (say 25 MB).
-
-- **Q6 — `_log` separate item cap.** Per-scope item cap defaults to
-  `ScopeMaxItems` (100k). Should `_log` have its own much-larger cap
-  (say 1M)? Same drain-keeps-it-flowing logic applies, but a
-  drainer-stall would 507 the cache much sooner with the default.
-
-- **Q7 — `_inbox` separate item cap.** Same question for `_inbox`.
 
 ### File handling
 
@@ -325,14 +319,6 @@ document.
   their own scheme. Or: `LogScopeName` / `InboxScopeName` config
   knobs defaulting to `_log` / `_inbox`?
 
-- **Q15 — Should writes to `_log` directly (by an app) be allowed?**
-  Today the cache does not reserve `_*` scopes (per CLAUDE.md
-  "No reserved scopes" section). Should `_log` specifically be
-  read-only-from-outside, with only the cache's auto-populate path
-  writing to it? If so: that creates a new "reserved scope"
-  exception. Lean toward "no, `_log` writes from outside are
-  allowed, the cache simply doesn't recurse on them."
-
 ### Subscribe semantics
 
 - **Q16 — Subscribe-on-not-yet-existent scope.** Should
@@ -368,8 +354,22 @@ document.
 
 ## Implementation outline
 
-Once the open questions are settled, the implementation breakdown
-is roughly:
+Already shipped (foundation):
+
+- ✅ Boot-time + post-wipe + post-rebuild pre-creation of `_log` and
+  `_inbox` (settled decisions 10, 11, 12).
+- ✅ Reservation contract: scope-level destructive ops on reserved
+  scopes return 400; in-place mutation (`/upsert`, `/update`,
+  `/counter_add`) returns 400; item-level ops + reads work normally.
+- ✅ Per-reserved-scope cap shape (settled decision 13): `Inbox.MaxItems`
+  + `Inbox.MaxItemBytes` operator-tunable; `_log` derived
+  (`MaxItemBytes + 1 KiB`) + exempt from item-count cap.
+- ✅ HTTP response cap derived from `MaxStoreBytes` (settled 14).
+- ✅ External `/append` to reserved scopes allowed with normal
+  hard-fail-on-cap semantics (settled 15).
+
+Remaining for Subscribe + auto-populate, once Q1-Q3, Q11-Q14, Q16-Q19
+are answered:
 
 1. **`subscribe.go`** in core (~120 lines): `Subscribe` method,
    `subscriber` struct, per-scope subscriber list with `subsMu`.
@@ -380,22 +380,22 @@ is roughly:
 3. **`_log` auto-populate** (~50 lines): a `logEvent` helper
    called from each write path that constructs and appends a log
    entry to the `_log` buffer (with recursion-guard for `_log`
-   itself).
-4. **Boot-time `ensureScope` for `_log` and `_inbox`** (~5 lines).
-5. **Config knobs** (~30 lines): `EnableLogScope`,
-   `LogScopeMaxBytes`, `InboxScopeMaxBytes`, item caps.
-6. **Tests** (~250 lines): race detector, coalescing semantics,
-   crash-safety, scope-detached-during-fanout, recursion-guard.
-7. **`addons/drainer/`** (~200 lines): drainer addon + integration
+   itself, and best-effort drop-on-overflow + `log_drops_total`
+   counter exposed on `/stats`).
+4. **Tests** (~250 lines): race detector, coalescing semantics,
+   crash-safety, scope-detached-during-fanout, recursion-guard,
+   drop-on-overflow.
+5. **`addons/drainer/`** (~200 lines): drainer addon + integration
    tests.
 
-Total: ~700 lines of code, ~250 lines of tests, ~1 day for core
-and ~1 day for the drainer.
+Total remaining: ~600 lines of code, ~250 lines of tests, ~1 day
+for core Subscribe + auto-populate and ~1 day for the drainer.
 
 ## Pointers
 
 - CLAUDE.md Phase A entry — the canonical (compact) summary.
 - CLAUDE.md "Pre-1.0 TODO (operational)" — health-check scheduler
   discussion.
-- docs/scopecache-core-rfc.md — the canonical core spec; will need
-  a §X update once these decisions are locked.
+- docs/scopecache-core-rfc.md §2.6 — the canonical core spec for
+  the reservation contract and per-reserved-scope cap shape;
+  already updated to match settled decisions 10-15.

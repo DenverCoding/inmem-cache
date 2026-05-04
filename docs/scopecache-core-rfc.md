@@ -407,12 +407,23 @@ for drainers that need to slurp `_log` or `_inbox` in large
 batches without artificial response-size 507s.
 
 **Implementation locus.** Constants `LogScopeName` and
-`InboxScopeName` live in `types.go`. The `reservedScopeNames`
-array, the `reservedScopesOverhead` constant, the
-`isReservedScope(scope)` helper, and the `initReservedScopes` /
-`initReservedScopesLocked` methods all live in `store.go`. The
-validators in `validation.go` and the bulk paths in `bulk.go`
-consult `isReservedScope` to enforce the rejection contract.
+`InboxScopeName` live in `types.go`, alongside `InboxMaxItemBytes`
+(default 64 KiB) and `LogItemEnvelopeOverhead` (1 KiB derivation
+slack). The `reservedScopeNames` array, the
+`reservedScopesOverhead` constant, the `isReservedScope(scope)`
+helper, and the `initReservedScopes` / `initReservedScopesLocked`
+methods all live in `store.go`, together with the per-scope cap
+dispatchers `maxItemBytesFor(scope)` and `maxItemsFor(scope)` that
+single-source the "which cap applies here?" decision. The
+`_log` exemption from the item-count cap is implemented as the
+`unboundedScopeMaxItems` (= 0) sentinel installed on the buffer
+at create time; `appendItem` in `buffer_write.go` skips the count
+check when the sentinel is present. The validators in
+`validation.go` and the bulk paths in `bulk.go` consult
+`isReservedScope` to enforce the scope-level rejection contract;
+`handleAppend` in `handlers_write.go` consults
+`maxItemBytesFor(item.Scope)` to enforce the per-item byte cap.
+
 Future addon-convention scopes that need pre-creation (e.g.
 `_tokens` for the `guarded` addon) are not part of the core's
 reservation list — they are operator-side concerns and will land
