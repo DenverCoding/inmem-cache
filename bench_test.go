@@ -133,6 +133,56 @@ func BenchmarkStore_Append(b *testing.B) {
 	}
 }
 
+// BenchmarkStore_Append_EventsOff and BenchmarkStore_Append_EventsFull
+// isolate the per-call cost of auto-populating `_events` on the
+// /append hot path. Both call store.appendOne (the layer where
+// emitAppendEvent fires) on a pre-warmed 100-scope dataset, so
+// scope-create + lazy-init overhead is out of the measured loop.
+// The only difference between them is Events.Mode — so the ns/op
+// delta is exactly the cost of one emit: json.Marshal of the
+// envelope + a recursive appendOne into `_events` (lock acquire
+// + slice append + bySeq map update + reserveBytes CAS + lock
+// release). Sequential, no contention, so the result is pure CPU
+// cost; the HTTP-level p99 inflation seen in scripts/bench.sh
+// EVENTS_MODE=full reflects added _events.buf.mu contention on
+// top of this base cost.
+func BenchmarkStore_Append_EventsOff(b *testing.B) {
+	benchAppendWithEventsMode(b, EventsModeOff)
+}
+
+func BenchmarkStore_Append_EventsFull(b *testing.B) {
+	benchAppendWithEventsMode(b, EventsModeFull)
+}
+
+func benchAppendWithEventsMode(b *testing.B, mode EventsMode) {
+	b.Helper()
+	store := NewStore(Config{
+		ScopeMaxItems: 1_000_000,
+		MaxStoreBytes: 8 << 30,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: mode},
+	})
+	const numScopes = 100
+	scopes := make([]string, numScopes)
+	for i := 0; i < numScopes; i++ {
+		scopes[i] = fmt.Sprintf("writes:%03d", i)
+		if _, err := store.getOrCreateScope(scopes[i]); err != nil {
+			b.Fatalf("pre-create %s: %v", scopes[i], err)
+		}
+	}
+	payload := json.RawMessage(`{"data":"benchmark"}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		scope := scopes[i%numScopes]
+		if _, err := store.appendOne(Item{Scope: scope, Payload: payload}); err != nil {
+			b.Fatalf("appendOne: %v", err)
+		}
+	}
+}
+
 // BenchmarkStore_AppendUniqueScope_Sequential measures /append cost when
 // every request creates a fresh scope — the anti-pattern documented in
 // CLAUDE.md "Scope modeling". Sequential variant; see _Parallel for the

@@ -79,7 +79,24 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TS="$(date +%Y%m%d-%H%M%S)"
-RESULTS_DIR="$REPO_ROOT/bench-results/$VERSION-$MODE-$TS"
+
+# Optional: inject an events_mode line into the Caddyfile's
+# scopecache block. Empty (default) leaves Events.Mode at its
+# Off zero-value, matching pre-v0.7.24 behaviour. Used to A/B
+# the auto-populate hot path against the same workload with
+# events disabled. Defined before RESULTS_DIR so the dir-name
+# encoding can read it under set -u.
+EVENTS_MODE="${EVENTS_MODE:-}"
+case "$EVENTS_MODE" in
+    ""|off|notify|full) ;;
+    *) echo "invalid EVENTS_MODE: $EVENTS_MODE (expected: off | notify | full | empty)"; exit 2 ;;
+esac
+
+# Encode EVENTS_MODE in the results dir name so A/B runs don't
+# clobber each other and you can grep results back later.
+EVENTS_TAG=""
+[[ -n "$EVENTS_MODE" ]] && EVENTS_TAG="-events-$EVENTS_MODE"
+RESULTS_DIR="$REPO_ROOT/bench-results/$VERSION-$MODE$EVENTS_TAG-$TS"
 mkdir -p "$RESULTS_DIR"
 
 CONTAINER="scopecache-bench"
@@ -131,7 +148,13 @@ CADDYFILE_BACKUP="${CADDYFILE_PATH}.bench-backup"
 [[ ! -f "$CADDYFILE_BACKUP" ]] && \
     cp "$CADDYFILE_PATH" "$CADDYFILE_BACKUP"
 
-cat > "$CADDYFILE_PATH" <<'CADDYFILE'
+# events_mode is injected only when EVENTS_MODE is set, otherwise
+# the line is omitted entirely so the Caddyfile is byte-identical
+# to the pre-EVENTS_MODE shape and A/B baseline runs are honest.
+EVENTS_LINE=""
+[[ -n "$EVENTS_MODE" ]] && EVENTS_LINE="        events_mode     $EVENTS_MODE"
+
+cat > "$CADDYFILE_PATH" <<CADDYFILE
 {
     admin off
     log {
@@ -152,6 +175,7 @@ cat > "$CADDYFILE_PATH" <<'CADDYFILE'
         scope_max_items 10000000
         max_store_mb    8192
         max_item_mb     16
+$EVENTS_LINE
     }
 }
 CADDYFILE
@@ -387,7 +411,7 @@ echo "  version: $VERSION"
 echo "  mode:    $MODE"
 echo "  wrk:     -t$WRK_THREADS -c$WRK_CONNECTIONS -d$WRK_DURATION --latency --timeout 2s, cpuset $WRK_CPUSET"
 echo "  server:  caddyscope, cpuset $SERVER_CPUSET"
-echo "  config:  scope_max_items=10M, max_store_mb=8192, max_item_mb=16"
+echo "  config:  scope_max_items=10M, max_store_mb=8192, max_item_mb=16, events_mode=${EVENTS_MODE:-<unset/off>}"
 echo "================================================================"
 echo
 

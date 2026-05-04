@@ -2593,6 +2593,101 @@ func TestEvents_AutoPopulate_Full(t *testing.T) {
 	}
 }
 
+// EventsModeFull at scale: 100 distinct /append calls produce 100
+// envelopes in `_events`, in append-order, each carrying its own
+// action-vector + nested user-payload. Verifies the auto-populate
+// path is per-write (not batched, not deduped) and that the
+// envelope-shape is stable across N writes — not just the 1-call
+// happy path.
+//
+// /tail returns oldest-first within the requested window
+// (buffer_read.go tailOffset), so rawItems[i] corresponds to the
+// i-th /append: id="p-i", user-scope seq=i+1 (fresh "posts"
+// scope), and the nested payload carries n=i + label="item-i".
+//
+// Dumps the first 3 envelopes via t.Logf so `go test -v` makes the
+// wire shape concrete for human readers.
+func TestEvents_AutoPopulate_Full_Many(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 1000,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	const N = 100
+	for i := 0; i < N; i++ {
+		body := fmt.Sprintf(
+			`{"scope":"posts","id":"p-%d","payload":{"n":%d,"label":"item-%d"}}`,
+			i, i, i,
+		)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	code, out, raw := doRequest(t, h, "GET",
+		fmt.Sprintf("/tail?scope=_events&limit=%d", N), "")
+	if code != 200 {
+		t.Fatalf("/tail _events: code=%d body=%s", code, raw)
+	}
+	count := int(mustFloat(t, out, "count"))
+	if count != N {
+		t.Fatalf("Full mode N=%d: _events count=%d want %d", N, count, N)
+	}
+	rawItems, _ := out["items"].([]interface{})
+	if len(rawItems) != N {
+		t.Fatalf("Full mode N=%d: items len=%d want %d", N, len(rawItems), N)
+	}
+
+	for i, ri := range rawItems {
+		envItem, ok := ri.(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: not an object: %v", i, ri)
+		}
+		evt, ok := envItem["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: envelope payload not an object: %v", i, envItem["payload"])
+		}
+		if evt["op"] != "append" {
+			t.Errorf("event %d: op=%v want append", i, evt["op"])
+		}
+		if evt["scope"] != "posts" {
+			t.Errorf("event %d: scope=%v want posts", i, evt["scope"])
+		}
+		wantID := fmt.Sprintf("p-%d", i)
+		if evt["id"] != wantID {
+			t.Errorf("event %d: id=%v want %s", i, evt["id"], wantID)
+		}
+		seq, ok := evt["seq"].(float64)
+		if !ok || seq != float64(i+1) {
+			t.Errorf("event %d: seq=%v want %d", i, evt["seq"], i+1)
+		}
+		userPayload, ok := evt["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: nested user payload not object: %v", i, evt["payload"])
+		}
+		if userPayload["n"] != float64(i) {
+			t.Errorf("event %d: user payload n=%v want %d", i, userPayload["n"], i)
+		}
+		wantLabel := fmt.Sprintf("item-%d", i)
+		if userPayload["label"] != wantLabel {
+			t.Errorf("event %d: user payload label=%v want %s", i, userPayload["label"], wantLabel)
+		}
+	}
+
+	// Dump the first 3 envelopes so `go test -v -run
+	// TestEvents_AutoPopulate_Full_Many` makes the wire shape
+	// concrete for human readers.
+	for i := 0; i < 3 && i < len(rawItems); i++ {
+		pretty, err := json.MarshalIndent(rawItems[i], "", "  ")
+		if err != nil {
+			continue
+		}
+		t.Logf("envelope #%d:\n%s", i, pretty)
+	}
+}
+
 // Recursion guard: an external /append directly to `_events`
 // (allowed but unusual per RFC §2.6 + decide-doc settled #15) must
 // NOT trigger the auto-populate machinery to write a SECOND event
