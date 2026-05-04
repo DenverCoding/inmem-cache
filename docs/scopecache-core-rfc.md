@@ -454,9 +454,44 @@ via the planned config-driven init-script (see CLAUDE.md
 ## 3. Capacity and limits
 
 The cache enforces the following capacity limits on every write
-path. All three are configurable via `Config` (Go API), env-vars
-(standalone binary), or Caddyfile directives (Caddy module); see the
-adapter docs for exact knob names.
+path. All knobs below are configurable via `Config` (Go API),
+env-vars (standalone binary), or Caddyfile / JSON directives (Caddy
+module). Setting a value to its zero / empty form (0 for integers,
+`""` for strings) selects the default.
+
+### 3.0 Knob mapping
+
+Single canonical mapping from Go API to adapter wire-shape. Defaults
+in the rightmost column reflect what `Config{}.WithDefaults()` plus
+`NewStore` produce out of the box.
+
+| Go-API field                  | Env-var                              | Caddyfile / JSON       | Default       |
+|-------------------------------|--------------------------------------|------------------------|---------------|
+| `Config.ScopeMaxItems`        | `SCOPECACHE_SCOPE_MAX_ITEMS`         | `scope_max_items`      | 100,000 items |
+| `Config.MaxStoreBytes`        | `SCOPECACHE_MAX_STORE_MB` *(MiB)*    | `max_store_mb`         | 100 MiB       |
+| `Config.MaxItemBytes`         | `SCOPECACHE_MAX_ITEM_MB` *(MiB)*     | `max_item_mb`          | 1 MiB         |
+| `Config.Inbox.MaxItems`       | `SCOPECACHE_INBOX_MAX_ITEMS`         | `inbox_max_items`      | = `ScopeMaxItems` |
+| `Config.Inbox.MaxItemBytes`   | `SCOPECACHE_INBOX_MAX_ITEM_KB` *(KiB)* | `inbox_max_item_kb`  | 64 KiB        |
+| `Config.Events.Mode`          | `SCOPECACHE_EVENTS_MODE`             | `events_mode`          | `off`         |
+
+The remaining caps in the cache are **derived** from the rows above
+and not exposed as knobs:
+
+- **`_events` per-item byte cap** = `MaxItemBytes + 1 KiB envelope
+  slack`. A log entry must always fit the user-write that produced
+  it (§2.6).
+- **`_events` per-scope item cap** = unbounded. `_events` is
+  best-effort observability; the global byte budget is the only
+  real begrenzer (§2.6).
+- **HTTP response cap** (`/head`, `/tail`, `/render`) =
+  `MaxStoreBytes`. By construction no scope can exceed the store
+  budget, so any single-scope read fits in one response.
+
+### Per-cap behaviour
+
+Per-cap enforcement detail follows in §3.1-§3.4 for the global
+caps; the reserved-scope-specific caps (Inbox, Events) are covered
+in §2.6.
 
 | limit             | scope        | default   | exceeded → |
 |-------------------|--------------|-----------|------------|
