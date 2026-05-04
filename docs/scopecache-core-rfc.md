@@ -98,12 +98,20 @@ and eviction-hint queries. Their RFCs live alongside this one in
 
 The core is the foundation: a small set of building blocks — the
 data model, the capacity rules, the address primitives, and the
-public Go API. Anything beyond that comes from **addons**: separate
-Go sub-packages built on top of the public Go API. Some addons ship
-with `scopecache` as part of the standard distribution
-(multi-tenant gateways, batch dispatch, write-only ingestion, …);
-anyone can build their own addons against the same public interface
-without touching the core.
+public Go API surface (`*scopecache.Gateway` and the methods it
+exposes). Anything beyond that comes from **addons**: separate Go
+sub-packages built on top of `*Gateway`. Some addons ship with
+`scopecache` as part of the standard distribution (multi-tenant
+gateways, batch dispatch, write-only ingestion, …); anyone can
+build their own addons against the same public interface without
+touching the core.
+
+One addon-shaped concern lives in core by exception: the subscriber
+bridge (§7.4) that turns the in-process `Subscribe` primitive into
+external command invocations. That single bridge is universal
+enough that every realistic deployment wants it; the cost of
+keeping it in `package scopecache` is one stdlib `os/exec`
+dependency, no third-party imports.
 
 The result is a clean separation of concerns:
 
@@ -288,16 +296,16 @@ clocks advance out of order across CPUs.
 ### 2.6 Reserved scopes and boot-time initialisation
 
 The cache reserves exactly two scope names: `_events` and `_inbox`.
-Both are pre-created at `NewStore` time so subscribers and apps
-can attach to a known-stable target without a "scope-doesn't-
+Both are pre-created at `NewGateway` time so subscribers (§7.4) and
+apps can attach to a known-stable target without a "scope-doesn't-
 exist-yet" race, and both are re-created automatically after
 `/wipe` and `/rebuild` so the cache always lands on a consistent
 post-event baseline.
 
 | Reserved scope | Role | Writer | Reader |
 |---|---|---|---|
-| `_events` | Cache-managed write-event log (Phase A "Subscribe + events-scope drain architecture") | The cache itself, on every successful mutation to any non-reserved scope | Drainer addons via `Subscribe` + `Tail` |
-| `_inbox` | Application-side fan-in ingestion scope | External clients via `/append` | Drainer addons via `Subscribe` + `Tail` |
+| `_events` | Cache-managed write-event log | The cache itself, on every successful mutation to any non-reserved scope | The in-core subscriber bridge (§7.4), or any caller of `Gateway.Subscribe` |
+| `_inbox` | Application-side fan-in ingestion scope | External clients via `/append` | The in-core subscriber bridge (§7.4), or any caller of `Gateway.Subscribe` |
 
 **Operations on reserved scopes** follow the
 append-only-drain-stream pattern. The cache allows the operations
@@ -319,7 +327,7 @@ The reservation is **scope-level only** — item-level cleanup
 (`/delete`, `/delete_up_to`) and item-level reads work normally,
 because the drainer pattern fundamentally requires them.
 
-**Boot-time initialisation.** `NewStore` calls
+**Boot-time initialisation.** `NewGateway` calls
 `s.initReservedScopes()` after the per-shard maps are allocated.
 This pre-creates `_events` and `_inbox` via `ensureScope`-equivalent
 logic, charges `len(reservedScopeNames) × scopeBufferOverhead`
@@ -463,7 +471,7 @@ module). Setting a value to its zero / empty form (0 for integers,
 
 Single canonical mapping from Go API to adapter wire-shape. Defaults
 in the rightmost column reflect what `Config{}.WithDefaults()` plus
-`NewStore` produce out of the box.
+`NewGateway` produce out of the box.
 
 | Go-API field                  | Env-var                              | Caddyfile / JSON       | Default       |
 |-------------------------------|--------------------------------------|------------------------|---------------|
@@ -473,6 +481,11 @@ in the rightmost column reflect what `Config{}.WithDefaults()` plus
 | `Config.Inbox.MaxItems`       | `SCOPECACHE_INBOX_MAX_ITEMS`         | `inbox_max_items`      | = `ScopeMaxItems` |
 | `Config.Inbox.MaxItemBytes`   | `SCOPECACHE_INBOX_MAX_ITEM_KB` *(KiB)* | `inbox_max_item_kb`  | 64 KiB        |
 | `Config.Events.Mode`          | `SCOPECACHE_EVENTS_MODE`             | `events_mode`          | `off`         |
+| *(adapter-level)*             | `SCOPECACHE_SUBSCRIBER_COMMAND`      | `subscriber_command`   | *(empty — no subscriber spawned)* |
+
+The last row is an **adapter-level knob**, not a `Config` field. It
+activates the in-core subscriber bridge at boot — see §7.4 for the
+contract.
 
 The remaining caps in the cache are **derived** from the rows above
 and not exposed as knobs:
@@ -1797,6 +1810,187 @@ are internally consistent at the moment of the read.
 Operators using `/stats` to drive decisions (capacity planning,
 admission-control headroom) should treat its output as approximate
 rather than transactional.
+
+### 7.4 Subscribe and the in-core subscriber bridge
+
+The cache exposes one in-process Go primitive on top of which
+operators wire automatic drainers, write-event publishers, and
+similar reactive pipelines: `Gateway.Subscribe`. On top of that
+primitive the core ships one ready-to-deploy bridge,
+`Gateway.StartSubscriber`, which translates wake-ups from the
+primitive into invocations of an operator-supplied executable. Both
+are documented here; the long-form design discussion lives in
+[`subscribe-drain-decide.md`](subscribe-drain-decide.md).
+
+#### 7.4.1 Subscribe primitive
+
+```go
+ch, unsub, err := gw.Subscribe(scope)
+```
+
+- `scope` MUST be one of the reserved scopes (`_events` or
+  `_inbox`); any other value returns `ErrInvalidSubscribeScope`.
+  The cache deliberately does not allow subscribing to user
+  scopes — `_events`'s auto-populate is the route to observe
+  user-scope mutations.
+- A second `Subscribe` to the same scope while the first is still
+  active returns `ErrAlreadySubscribed`. Single subscriber per
+  reserved scope is by design (multi-fan-out belongs in the
+  subscriber, not in the cache).
+- `ch` is a single-slot, size-1 buffered `chan struct{}`. The
+  cache sends non-blockingly: when the slot is full the send is
+  dropped. A burst of N writes during a busy subscriber coalesces
+  into one wake-up; the subscriber catches up via cursor on its
+  next drain. There is no slow-subscriber drop policy and no deep
+  buffer.
+- The channel survives `/wipe` and `/rebuild` transparently: the
+  subscriber slot lives at the cache level (keyed by scope name),
+  so when those destructive ops drop+recreate the reserved scope
+  buffers, the subscriber stays attached and re-points at the new
+  buffer. The subscriber detects wipe/rebuild via cursor-rewind on
+  the next read (last-seen seq going backwards) and resets its own
+  state.
+- `unsub()` is idempotent: the second call after the entry is
+  already gone is a no-op. This lets shutdown paths use a
+  signal-handler call and a `defer` backstop without double-close
+  panics.
+- `unsub()` is graceful, not abortive: it closes the wake-up
+  channel (so the subscriber's `for range ch` loop exits), but any
+  work the subscriber goroutine had already started runs to
+  completion.
+
+#### 7.4.2 StartSubscriber bridge
+
+```go
+stop, err := gw.StartSubscriber(scope, command)
+```
+
+The bridge spawns a goroutine that subscribes to `scope`, then on
+every wake-up invokes `command` (any path that `exec.Command` can
+run — shell scripts, Python/PHP/Ruby with shebang, compiled
+binaries) and waits for it to exit. The goroutine never reads,
+marshals, or writes item data — the command does that itself,
+typically via `curl /tail` and `curl /delete_up_to` against the
+cache's HTTP endpoints.
+
+One environment variable is set per invocation:
+
+- `SCOPECACHE_SCOPE` — the reserved scope that fired the wake-up
+  (`_events` or `_inbox`). A single command can serve both
+  scopes by branching on this value.
+
+Everything else the command needs (cache socket path, HTTP base
+URL, auth headers) is the operator's responsibility — the bridge
+does not know how the command reaches the cache.
+
+`stop` is graceful and synchronous: it closes the wake-up channel
+**and** blocks until the goroutine has fully exited (including any
+in-flight `cmd.Run` for the currently-executing command). This
+lets adapters sequence "stop subscribers → tear down server"
+deterministically — see §7.4.4 below for the standalone-binary
+shutdown ordering.
+
+Concurrency: one goroutine per scope, one command run at a time
+per scope, in strict order. Wake-ups arriving while a command is
+running coalesce in the cache's single-slot wake-up channel; the
+next loop iteration sees one pending wake-up and triggers one more
+command run.
+
+#### 7.4.3 Activation knob
+
+The bridge is wired by the adapters via the single
+`subscriber_command` knob (see §3.0):
+
+- Standalone: `SCOPECACHE_SUBSCRIBER_COMMAND=/path/to/exec ./scopecache`
+- Caddyfile: `subscriber_command /path/to/exec` inside the `scopecache { ... }` block.
+
+When **empty** (default): no subscriber goroutine is spawned. The
+reserved scopes still exist (§2.6) but accumulate without being
+consumed; if the operator never wires their own subscriber, those
+scopes will eventually approach the global byte cap. Pure
+cache-only mode — the operator opted out of the auto-pipeline.
+
+When **set to a path**: the adapter calls
+`gw.StartSubscriber(EventsScopeName, command)` and
+`gw.StartSubscriber(InboxScopeName, command)` at boot. Both
+goroutines invoke the same command; the command branches on
+`SCOPECACHE_SCOPE` to know which scope fired. `stop()` for both is
+called automatically at process shutdown / Caddy module Cleanup;
+operators never see it directly.
+
+A path that points at a missing or non-executable file is **not**
+a startup error — the bridge logs the per-invocation failure and
+the next wake-up retries. This lets operators deploy the command
+after the cache has booted.
+
+"Command" not "script": the bridge's `exec.Command` accepts any
+executable. The reference implementation in
+[`scripts/drain_events.sh`](../scripts/drain_events.sh) is a POSIX
+shell script that demonstrates the drain pattern (sleep 0.5, GET
+/head, write JSONL, POST /delete_up_to, repeat until empty) but
+operators may swap in any language or compiled binary.
+
+#### 7.4.4 Lifecycle ordering at shutdown
+
+The standalone binary stops subscribers **before** calling
+`server.Shutdown(ctx)` so any running drain command can complete
+its HTTP roundtrips against a still-listening cache. The order is:
+
+1. `SIGINT` / `SIGTERM` arrives.
+2. `stopSubscribers()` runs — blocks until each subscriber goroutine
+   has finished its current command run. The HTTP server is still
+   accepting requests during this phase; in-flight `curl /head` /
+   `curl /delete_up_to` calls complete normally.
+3. `server.Shutdown(ctx)` runs — drains any non-subscriber HTTP
+   requests, then closes the listener.
+4. Socket file removed; process exits.
+
+The Caddy module mirrors this in `Cleanup()`. Shutdown ordering is
+adapter responsibility, not core — the bridge exposes a synchronous
+`stop()` so adapters can wire it correctly without needing to know
+internals.
+
+#### 7.4.5 Crash-safety invariant for any subscriber
+
+This applies to **any** subscriber pattern — the in-core bridge,
+operators writing their own Go-side subscribers via `Subscribe`,
+or commands wired through the bridge. The cache cannot enforce it;
+it's a contract the subscriber must follow:
+
+> Persist your cursor to durable storage **before** calling
+> `/delete_up_to`. Otherwise a crash between the durable write and
+> the cursor save loses the just-deleted-but-not-yet-recorded batch.
+
+Generic safe order:
+
+1. Read a batch (`/tail` or `/head`).
+2. Write to the sink **durably** (fsync, COMMIT, ack, …).
+3. Persist the cursor durably (ideally in the same transaction as
+   step 2, if the sink is transactional).
+4. Call `/delete_up_to` with the persisted cursor.
+
+If step 4 crashes, the next run sees a cursor past where the items
+still are; re-running `/delete_up_to` is idempotent. Combining
+steps 2 and 3 in one transaction (SQLite, Postgres, etc.) removes
+the gap between them; for filesystem sinks an atomic-rename of a
+tmp-file is the closest portable equivalent. The cache itself
+holds nothing recoverable — `_events` is in-memory only — so the
+durability burden is entirely on the sink side.
+
+#### 7.4.6 Reference materials
+
+- [`scripts/drain_events.sh`](../scripts/drain_events.sh) —
+  reference command implementation. POSIX shell, depends on `curl`
+  + `jq`. Reads `SCOPECACHE_SCOPE`, `SCOPECACHE_SOCKET_PATH`, and
+  `SCOPECACHE_OUTPUT_DIR`; drains the scope into timestamped JSONL
+  files and exits.
+- [`scripts/e2e_subscriber.sh`](../scripts/e2e_subscriber.sh) —
+  end-to-end smoke test that boots the standalone binary with
+  `subscriber_command` set, performs 10 writes, polls until
+  `_events` is empty, and verifies the JSONL output shape.
+- Settled-decisions log:
+  [`docs/subscribe-drain-decide.md`](subscribe-drain-decide.md)
+  — design history, rejected alternatives, lock-discipline notes.
 
 ---
 

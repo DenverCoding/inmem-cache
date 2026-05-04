@@ -435,29 +435,32 @@ Already shipped (auto-populate, v0.7.25):
 - ✅ /stats `reserved_scopes` block — per-scope state for `_events`
   and `_inbox` on every /stats call (commit ff4e1b9).
 
-Remaining:
+Already shipped (Subscribe + bridge):
 
-1. **Step 5e** — best-effort drop-on-overflow + `events_drops_total`
-   atomic counter; surface on `/stats` (one-line addition to the
-   /stats enrichment TODO). ~20 lines + tests. (Already partially
-   wired via `eventsDropsTotal` atomic; just needs the /stats
-   surface and tests for the drop-on-overflow path.)
-2. **Step 6** — `Subscribe` primitive in core (~80 lines) in a new
-   `subscribe.go` file:
-   `Store.Subscribe(scope) (<-chan struct{}, func(), error)` —
-   restricted to reserved scopes (settled #2), single subscriber
-   per scope (settled #20), state at Store level keyed by name
-   (settled #21), close-on-unsub with lock-discipline (settled Q19).
-   Notify hook in `Store.appendOne` (single site — all writes to
-   `_events` and `_inbox` route through this method).
-3. **Step 7** — default subscriber addon as standard add-on
-   (~150 lines): script-runner shape per settled #23. Sub-package
-   under repo (Phase C). Adapter-side activation knob
-   `subscriber_enabled` on standalone (env `SCOPECACHE_SUBSCRIBER_ENABLED`)
-   and Caddy module (`subscriber_enabled true` Caddyfile directive).
-   Operator-supplied `subscriber_script` is the only sink-specific
-   knob the cache exposes; everything else is the script's
-   responsibility.
+- ✅ Step 5e — `events_drops_total` exposed on `/stats`; drop-on-
+  overflow path covered by tests. (v0.7.25.)
+- ✅ Step 6 — `Subscribe` primitive in core: `Gateway.Subscribe(scope)
+  (<-chan struct{}, func(), error)`. Restricted to reserved scopes
+  (settled #2), single subscriber per scope (settled #20), state at
+  cache level keyed by name (settled #21), close-on-unsub with
+  idempotent unsub (settled Q19). Notify hook in `Store.appendOne`
+  (single site — all writes to `_events` and `_inbox` route through
+  it).
+- ✅ Step 7 — subscriber bridge in core (not as a sub-package per
+  earlier framing): `Gateway.StartSubscriber(scope, command)` →
+  `subscriber_command.go`. Single activation knob
+  `SCOPECACHE_SUBSCRIBER_COMMAND` (standalone) /
+  `subscriber_command` (Caddyfile). Notification-only contract
+  per settled #23 — the bridge invokes the command and waits for
+  exit; the command does its own /tail and /delete_up_to. Reference
+  command: [`scripts/drain_events.sh`](../scripts/drain_events.sh).
+  End-to-end smoke: [`scripts/e2e_subscriber.sh`](../scripts/e2e_subscriber.sh).
+  Standalone-binary shutdown ordering: subscribers stop before
+  `server.Shutdown` so in-flight commands complete cleanly.
+
+Phase A is feature-complete on the Subscribe + drain pipeline. The
+canonical operator-facing spec is now in
+[`scopecache-core-rfc.md`](scopecache-core-rfc.md) §7.4.
 
 ## Pointers
 
