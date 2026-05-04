@@ -636,32 +636,45 @@ func (s *Store) appendOne(item Item) (Item, error) {
 
 // upsertOne is the atomic /upsert write-path; same rollback contract
 // as appendOne. Returns (item, created, err) where created reflects
-// the upsert outcome, not the scope-creation outcome.
+// the upsert outcome, not the scope-creation outcome. On success it
+// emits an upsert event into `_events` (Phase A auto-populate; gated
+// on Config.Events.Mode — see events.go).
 func (s *Store) upsertOne(item Item) (Item, bool, error) {
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
 		return Item{}, false, err
 	}
 	result, itemCreated, upsertErr := buf.upsertByID(item)
-	if upsertErr != nil && scopeCreated {
-		s.cleanupIfEmptyAndUnused(item.Scope, buf)
+	if upsertErr != nil {
+		if scopeCreated {
+			s.cleanupIfEmptyAndUnused(item.Scope, buf)
+		}
+		return result, itemCreated, upsertErr
 	}
-	return result, itemCreated, upsertErr
+	s.emitUpsertEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
+	return result, itemCreated, nil
 }
 
 // counterAddOne is the atomic /counter_add write-path; same rollback
 // contract as appendOne. Returns (value, created, err) where created
-// reflects the counter outcome, not the scope-creation outcome.
+// reflects the counter outcome, not the scope-creation outcome. On
+// success it emits a counter_add event into `_events` carrying the
+// increment `by` — never the post-add value (action-logging, not
+// result-logging; see events.go).
 func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
 	if err != nil {
 		return 0, false, err
 	}
 	value, counterCreated, addErr := buf.counterAdd(scope, id, by)
-	if addErr != nil && scopeCreated {
-		s.cleanupIfEmptyAndUnused(scope, buf)
+	if addErr != nil {
+		if scopeCreated {
+			s.cleanupIfEmptyAndUnused(scope, buf)
+		}
+		return value, counterCreated, addErr
 	}
-	return value, counterCreated, addErr
+	s.emitCounterAddEvent(scope, id, by)
+	return value, counterCreated, nil
 }
 
 // updateOne mutates the payload of an item addressed by scope+id or
@@ -670,15 +683,33 @@ func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 // scope would produce. The caller-side validator enforces the
 // id-xor-seq invariant; updateOne assumes id != "" picks the id path
 // and otherwise routes by seq.
+//
+// Emits an update event into `_events` ONLY on hit (updated > 0): a
+// miss is a no-op against cache state, so emitting it would be result-
+// logging (the request) rather than action-logging (the change).
+// Drainers replaying `_events` against an empty cache produce the
+// same final state without these noise entries.
 func (s *Store) updateOne(item Item) (int, error) {
 	buf, ok := s.getScope(item.Scope)
 	if !ok {
 		return 0, nil
 	}
+	var (
+		updated int
+		err     error
+	)
 	if item.ID != "" {
-		return buf.updateByID(item.ID, item.Payload)
+		updated, err = buf.updateByID(item.ID, item.Payload)
+	} else {
+		updated, err = buf.updateBySeq(item.Seq, item.Payload)
 	}
-	return buf.updateBySeq(item.Seq, item.Payload)
+	if err != nil {
+		return updated, err
+	}
+	if updated > 0 {
+		s.emitUpdateEvent(item.Scope, item.ID, item.Seq, item.Payload)
+	}
+	return updated, nil
 }
 
 // deleteOne removes a single item by scope+id or scope+seq. Returns

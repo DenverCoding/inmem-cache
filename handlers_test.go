@@ -2753,3 +2753,205 @@ func TestEvents_AutoPopulate_DropsOnOverflow(t *testing.T) {
 		t.Errorf("user-write not reachable post-drop: code=%d hit=%v", code, out["hit"])
 	}
 }
+
+// /upsert auto-populate: same envelope shape as /append (scope, id,
+// seq, ts, payload?) — only the op string differs. Test covers both
+// the create branch (fresh id) and the replace branch (existing id);
+// drainers should see "upsert" in both cases (action-logging: the
+// action is "upsert this id with this payload" regardless of outcome).
+func TestEvents_AutoPopulate_Upsert(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Create branch.
+	if code, _, raw := doRequest(t, h, "POST", "/upsert",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/upsert create: code=%d body=%s", code, raw)
+	}
+	// Replace branch.
+	if code, _, raw := doRequest(t, h, "POST", "/upsert",
+		`{"scope":"posts","id":"a","payload":{"v":2}}`); code != 200 {
+		t.Fatalf("/upsert replace: code=%d body=%s", code, raw)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 2 {
+		t.Fatalf("upsert auto-populate: _events count=%d want 2", count)
+	}
+	for i, evt := range items {
+		envelope, ok := evt["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: envelope payload not an object: %v", i, evt["payload"])
+		}
+		if envelope["op"] != "upsert" {
+			t.Errorf("event %d: op=%v want upsert", i, envelope["op"])
+		}
+		if envelope["scope"] != "posts" || envelope["id"] != "a" {
+			t.Errorf("event %d: addressing wrong, got scope=%v id=%v", i, envelope["scope"], envelope["id"])
+		}
+		// Both events carry the user payload (Full mode).
+		userPayload, ok := envelope["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: nested user payload not object: %v", i, envelope["payload"])
+		}
+		if userPayload["v"] != float64(i+1) { // 1, then 2
+			t.Errorf("event %d: user payload v=%v want %d", i, userPayload["v"], i+1)
+		}
+	}
+}
+
+// /upsert in Notify mode: action-vector preserved, user payload
+// stripped (same Notify rule as /append).
+func TestEvents_AutoPopulate_Upsert_Notify(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeNotify},
+	})
+	if code, _, raw := doRequest(t, h, "POST", "/upsert",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/upsert: code=%d body=%s", code, raw)
+	}
+	count, items := eventsTailCount(t, h)
+	if count != 1 {
+		t.Fatalf("Notify mode: _events count=%d want 1", count)
+	}
+	envelope, _ := items[0]["payload"].(map[string]interface{})
+	if envelope["op"] != "upsert" {
+		t.Errorf("op=%v want upsert", envelope["op"])
+	}
+	if _, hasPayload := envelope["payload"]; hasPayload {
+		t.Errorf("Notify mode must strip user payload, got %v", envelope)
+	}
+}
+
+// /update auto-populate: emit on hit only. Tests three branches:
+// (1) update-by-id (envelope carries id, no seq)
+// (2) update-by-seq (envelope carries seq, no id)
+// (3) update on a missing id (no emit — action-logging principle:
+//
+//	a no-op request is not a state change worth logging)
+func TestEvents_AutoPopulate_Update(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Seed: one item we can update by id, one by seq.
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"posts","id":"a","payload":{"v":0}}`); code != 200 {
+		t.Fatalf("seed by-id: code=%d body=%s", code, raw)
+	}
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"posts","payload":{"v":0}}`); code != 200 {
+		t.Fatalf("seed by-seq: code=%d body=%s", code, raw)
+	}
+	// Two seed events expected; baseline.
+	baseline, _ := eventsTailCount(t, h)
+	if baseline != 2 {
+		t.Fatalf("after seed: _events count=%d want 2", baseline)
+	}
+
+	// (1) update-by-id.
+	if code, _, raw := doRequest(t, h, "POST", "/update",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/update by-id: code=%d body=%s", code, raw)
+	}
+	// (2) update-by-seq (the second seeded item is at seq=2).
+	if code, _, raw := doRequest(t, h, "POST", "/update",
+		`{"scope":"posts","seq":2,"payload":{"v":2}}`); code != 200 {
+		t.Fatalf("/update by-seq: code=%d body=%s", code, raw)
+	}
+	// (3) update miss (id that doesn't exist) — must NOT emit.
+	if code, _, _ := doRequest(t, h, "POST", "/update",
+		`{"scope":"posts","id":"nope","payload":{"v":3}}`); code != 200 {
+		t.Fatalf("/update miss: code=%d want 200 (miss is not an error)", code)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 4 { // 2 seeds + 2 updates (miss skipped)
+		t.Fatalf("after updates: _events count=%d want 4 (2 seeds + 2 updates, miss must not emit)", count)
+	}
+
+	// items[2] is the by-id update; items[3] is the by-seq update.
+	byID, _ := items[2]["payload"].(map[string]interface{})
+	if byID["op"] != "update" || byID["id"] != "a" {
+		t.Errorf("by-id update envelope wrong: %v", byID)
+	}
+	if _, hasSeq := byID["seq"]; hasSeq {
+		t.Errorf("by-id update envelope must omit seq (omitempty); got %v", byID["seq"])
+	}
+	bySeq, _ := items[3]["payload"].(map[string]interface{})
+	if bySeq["op"] != "update" {
+		t.Errorf("by-seq update op=%v want update", bySeq["op"])
+	}
+	if bySeq["seq"] != float64(2) {
+		t.Errorf("by-seq update seq=%v want 2", bySeq["seq"])
+	}
+	if _, hasID := bySeq["id"]; hasID {
+		t.Errorf("by-seq update envelope must omit id (omitempty); got %v", bySeq["id"])
+	}
+}
+
+// /counter_add auto-populate: envelope carries the increment `by`,
+// never the post-add value. Tests both create-on-miss (auto-creates
+// the cell) and increment-on-hit. Notify and Full are functionally
+// identical for counter_add — counter cells have no opaque user
+// payload to strip.
+func TestEvents_AutoPopulate_CounterAdd(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Create-on-miss: by=5 against a non-existent id.
+	if code, _, raw := doRequest(t, h, "POST", "/counter_add",
+		`{"scope":"counters","id":"hits","by":5}`); code != 200 {
+		t.Fatalf("/counter_add create: code=%d body=%s", code, raw)
+	}
+	// Increment-on-hit: by=-2 (negative is allowed).
+	if code, _, raw := doRequest(t, h, "POST", "/counter_add",
+		`{"scope":"counters","id":"hits","by":-2}`); code != 200 {
+		t.Fatalf("/counter_add increment: code=%d body=%s", code, raw)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 2 {
+		t.Fatalf("counter_add auto-populate: _events count=%d want 2", count)
+	}
+	wantBy := []float64{5, -2}
+	for i, evt := range items {
+		envelope, ok := evt["payload"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event %d: envelope not object: %v", i, evt["payload"])
+		}
+		if envelope["op"] != "counter_add" {
+			t.Errorf("event %d: op=%v want counter_add", i, envelope["op"])
+		}
+		if envelope["scope"] != "counters" || envelope["id"] != "hits" {
+			t.Errorf("event %d: addressing wrong, got scope=%v id=%v", i, envelope["scope"], envelope["id"])
+		}
+		by, ok := envelope["by"].(float64)
+		if !ok || by != wantBy[i] {
+			t.Errorf("event %d: by=%v want %v (action-input, not the post-add value)", i, envelope["by"], wantBy[i])
+		}
+		// Counter envelopes carry NO payload field (counter cells are
+		// typed int64, not opaque JSON).
+		if _, hasPayload := envelope["payload"]; hasPayload {
+			t.Errorf("event %d: counter_add must not carry payload, got %v", i, envelope["payload"])
+		}
+		// And NO seq — counterAddOne doesn't pass it through.
+		if _, hasSeq := envelope["seq"]; hasSeq {
+			t.Errorf("event %d: counter_add envelope must omit seq, got %v", i, envelope["seq"])
+		}
+	}
+}
