@@ -52,6 +52,7 @@ func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		{"total_items", st.TotalItems},
 		{"approx_store_mb", st.ApproxStoreMB},
 		{"last_write_ts", st.LastWriteTS},
+		{"events_drops_total", st.EventsDropsTotal},
 		{"reserved_scopes", st.ReservedScopes},
 	}, started)
 }

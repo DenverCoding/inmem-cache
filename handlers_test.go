@@ -1216,6 +1216,62 @@ func TestStats_Structure(t *testing.T) {
 	}
 }
 
+// /stats always carries events_drops_total — a monotonic atomic
+// counter that ticks up every time the auto-populate path failed to
+// land an event in `_events` (cap overflow on _events, or — defensive
+// only — json.Marshal failure). Operators monitor this for drainer-
+// lag / cap-undersized deployments. On a fresh store with no writes
+// (or events_mode=off), the field is present with value 0 — its
+// presence is the contract, not its non-zeroness.
+func TestStats_EventsDropsTotal_PresentByDefault(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	_, out, _ := doAdminRequest(t, h, "/stats", "")
+	got, ok := out["events_drops_total"]
+	if !ok {
+		t.Fatalf("events_drops_total missing from /stats response: %+v", out)
+	}
+	if v, ok := got.(float64); !ok || v != 0 {
+		t.Errorf("events_drops_total=%v want 0 (fresh store, no writes)", got)
+	}
+}
+
+// Under tight cap pressure with events_mode=full, each user write
+// commits but the auto-populate path drops its event because there's
+// no room in _events for the envelope. /stats must report the
+// resulting drop count — that's the operator-monitorable signal that
+// "events are silently being lost" (drainer slow, cap undersized,
+// etc.).
+func TestStats_EventsDropsTotal_TicksOnDrops(t *testing.T) {
+	cfg := Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: reservedScopesOverhead + scopeBufferOverhead + 100,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	}
+	api := NewAPI(NewStore(cfg), APIConfig{})
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// Force a drop: tiny user payload fits in the 100-byte slack but
+	// the Full-mode event envelope doesn't.
+	if code, _, raw := doRequest(t, mux, "POST", "/append",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("user /append: code=%d body=%s want 200", code, raw)
+	}
+
+	_, out, _ := doRequest(t, mux, "GET", "/stats", "")
+	got := mustFloat(t, out, "events_drops_total")
+	if got < 1 {
+		t.Errorf("events_drops_total=%v want >= 1 (a drop should have happened)", got)
+	}
+	// Atomic counter must agree with what /stats reports.
+	if int64(got) != api.store.eventsDropsTotal.Load() {
+		t.Errorf("events_drops_total wire (%v) != atomic (%d)",
+			got, api.store.eventsDropsTotal.Load())
+	}
+}
+
 // /stats includes a reserved_scopes array — one row per cache-managed
 // reserved scope (currently `_events`, `_inbox`). The row carries the
 // (ii)-tier scope-stats: item_count, last_seq, approx_scope_mb,

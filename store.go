@@ -1029,11 +1029,12 @@ func (s *Store) deleteScope(scope string) (int, bool, error) {
 // O(1) /stats budget is preserved: two getScope() lookups + two
 // buf.stats() calls regardless of total scope count.
 type storeStats struct {
-	ScopeCount     int
-	TotalItems     int
-	ApproxStoreMB  MB
-	LastWriteTS    int64
-	ReservedScopes []reservedScopeEntry
+	ScopeCount       int
+	TotalItems       int
+	ApproxStoreMB    MB
+	LastWriteTS      int64
+	EventsDropsTotal int64
+	ReservedScopes   []reservedScopeEntry
 }
 
 // reservedScopeEntry is one row in /stats's reserved_scopes array.
@@ -1074,11 +1075,12 @@ type reservedScopeEntry struct {
 // without paying the per-scope enumeration cost.
 func (s *Store) stats() storeStats {
 	return storeStats{
-		ScopeCount:     int(s.scopeCount.Load()),
-		TotalItems:     int(s.totalItems.Load()),
-		ApproxStoreMB:  MB(s.totalBytes.Load()),
-		LastWriteTS:    s.lastWriteTS.Load(),
-		ReservedScopes: s.reservedScopeStats(),
+		ScopeCount:       int(s.scopeCount.Load()),
+		TotalItems:       int(s.totalItems.Load()),
+		ApproxStoreMB:    MB(s.totalBytes.Load()),
+		LastWriteTS:      s.lastWriteTS.Load(),
+		EventsDropsTotal: s.eventsDropsTotal.Load(),
+		ReservedScopes:   s.reservedScopeStats(),
 	}
 }
 

@@ -1394,9 +1394,11 @@ curl -s 'http://localhost:8080/tail?scope=events&limit=10'
 #### `GET /stats`
 
 Return a **store-wide aggregate snapshot**: scope count, total item
-count, approximate stored bytes, and the freshness tick. No
-per-scope enumeration — that lives on `/scopelist` (paginated, with
-optional prefix filter). Per-field semantics are documented in §2.5.
+count, approximate stored bytes, the freshness tick, the auto-populate
+drop counter, and a small fixed per-scope block for the reserved
+scopes (`_events`, `_inbox`). No enumeration of user-managed scopes —
+that lives on `/scopelist` (paginated, with optional prefix filter).
+Per-field semantics for the aggregates are documented in §2.5.
 
 **Query parameters**
 
@@ -1407,43 +1409,100 @@ None.
 ```json
 {
   "ok": true,
-  "scope_count": 12,
+  "scope_count": 14,
   "total_items": 5400,
   "approx_store_mb": 12.3456,
   "last_write_ts": 1700000000123456,
+  "events_drops_total": 0,
+  "reserved_scopes": [
+    {
+      "scope": "_events",
+      "item_count": 0,
+      "last_seq": 0,
+      "approx_scope_mb": 0.0001,
+      "created_ts": 1700000000000000,
+      "last_write_ts": 1700000000000000
+    },
+    {
+      "scope": "_inbox",
+      "item_count": 0,
+      "last_seq": 0,
+      "approx_scope_mb": 0.0001,
+      "created_ts": 1700000000000000,
+      "last_write_ts": 0
+    }
+  ],
   "duration_us": 0
 }
 ```
 
+**Field semantics**
+
+- `scope_count` — total number of scopes in the cache, **including**
+  the two reserved scopes. A freshly-wiped store has `scope_count=2`,
+  not `0`, because the reservation contract recreates `_events` and
+  `_inbox` immediately on `/wipe` and `/rebuild` (§2.6).
+- `total_items` — sum of items across all scopes, including reserved.
+  When `events_mode=full` this also counts the auto-populated event
+  entries.
+- `approx_store_mb` — sum of `approxItemSize(item)` over every item
+  plus `scopeBufferOverhead` per scope. Independent of the number of
+  scopes; counts items + per-scope overhead, not Go heap overhead per
+  scope (§2.4).
+- `last_write_ts` — the freshness-tick polling client `last_write_ts`
+  (§2.5). Strictly advances on every write/delete/bulk-op including
+  `/wipe`.
+- `events_drops_total` — monotonic counter of auto-populate event
+  emits that the cache had to drop because `_events` was at the byte
+  cap. **The user write that triggered the emit always succeeds** —
+  the drop is a degraded observability signal, not a degraded
+  primary operation. Operators monitor this for slow / dead
+  subscriber + cap-undersized deployments. Defensive: also bumped on
+  the (effectively unreachable) `json.Marshal` failure path.
+- `reserved_scopes` — bounded array (currently length 2) carrying the
+  per-scope state of the cache's infrastructure scopes. Per-row
+  fields mirror `/scopelist`'s shape minus the read-bookkeeping
+  signals (`last_access_ts`, `read_count_total`) which are noise on
+  reserved scopes that no user-facing traffic reads. Bounded by the
+  reserved-scope set, so `/stats` stays O(1) regardless of total
+  scope count.
+
 **Cost**
 
-`/stats` is **O(1)**: four atomic loads (`scope_count`, `total_items`,
-`approx_store_mb`, `last_write_ts`). Cost is independent of the
-number of scopes in the store. Each counter is maintained incrementally
-on every write/delete/bulk path. See §2.5 for the polling pattern that
+`/stats` is **O(1)**: five atomic loads (`scope_count`, `total_items`,
+`approx_store_mb`, `last_write_ts`, `events_drops_total`) plus two
+`getScope() + buf.stats()` materialisations for the reserved-scope
+rows. Cost is independent of the number of user-managed scopes in the
+store. Each aggregate counter is maintained incrementally on every
+write/delete/bulk path. See §2.5 for the polling pattern that
 `last_write_ts` enables. Configured caps are NOT echoed here — they
 are static config and live on `/help`.
 
 The previous shape included a per-scope `scopes` map keyed by scope
-name. At 100k+ scopes that response routinely blew past practical
-client and proxy response-size limits, and the per-scope enumeration
-(one `buffer.stats()` materialisation per scope) dominated `/stats`
-latency. Per-scope listing moved to a dedicated paginated endpoint
-to keep `/stats` cheap regardless of cache size.
+name across **all** user scopes. At 100k+ scopes that response
+routinely blew past practical client and proxy response-size limits,
+and the per-scope enumeration (one `buffer.stats()` materialisation
+per scope) dominated `/stats` latency. Per-scope listing of user
+scopes moved to a dedicated paginated endpoint (`/scopelist`); the
+small fixed `reserved_scopes` block is the bounded exception so
+operators can monitor drainer-backlog and fan-in queue depth without
+paging.
 
 **Side effects**
 
-None. `/stats` is read-only and aggregate-only — no scope names
-appear in the response, so it does not leak the per-tenant
-identifier surface (`_*` scopes etc.) that the per-scope map
-previously did. Operators may still wish to gate `/stats` for other
+None. `/stats` is read-only — no user-scope names appear in the
+response, so it does not leak the per-tenant identifier surface
+(`_*` scopes etc.) that the per-scope map previously did. The
+reserved-scope names are compile-time constants (settled #19), not
+operator-facing identifiers, so listing them carries no tenant
+information. Operators may still wish to gate `/stats` for other
 reasons (capacity-disclosure, side-channel timing); see §1.3.
 
 **Example**
 
 ```bash
-curl -s 'http://localhost:8080/stats'
-# → {"ok":true,"scope_count":12,"total_items":5400,"approx_store_mb":12.3456,"last_write_ts":1700000000123456,"duration_us":0}
+curl -s 'http://localhost:8080/stats' | jq .events_drops_total
+# → 0   # alert on > 0 in your monitoring pipeline
 ```
 
 ---
