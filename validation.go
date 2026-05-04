@@ -4,11 +4,36 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// ErrInvalidInput is the sentinel that every top-level validator wraps
+// its return error with. Lets HTTP handlers distinguish a validation
+// failure (→ 400 Bad Request) from a conflict (→ 409, e.g. duplicate
+// id) or a capacity error (→ 507) without per-validator type
+// inspection.
+//
+// Validators wrap via `fmt.Errorf("%w: <reason>", ErrInvalidInput)` so
+// errors.Is(err, ErrInvalidInput) on the handler side suffices. The
+// underlying reason string is preserved in the wrapped error for
+// human-readable diagnostic output (badRequest writes the full chain
+// to the response body).
+var ErrInvalidInput = errors.New("scopecache: invalid input")
+
+// wrapValidation tags a non-nil error as a validation failure by
+// wrapping it with ErrInvalidInput. Top-level validators use it via a
+// deferred call so every return path picks up the wrap automatically;
+// see validateWriteItem etc. for the pattern.
+func wrapValidation(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrInvalidInput, err.Error())
+}
 
 // checkKeyField enforces the shape rules for scope/id strings:
 // length cap, no surrounding whitespace, no embedded control characters.
@@ -166,7 +191,8 @@ func rejectClientTs(item Item, endpoint string) error {
 	return nil
 }
 
-func validateWriteItem(item Item, endpoint string, maxItemBytes int64) error {
+func validateWriteItem(item Item, endpoint string, maxItemBytes int64) (returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, endpoint); err != nil {
 		return err
 	}
@@ -185,7 +211,8 @@ func validateWriteItem(item Item, endpoint string, maxItemBytes int64) error {
 	return checkItemSize(item, maxItemBytes)
 }
 
-func validateUpsertItem(item Item, maxItemBytes int64) error {
+func validateUpsertItem(item Item, maxItemBytes int64) (returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, "/upsert"); err != nil {
 		return err
 	}
@@ -207,7 +234,8 @@ func validateUpsertItem(item Item, maxItemBytes int64) error {
 	return checkItemSize(item, maxItemBytes)
 }
 
-func validateUpdateItem(item Item, maxItemBytes int64) error {
+func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, "/update"); err != nil {
 		return err
 	}
@@ -236,7 +264,8 @@ func validateUpdateItem(item Item, maxItemBytes int64) error {
 // validateCounterAddRequest returns the parsed `by` on success so the handler
 // can pass it straight to the store without re-dereferencing the pointer.
 // Missing `by` is distinguished from an explicit zero by the pointer type.
-func validateCounterAddRequest(req CounterAddRequest) (int64, error) {
+func validateCounterAddRequest(req CounterAddRequest) (by int64, returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/counter_add"); err != nil {
 		return 0, err
 	}
@@ -249,7 +278,7 @@ func validateCounterAddRequest(req CounterAddRequest) (int64, error) {
 	if req.By == nil {
 		return 0, errors.New("the 'by' field is required for the '/counter_add' endpoint")
 	}
-	by := *req.By
+	by = *req.By
 	if by == 0 {
 		return 0, errors.New("the 'by' field must not be zero")
 	}
@@ -259,7 +288,8 @@ func validateCounterAddRequest(req CounterAddRequest) (int64, error) {
 	return by, nil
 }
 
-func validateDeleteRequest(req DeleteRequest) error {
+func validateDeleteRequest(req DeleteRequest) (returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete"); err != nil {
 		return err
 	}
@@ -274,7 +304,8 @@ func validateDeleteRequest(req DeleteRequest) error {
 	return nil
 }
 
-func validateDeleteScopeRequest(req DeleteScopeRequest) error {
+func validateDeleteScopeRequest(req DeleteScopeRequest) (returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete_scope"); err != nil {
 		return err
 	}
@@ -284,7 +315,8 @@ func validateDeleteScopeRequest(req DeleteScopeRequest) error {
 	return nil
 }
 
-func validateDeleteUpToRequest(req DeleteUpToRequest) error {
+func validateDeleteUpToRequest(req DeleteUpToRequest) (returnErr error) {
+	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/delete_up_to"); err != nil {
 		return err
 	}

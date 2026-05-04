@@ -636,6 +636,9 @@ func (s *Store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 // `_events` scope, which is recursion-guarded inside the helper.
 // See events.go for the full discipline.
 func (s *Store) appendOne(item Item) (Item, error) {
+	if err := validateWriteItem(item, "/append", s.maxItemBytesFor(item.Scope)); err != nil {
+		return Item{}, err
+	}
 	buf, created, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
 		return Item{}, err
@@ -667,6 +670,9 @@ func (s *Store) appendOne(item Item) (Item, error) {
 // emits an upsert event into `_events` (Phase A auto-populate; gated
 // on Config.Events.Mode — see events.go).
 func (s *Store) upsertOne(item Item) (Item, bool, error) {
+	if err := validateUpsertItem(item, s.maxItemBytes); err != nil {
+		return Item{}, false, err
+	}
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(item.Scope)
 	if err != nil {
 		return Item{}, false, err
@@ -689,6 +695,15 @@ func (s *Store) upsertOne(item Item) (Item, bool, error) {
 // increment `by` — never the post-add value (action-logging, not
 // result-logging; see events.go).
 func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
+	// Construct the request shape the validator expects so the same
+	// rules (scope shape + reserved-rejection + by != 0 + range) apply
+	// to both HTTP and Go-API callers. The pointer-nil check
+	// (`by required`) is the HTTP-only concern (JSON missing-field
+	// detection) and stays in the handler — Go callers always pass an
+	// int64.
+	if _, err := validateCounterAddRequest(CounterAddRequest{Scope: scope, ID: id, By: &by}); err != nil {
+		return 0, false, err
+	}
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
 	if err != nil {
 		return 0, false, err
@@ -717,6 +732,9 @@ func (s *Store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 // Drainers replaying `_events` against an empty cache produce the
 // same final state without these noise entries.
 func (s *Store) updateOne(item Item) (int, error) {
+	if err := validateUpdateItem(item, s.maxItemBytes); err != nil {
+		return 0, err
+	}
 	buf, ok := s.getScope(item.Scope)
 	if !ok {
 		return 0, nil
@@ -746,6 +764,9 @@ func (s *Store) updateOne(item Item) (int, error) {
 // Emits a delete event on hit (count > 0); see updateOne for the
 // action-logging-on-effective-change rationale.
 func (s *Store) deleteOne(scope, id string, seq uint64) (int, error) {
+	if err := validateDeleteRequest(DeleteRequest{Scope: scope, ID: id, Seq: seq}); err != nil {
+		return 0, err
+	}
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return 0, nil
@@ -773,6 +794,9 @@ func (s *Store) deleteOne(scope, id string, seq uint64) (int, error) {
 // a delete_up_to event on hit (count > 0); a cursor that selects no
 // items is a no-op against cache state and is not emitted.
 func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
+	if err := validateDeleteUpToRequest(DeleteUpToRequest{Scope: scope, MaxSeq: maxSeq}); err != nil {
+		return 0, err
+	}
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return 0, nil
@@ -928,9 +952,14 @@ func (s *Store) getScope(scope string) (*scopeBuffer, bool) {
 	return buf, ok
 }
 
-func (s *Store) deleteScope(scope string) (int, bool) {
-	if scope == "" {
-		return 0, false
+func (s *Store) deleteScope(scope string) (int, bool, error) {
+	// validateDeleteScopeRequest enforces the same shape rules as
+	// /delete_scope (scope present + non-reserved). Empty scope
+	// triggers the validator's "scope required" reject; reserved scope
+	// triggers the "is reserved" reject — both come back wrapped in
+	// ErrInvalidInput so the handler can map to 400.
+	if err := validateDeleteScopeRequest(DeleteScopeRequest{Scope: scope}); err != nil {
+		return 0, false, err
 	}
 
 	// The locked phase is wrapped in an inline closure so `defer
@@ -975,10 +1004,10 @@ func (s *Store) deleteScope(scope string) (int, bool) {
 		return itemCount, true
 	}()
 	if !ok {
-		return itemCount, false
+		return itemCount, false, nil
 	}
 	s.emitDeleteScopeEvent(scope)
-	return itemCount, true
+	return itemCount, true, nil
 }
 
 // storeStats is the typed snapshot of the store. stats() returns it so the

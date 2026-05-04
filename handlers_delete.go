@@ -1,6 +1,7 @@
 package scopecache
 
 import (
+	"errors"
 	"net/http"
 	"time"
 )
@@ -30,13 +31,12 @@ func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateDeleteRequest(req); err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	deleted, err := api.store.deleteOne(req.Scope, req.ID, req.Seq)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		// *ScopeDetachedError: the scope was wiped/deleted/rebuilt
 		// between the lookup and the mutation. Surface as 409 — same
 		// stance as /append, /upsert, /update, /counter_add. A retry
@@ -67,13 +67,12 @@ func (api *API) handleDeleteUpTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateDeleteUpToRequest(req); err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	deleted, err := api.store.deleteUpTo(req.Scope, req.MaxSeq)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		// Same orphan-detect rationale as handleDelete above.
 		conflict(w, started, err.Error())
 		return
@@ -100,12 +99,15 @@ func (api *API) handleDeleteScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateDeleteScopeRequest(req); err != nil {
-		badRequest(w, started, err.Error())
+	deletedItems, deleted, err := api.store.deleteScope(req.Scope)
+	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
+		conflict(w, started, err.Error())
 		return
 	}
-
-	deletedItems, deleted := api.store.deleteScope(req.Scope)
 
 	writeJSONWithDuration(w, http.StatusOK, orderedFields{
 		{"ok", true},

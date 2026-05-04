@@ -348,7 +348,7 @@ func TestStore_DeleteScope_ReleasesOverhead(t *testing.T) {
 	}
 
 	// Delete one scope — its overhead is released.
-	if _, ok := s.deleteScope("s_0"); !ok {
+	if _, ok, _ := s.deleteScope("s_0"); !ok {
 		t.Fatal("deleteScope s_0 reported miss")
 	}
 
@@ -761,7 +761,7 @@ func TestStore_EnsureScope_ReservesOverheadAndRoundTrips(t *testing.T) {
 		t.Fatalf("ensureScope reserved %d bytes; want %d (scopeBufferOverhead)", got, scopeBufferOverhead)
 	}
 
-	if _, ok := s.deleteScope("_counters_count_calls"); !ok {
+	if _, ok, _ := s.deleteScope("_counters_count_calls"); !ok {
 		t.Fatal("deleteScope reported miss on the freshly ensured scope")
 	}
 	if got := s.totalBytes.Load(); got != before {
@@ -851,24 +851,24 @@ func TestStore_DeleteScope(t *testing.T) {
 	_, _ = buf.appendItem(newItem("x", "a", nil))
 	_, _ = buf.appendItem(newItem("x", "b", nil))
 
-	n, ok := s.deleteScope("x")
-	if !ok || n != 2 {
-		t.Fatalf("deleteScope: ok=%v n=%d", ok, n)
+	n, ok, err := s.deleteScope("x")
+	if err != nil || !ok || n != 2 {
+		t.Fatalf("deleteScope: ok=%v n=%d err=%v", ok, n, err)
 	}
 	if _, found := s.getScope("x"); found {
 		t.Fatal("scope should be gone")
 	}
 
-	n, ok = s.deleteScope("missing")
-	if ok || n != 0 {
-		t.Fatalf("deleteScope(missing): ok=%v n=%d", ok, n)
+	n, ok, err = s.deleteScope("missing")
+	if err != nil || ok || n != 0 {
+		t.Fatalf("deleteScope(missing): ok=%v n=%d err=%v", ok, n, err)
 	}
 
-	// Empty scope is a shape bug from the caller — the store refuses it up
-	// front rather than walking the map for a key that cannot exist.
-	n, ok = s.deleteScope("")
-	if ok || n != 0 {
-		t.Fatalf("deleteScope(\"\"): ok=%v n=%d", ok, n)
+	// Empty scope is a shape bug from the caller — the validator refuses
+	// it up front, returning (0, false, ErrInvalidInput).
+	n, ok, err = s.deleteScope("")
+	if !errors.Is(err, ErrInvalidInput) || ok || n != 0 {
+		t.Fatalf("deleteScope(\"\"): ok=%v n=%d err=%v want ErrInvalidInput", ok, n, err)
 	}
 }
 
@@ -890,7 +890,7 @@ func TestScopeBuffer_DeletesDetectDetached(t *testing.T) {
 	_, _ = buf.appendItem(newItem("s", "c", nil))
 
 	// Detach by deleting the scope. buf is now an orphan.
-	if _, ok := s.deleteScope("s"); !ok {
+	if _, ok, _ := s.deleteScope("s"); !ok {
 		t.Fatal("deleteScope reported miss on a scope that exists")
 	}
 
@@ -1039,7 +1039,7 @@ func TestStore_DeleteScope_FreesBytes(t *testing.T) {
 		}
 	}
 
-	n, ok := s.deleteScope("s")
+	n, ok, _ := s.deleteScope("s")
 	if !ok || n != 4 {
 		t.Fatalf("deleteScope: ok=%v n=%d", ok, n)
 	}
@@ -1138,7 +1138,7 @@ func TestStore_DeleteScope_RaceWithAppend(t *testing.T) {
 			done <- struct{}{}
 		}()
 		go func() {
-			_, _ = s.deleteScope(scope)
+			_, _, _ = s.deleteScope(scope)
 			done <- struct{}{}
 		}()
 		<-done
@@ -1289,7 +1289,7 @@ func TestStore_StatsCounters_Invariant_AcrossPaths(t *testing.T) {
 	assertStatsCountersInvariant(t, s, "after deleteUpTo")
 
 	// deleteScope — drops scope b entirely (2 items + 1 scope).
-	if n, ok := s.deleteScope("b"); !ok || n != 2 {
+	if n, ok, _ := s.deleteScope("b"); !ok || n != 2 {
 		t.Fatalf("deleteScope n=%d ok=%v want n=2 ok=true", n, ok)
 	}
 	assertStatsCountersInvariant(t, s, "after deleteScope")
@@ -1552,7 +1552,7 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 		}
 	})
 	step("deleteScope", func() {
-		if _, ok := s.deleteScope("b"); !ok {
+		if _, ok, _ := s.deleteScope("b"); !ok {
 			t.Fatal("deleteScope: scope b missing")
 		}
 	})

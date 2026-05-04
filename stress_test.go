@@ -171,7 +171,7 @@ func TestStress_MixedOps(t *testing.T) {
 
 			case kind < 993:
 				// 1.8% delete_scope + immediate recreate
-				_, _ = s.deleteScope(scope)
+				_, _, _ = s.deleteScope(scope)
 				buf, _ := s.getOrCreateScope(scope)
 				_, _ = buf.appendItem(Item{
 					Scope:   scope,

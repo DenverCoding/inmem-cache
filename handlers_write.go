@@ -49,21 +49,13 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /append is the only single-item write that can target reserved
-	// scopes (the others reject reserved scopes at the validator), so
-	// it must resolve the per-item byte cap per scope: `_events`
-	// allows MaxItemBytes + 1 KiB envelope slack, `_inbox` is capped
-	// at the operator-tunable Inbox.MaxItemBytes (default 64 KiB),
-	// everything else uses the global MaxItemBytes. See store.go
-	// maxItemBytesFor.
-	if err := validateWriteItem(item, "/append", api.store.maxItemBytesFor(item.Scope)); err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	origScope := item.Scope
 	item, err := api.store.appendOne(item)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
@@ -100,14 +92,13 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateUpsertItem(item, api.store.maxItemBytes); err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	origScope := item.Scope
 	result, created, err := api.store.upsertOne(item)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
@@ -144,20 +135,28 @@ func (api *API) handleCounterAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	by, err := validateCounterAddRequest(req)
-	if err != nil {
-		badRequest(w, started, err.Error())
+	// /counter_add is the one endpoint where the JSON-shape check is
+	// HTTP-only: req.By is *int64 to distinguish "field missing" from
+	// "explicit zero". The "missing" case is a JSON-decode shape
+	// concern, not a Go-API concern (Go callers always pass int64), so
+	// the nil-check stays here. Range + non-zero validation lives in
+	// Store.counterAddOne (it sees int64).
+	if req.By == nil {
+		badRequest(w, started, "the 'by' field is required for the '/counter_add' endpoint")
 		return
 	}
 
 	origScope := req.Scope
-	value, created, err := api.store.counterAddOne(req.Scope, req.ID, by)
+	value, created, err := api.store.counterAddOne(req.Scope, req.ID, *req.By)
 	if err != nil {
-		// Common capacity-class errors first (sfe + stfe). Counter-
-		// specific errors (cpe → 409, coe → 400) are handled inline
-		// below — they do not fit the helper because cpe maps to
-		// `conflict` and coe maps to `badRequest`, not to the
-		// scope/store-full responders.
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
+		// Capacity-class errors (sfe + stfe). Counter-specific errors
+		// (cpe → 409, coe → 400) are handled inline below — they do
+		// not fit the helper because cpe maps to `conflict` and coe
+		// maps to `badRequest`, not to the scope/store-full responders.
 		if writeStoreCapacityError(w, started, err, origScope) {
 			return
 		}
@@ -196,13 +195,12 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateUpdateItem(item, api.store.maxItemBytes); err != nil {
-		badRequest(w, started, err.Error())
-		return
-	}
-
 	updated, err := api.store.updateOne(item)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		// /update only ever sees *StoreFullError on the cap path
 		// (existing-item replace can grow byte size); scopeForSFE is
 		// unused.
