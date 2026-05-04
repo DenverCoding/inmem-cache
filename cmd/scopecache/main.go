@@ -91,22 +91,40 @@ func maxItemBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
-// maxResponseBytesFromEnv returns SCOPECACHE_MAX_RESPONSE_MB (in MiB,
-// converted to bytes) if set to a positive integer, otherwise the
-// compile-time default. Caps the byte size of /head and /tail
-// responses; values past the cap are rejected with 507 Insufficient
-// Storage rather than streamed truncated.
-func maxResponseBytesFromEnv() int64 {
-	raw := os.Getenv("SCOPECACHE_MAX_RESPONSE_MB")
+// inboxMaxItemsFromEnv returns SCOPECACHE_INBOX_MAX_ITEMS if set to a
+// positive integer, otherwise 0 — the sentinel that lets
+// Config.WithDefaults fall back to ScopeMaxItems for the `_inbox`
+// scope. A malformed or non-positive value is ignored with a warning.
+func inboxMaxItemsFromEnv() int {
+	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEMS")
 	if raw == "" {
-		return int64(scopecache.MaxResponseMiB) << 20
+		return 0
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
-		log.Printf("SCOPECACHE_MAX_RESPONSE_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxResponseMiB)
-		return int64(scopecache.MaxResponseMiB) << 20
+		log.Printf("SCOPECACHE_INBOX_MAX_ITEMS=%q is not a positive integer; falling back to ScopeMaxItems", raw)
+		return 0
 	}
-	return int64(n) << 20
+	return n
+}
+
+// inboxMaxItemBytesFromEnv returns SCOPECACHE_INBOX_MAX_ITEM_KB
+// (in KiB, converted to bytes) if set to a positive integer, otherwise
+// 0 — the sentinel that lets Config.WithDefaults fall back to
+// InboxMaxItemBytes (64 KiB) for the `_inbox` scope. A malformed or
+// non-positive value is ignored with a warning. KiB is the configured
+// unit because the default (64 KiB) reads awkwardly as MiB (0.0625).
+func inboxMaxItemBytesFromEnv() int64 {
+	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEM_KB")
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("SCOPECACHE_INBOX_MAX_ITEM_KB=%q is not a positive integer; falling back to %d KiB", raw, scopecache.InboxMaxItemBytes>>10)
+		return 0
+	}
+	return int64(n) << 10
 }
 
 const shutdownGracePeriod = 5 * time.Second
@@ -160,14 +178,18 @@ func main() {
 		ScopeMaxItems: scopeMaxItemsFromEnv(),
 		MaxStoreBytes: maxStoreBytesFromEnv(),
 		MaxItemBytes:  maxItemBytesFromEnv(),
+		Inbox: scopecache.InboxConfig{
+			MaxItems:     inboxMaxItemsFromEnv(),
+			MaxItemBytes: inboxMaxItemBytesFromEnv(),
+		},
 	}
-	apiCfg := scopecache.APIConfig{
-		MaxResponseBytes: maxResponseBytesFromEnv(),
-	}
+	cfg = cfg.WithDefaults()
 	store := scopecache.NewStore(cfg)
-	api := scopecache.NewAPI(store, apiCfg)
+	api := scopecache.NewAPI(store, scopecache.APIConfig{})
 
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item, %d MiB per response", cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20, apiCfg.MaxResponseBytes>>20)
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item",
+		cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20,
+		cfg.Inbox.MaxItems, cfg.Inbox.MaxItemBytes>>10)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

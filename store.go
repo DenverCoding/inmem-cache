@@ -41,6 +41,30 @@ type Store struct {
 	maxStoreBytes   int64
 	maxItemBytes    int64
 
+	// Reserved-scope derived caps. Computed once at NewStore time from
+	// Config so write-path checks can read these directly without
+	// re-deriving on every call. See types.go LogConfig / InboxConfig
+	// for the shape rationale (why `_log` has no item-count knob and
+	// `_inbox` has both item-count and item-byte knobs).
+	//
+	//   - logMaxItemBytes:    MaxItemBytes + LogItemEnvelopeOverhead.
+	//                         Derived, not a knob — a log entry must
+	//                         always fit the user-write that produced it.
+	//   - inboxMaxItems:      Inbox.MaxItems (default = ScopeMaxItems).
+	//                         Operator-tunable independently of the global.
+	//   - inboxMaxItemBytes:  Inbox.MaxItemBytes (default = InboxMaxItemBytes,
+	//                         i.e. 64 KiB). Operator-tunable; typically
+	//                         smaller than the global MaxItemBytes because
+	//                         `_inbox` is for small fan-in events, not
+	//                         arbitrary user payloads.
+	//
+	// `_log` does NOT have an item-count cap: ScopeMaxItems is bypassed
+	// for that scope (best-effort observability — the only real
+	// begrenzer is the global byte budget on MaxStoreBytes).
+	logMaxItemBytes   int64
+	inboxMaxItems     int
+	inboxMaxItemBytes int64
+
 	// totalBytes tracks the running sum of every store-byte reservation:
 	// approxItemSize per item plus scopeBufferOverhead per allocated
 	// scope. Kept in an atomic so write paths can reserve against the
@@ -239,10 +263,13 @@ func (s *Store) initReservedScopesLocked() {
 func NewStore(c Config) *Store {
 	c = c.WithDefaults()
 	s := &Store{
-		hashSeed:        maphash.MakeSeed(),
-		defaultMaxItems: c.ScopeMaxItems,
-		maxStoreBytes:   c.MaxStoreBytes,
-		maxItemBytes:    c.MaxItemBytes,
+		hashSeed:          maphash.MakeSeed(),
+		defaultMaxItems:   c.ScopeMaxItems,
+		maxStoreBytes:     c.MaxStoreBytes,
+		maxItemBytes:      c.MaxItemBytes,
+		logMaxItemBytes:   c.MaxItemBytes + LogItemEnvelopeOverhead,
+		inboxMaxItems:     c.Inbox.MaxItems,
+		inboxMaxItemBytes: c.Inbox.MaxItemBytes,
 	}
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)

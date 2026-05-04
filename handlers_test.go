@@ -18,7 +18,7 @@ func newTestHandler(maxItems int) (http.Handler, *API) {
 	// small maxStoreBytes so their writes can fail the store cap on purpose.
 	api := NewAPI(
 		NewStore(Config{ScopeMaxItems: maxItems, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20}),
-		APIConfig{MaxResponseBytes: 25 << 20},
+		APIConfig{},
 	)
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

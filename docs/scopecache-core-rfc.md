@@ -358,6 +358,54 @@ clients.
   reserved scopes with no additional bookkeeping — same paths as
   user-managed scopes.
 
+**Per-reserved-scope capacity knobs.** The reserved scopes use
+caps that are deliberately decoupled from the global ones, but
+only where decoupling buys something. The rest is derived.
+
+| Scope | Item count cap | Per-item byte cap | Configurable? |
+|---|---|---|---|
+| `_inbox` | `Inbox.MaxItems` (default = `ScopeMaxItems`) | `Inbox.MaxItemBytes` (default = 64 KiB) | Both knobs are operator-tunable |
+| `_log` | *(none — exempt from `ScopeMaxItems`)* | `MaxItemBytes + 1 KiB` (derived) | Neither is a knob |
+
+`_inbox` is **operator-tunable on both axes**. It carries app-
+written fan-in events that are typically much smaller than user
+payloads, so the per-item cap defaults to 64 KiB rather than the
+global 1 MiB. Operators who need bigger or smaller `_inbox`
+events tune `Inbox.MaxItemBytes` independently. The item-count
+cap defaults to the global `ScopeMaxItems` but is also separately
+tunable so a high-throughput inbox can hold a different number of
+events than user scopes.
+
+`_log` is **fully derived**. Two reasons:
+
+1. *Per-item byte cap.* A `_log` entry wraps the user payload
+   produced by the write that triggered it (op-type, scope, seq,
+   ts, payload). It must always be at least as wide as the
+   user-write itself, plus a small envelope overhead. Setting it
+   independently invites the misconfiguration "log smaller than
+   user-item" → max-size user-writes silently drop their log
+   entry. The cache derives `_log`'s cap as
+   `MaxItemBytes + 1 KiB` so operators only ever tune
+   `MaxItemBytes` and `_log` follows.
+
+2. *Item-count cap.* `_log` is best-effort observability, not
+   durable user data. The only meaningful begrenzer is the
+   global byte budget (`MaxStoreBytes`), which `_log` shares
+   with every other scope. A separate item-count cap on `_log`
+   would be arbitrary; `ScopeMaxItems = 100,000` is no more
+   right for `_log` than `1,000,000` would be. The cache
+   exempts `_log` from `ScopeMaxItems` entirely; bytes-pressure
+   alone gates writes there.
+
+**HTTP response cap.** The per-response byte cap on `/head`,
+`/tail`, and `/render` is derived from `MaxStoreBytes`, not
+configured separately. By construction no scope can exceed the
+store budget, so any single-scope read is bounded by the store
+cap; making the response cap equal to the store cap guarantees
+every full-scope read fits in one response. This matters most
+for drainers that need to slurp `_log` or `_inbox` in large
+batches without artificial response-size 507s.
+
 **Implementation locus.** Constants `LogScopeName` and
 `InboxScopeName` live in `types.go`. The `reservedScopeNames`
 array, the `reservedScopesOverhead` constant, the

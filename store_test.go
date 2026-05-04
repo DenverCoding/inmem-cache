@@ -55,9 +55,12 @@ func TestNewStore_ZeroConfigUsesDefaults(t *testing.T) {
 	if s.maxItemBytes != int64(MaxItemBytes) {
 		t.Errorf("maxItemBytes=%d want %d", s.maxItemBytes, int64(MaxItemBytes))
 	}
-	// HTTP caps must match the package-level compile-time defaults.
-	if api.maxResponseBytes != int64(MaxResponseMiB)<<20 {
-		t.Errorf("api.maxResponseBytes=%d want %d", api.maxResponseBytes, int64(MaxResponseMiB)<<20)
+	// HTTP response cap is derived from the store's byte cap (no
+	// separate APIConfig knob): a single scope can never exceed the
+	// store budget, so the response cap that "guarantees every full-
+	// scope tail fits in one response" is exactly the store cap.
+	if api.maxResponseBytes != s.maxStoreBytes {
+		t.Errorf("api.maxResponseBytes=%d want %d (= store.maxStoreBytes)", api.maxResponseBytes, s.maxStoreBytes)
 	}
 }
 
@@ -76,14 +79,27 @@ func TestConfig_WithDefaults(t *testing.T) {
 		if got.MaxItemBytes != int64(MaxItemBytes) {
 			t.Errorf("MaxItemBytes=%d", got.MaxItemBytes)
 		}
+		if got.Inbox.MaxItems != ScopeMaxItems {
+			t.Errorf("Inbox.MaxItems=%d want %d", got.Inbox.MaxItems, ScopeMaxItems)
+		}
+		if got.Inbox.MaxItemBytes != int64(InboxMaxItemBytes) {
+			t.Errorf("Inbox.MaxItemBytes=%d want %d", got.Inbox.MaxItemBytes, InboxMaxItemBytes)
+		}
 	})
 
 	t.Run("positive fields preserved", func(t *testing.T) {
-		in := Config{ScopeMaxItems: 5, MaxStoreBytes: 7, MaxItemBytes: 11}
+		in := Config{
+			ScopeMaxItems: 5,
+			MaxStoreBytes: 7,
+			MaxItemBytes:  11,
+			Inbox:         InboxConfig{MaxItems: 13, MaxItemBytes: 17},
+		}
 		got := in.WithDefaults()
 		if got.ScopeMaxItems != in.ScopeMaxItems ||
 			got.MaxStoreBytes != in.MaxStoreBytes ||
-			got.MaxItemBytes != in.MaxItemBytes {
+			got.MaxItemBytes != in.MaxItemBytes ||
+			got.Inbox.MaxItems != in.Inbox.MaxItems ||
+			got.Inbox.MaxItemBytes != in.Inbox.MaxItemBytes {
 			t.Errorf("positive Config mutated: got %+v want %+v", got, in)
 		}
 	})
@@ -93,31 +109,96 @@ func TestConfig_WithDefaults(t *testing.T) {
 		// The Caddy module rejects negatives explicitly via validateConfig
 		// before even calling NewStore, so this path only fires for direct
 		// library callers — friendlier to fall back than to crash.
-		got := Config{ScopeMaxItems: -1, MaxStoreBytes: -100}.WithDefaults()
+		got := Config{
+			ScopeMaxItems: -1,
+			MaxStoreBytes: -100,
+			Inbox:         InboxConfig{MaxItems: -1, MaxItemBytes: -1},
+		}.WithDefaults()
 		if got.ScopeMaxItems != ScopeMaxItems {
 			t.Errorf("negative ScopeMaxItems not defaulted: %d", got.ScopeMaxItems)
 		}
 		if got.MaxStoreBytes != int64(MaxStoreMiB)<<20 {
 			t.Errorf("negative MaxStoreBytes not defaulted: %d", got.MaxStoreBytes)
 		}
-	})
-}
-
-// APIConfig.WithDefaults mirrors Config.WithDefaults: numeric zeros fall
-// back to compile-time defaults.
-func TestAPIConfig_WithDefaults(t *testing.T) {
-	t.Run("zero fields fall back to defaults", func(t *testing.T) {
-		got := APIConfig{}.WithDefaults()
-		if got.MaxResponseBytes != int64(MaxResponseMiB)<<20 {
-			t.Errorf("MaxResponseBytes=%d", got.MaxResponseBytes)
+		if got.Inbox.MaxItems != ScopeMaxItems {
+			t.Errorf("negative Inbox.MaxItems not defaulted: %d", got.Inbox.MaxItems)
+		}
+		if got.Inbox.MaxItemBytes != int64(InboxMaxItemBytes) {
+			t.Errorf("negative Inbox.MaxItemBytes not defaulted: %d", got.Inbox.MaxItemBytes)
 		}
 	})
 
-	t.Run("positive fields preserved", func(t *testing.T) {
-		in := APIConfig{MaxResponseBytes: 13}
-		got := in.WithDefaults()
-		if got.MaxResponseBytes != in.MaxResponseBytes {
-			t.Errorf("positive APIConfig mutated: got %+v want %+v", got, in)
+	t.Run("Inbox.MaxItems follows custom ScopeMaxItems", func(t *testing.T) {
+		// Inbox.MaxItems defaults to the resolved ScopeMaxItems, not
+		// the package-level ScopeMaxItems constant. Operators tuning
+		// the global cap downward must see Inbox follow.
+		got := Config{ScopeMaxItems: 42}.WithDefaults()
+		if got.Inbox.MaxItems != 42 {
+			t.Errorf("Inbox.MaxItems=%d want 42 (= custom ScopeMaxItems)", got.Inbox.MaxItems)
+		}
+	})
+}
+
+// NewStore derives the reserved-scope caps from the resolved Config.
+// Pinning these in a dedicated test means a future refactor of
+// LogItemEnvelopeOverhead, the inbox-default unit, or the derivation
+// formula breaks here loudly rather than silently shifting the
+// production caps.
+func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
+	t.Run("default config", func(t *testing.T) {
+		s := NewStore(Config{})
+		wantLog := int64(MaxItemBytes) + LogItemEnvelopeOverhead
+		if s.logMaxItemBytes != wantLog {
+			t.Errorf("logMaxItemBytes=%d want %d (= MaxItemBytes + LogItemEnvelopeOverhead)",
+				s.logMaxItemBytes, wantLog)
+		}
+		if s.inboxMaxItems != ScopeMaxItems {
+			t.Errorf("inboxMaxItems=%d want %d", s.inboxMaxItems, ScopeMaxItems)
+		}
+		if s.inboxMaxItemBytes != int64(InboxMaxItemBytes) {
+			t.Errorf("inboxMaxItemBytes=%d want %d", s.inboxMaxItemBytes, InboxMaxItemBytes)
+		}
+	})
+
+	t.Run("custom MaxItemBytes propagates to logMaxItemBytes", func(t *testing.T) {
+		s := NewStore(Config{MaxItemBytes: 256 << 10})
+		want := int64(256<<10) + LogItemEnvelopeOverhead
+		if s.logMaxItemBytes != want {
+			t.Errorf("logMaxItemBytes=%d want %d", s.logMaxItemBytes, want)
+		}
+	})
+
+	t.Run("custom InboxConfig is honoured", func(t *testing.T) {
+		s := NewStore(Config{Inbox: InboxConfig{MaxItems: 5000, MaxItemBytes: 8 << 10}})
+		if s.inboxMaxItems != 5000 {
+			t.Errorf("inboxMaxItems=%d want 5000", s.inboxMaxItems)
+		}
+		if s.inboxMaxItemBytes != int64(8<<10) {
+			t.Errorf("inboxMaxItemBytes=%d want %d", s.inboxMaxItemBytes, 8<<10)
+		}
+	})
+}
+
+// NewAPI derives the response cap from the store's byte cap rather
+// than from a separate APIConfig knob: any single scope is bounded by
+// the store budget, so the response cap that's "guaranteed to fit
+// every full-scope tail in one response" is simply equal to the store
+// cap. Operators tune MaxStoreBytes; the response cap follows.
+func TestNewAPI_DerivesMaxResponseBytesFromStore(t *testing.T) {
+	t.Run("default store", func(t *testing.T) {
+		s := NewStore(Config{})
+		api := NewAPI(s, APIConfig{})
+		if api.maxResponseBytes != s.maxStoreBytes {
+			t.Errorf("maxResponseBytes=%d want %d (= store.maxStoreBytes)",
+				api.maxResponseBytes, s.maxStoreBytes)
+		}
+	})
+
+	t.Run("custom store cap propagates", func(t *testing.T) {
+		s := NewStore(Config{MaxStoreBytes: 7 << 20})
+		api := NewAPI(s, APIConfig{})
+		if api.maxResponseBytes != int64(7<<20) {
+			t.Errorf("maxResponseBytes=%d want %d", api.maxResponseBytes, 7<<20)
 		}
 	})
 }

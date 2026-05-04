@@ -8,14 +8,33 @@ import (
 )
 
 const (
-	DefaultLimit   = 1000    // read response size when client omits ?limit
-	MaxLimit       = 10000   // hard ceiling on ?limit; higher values are clamped, not rejected
-	ScopeMaxItems  = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
-	MaxStoreMiB    = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
-	MaxItemBytes   = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
-	MaxResponseMiB = 25      // per-response cap default in MiB; applies to read endpoints whose response can grow with limit × per-item-cap (/tail, /head). Overridable via SCOPECACHE_MAX_RESPONSE_MB
-	MaxScopeBytes  = 256
-	MaxIDBytes     = 256
+	DefaultLimit  = 1000    // read response size when client omits ?limit
+	MaxLimit      = 10000   // hard ceiling on ?limit; higher values are clamped, not rejected
+	ScopeMaxItems = 100000  // per-scope capacity default; writes that would exceed this are rejected (507). Overridable via SCOPECACHE_SCOPE_MAX_ITEMS
+	MaxStoreMiB   = 100     // store-wide aggregate approxItemSize default in MiB; writes past this are rejected (507). Tuned for ~1 GB VPS footprints. Overridable via SCOPECACHE_MAX_STORE_MB
+	MaxItemBytes  = 1 << 20 // per-item cap default in bytes on approxItemSize (overhead + scope + id + payload). Overridable via SCOPECACHE_MAX_ITEM_MB (integer MiB)
+	MaxScopeBytes = 256
+	MaxIDBytes    = 256
+
+	// InboxMaxItemBytes is the default per-item cap for the reserved
+	// `_inbox` scope, in bytes. 64 KiB matches the "fan-in event drop"
+	// shape `_inbox` is designed for — small structured records that
+	// drainers process in bulk. Overridable via
+	// SCOPECACHE_INBOX_MAX_ITEM_KB (integer KiB).
+	InboxMaxItemBytes = 64 << 10
+
+	// LogItemEnvelopeOverhead is the slack added to the user-facing
+	// MaxItemBytes to derive the `_log` scope's per-item cap. A log
+	// entry wraps the user payload in a JSON envelope (op, scope, seq,
+	// ts, plus framing); 1 KiB is generous over the actual ~150 B of
+	// envelope so future field additions don't force a knob bump.
+	//
+	// `_log`'s per-item cap is derived (`MaxItemBytes +
+	// LogItemEnvelopeOverhead`), not exposed as a knob: a log entry
+	// must always be at least as wide as the user-write that produced
+	// it, otherwise large user-writes would 507 on the auto-populate
+	// path. Operators tune `MaxItemBytes`; `_log` follows.
+	LogItemEnvelopeOverhead = 1024
 
 	// LogScopeName is the well-known scope name for the auto-populated
 	// write-event log (Phase A "Subscribe + log-scope drain
@@ -63,23 +82,58 @@ const (
 // to NewStore. Keeping the shape in one place means new cache knobs land
 // in a single file instead of rippling through every adapter's call site.
 //
-// HTTP/transport-layer knobs (response sizing, read-heat opt-out) live
-// on APIConfig in api.go and are passed to NewAPI separately. The split
-// matches the boundary rule in CLAUDE.md: the core stays
-// transport-agnostic; HTTP concerns are an adapter-layer concept.
+// HTTP/transport-layer knobs live on APIConfig in api.go and are passed
+// to NewAPI separately. The split matches the boundary rule in
+// CLAUDE.md: the core stays transport-agnostic; HTTP concerns are an
+// adapter-layer concept.
 //
 // Fields:
 //   - ScopeMaxItems: per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
+//     Does NOT apply to the reserved `_log` scope (best-effort observability;
+//     bytes-cap on MaxStoreBytes is the only real begrenzer there).
 //   - MaxStoreBytes: aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
 //   - MaxItemBytes:  per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
+//     Applies to user-scopes; `_log` derives `MaxItemBytes + LogItemEnvelopeOverhead`,
+//     `_inbox` uses the operator-tunable Inbox.MaxItemBytes instead.
+//   - Log:           reserved-scope settings for `_log` (currently empty —
+//     forward-compat for any future log-specific knob).
+//   - Inbox:         reserved-scope settings for `_inbox` (per-item cap +
+//     item-count cap; both operator-tunable).
 //
 // Bytes (not MiB) are the core unit because admission control arithmetic
-// lives in bytes; adapters convert their MiB-facing configuration at the
-// boundary.
+// lives in bytes; adapters convert their MiB/KiB-facing configuration at
+// the boundary.
 type Config struct {
 	ScopeMaxItems int
 	MaxStoreBytes int64
 	MaxItemBytes  int64
+
+	Log   LogConfig
+	Inbox InboxConfig
+}
+
+// LogConfig holds reserved-scope settings for `_log`. Intentionally
+// empty: every plausible knob (per-item cap, item-count cap) is either
+// derived from the global Config or deliberately unbounded for
+// best-effort observability semantics. Kept as a struct (rather than
+// dropped) so a future log-specific knob lands without a breaking
+// change to Config's shape.
+type LogConfig struct{}
+
+// InboxConfig holds operator-tunable settings for the reserved `_inbox`
+// scope. `_inbox` is app-populated fan-in storage; its per-item cap is
+// independent of the global MaxItemBytes (which targets user-scopes
+// with potentially much larger payloads), and its item-count cap stays
+// tunable so operators can give `_inbox` a different ceiling than the
+// global ScopeMaxItems if their drainer cadence demands it.
+//
+// Fields:
+//   - MaxItems:     per-scope item cap on `_inbox`. Default ScopeMaxItems.
+//   - MaxItemBytes: per-item approxItemSize cap on `_inbox`. Default
+//     InboxMaxItemBytes (64 KiB).
+type InboxConfig struct {
+	MaxItems     int
+	MaxItemBytes int64
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields
@@ -97,6 +151,12 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.MaxItemBytes <= 0 {
 		c.MaxItemBytes = int64(MaxItemBytes)
+	}
+	if c.Inbox.MaxItems <= 0 {
+		c.Inbox.MaxItems = c.ScopeMaxItems
+	}
+	if c.Inbox.MaxItemBytes <= 0 {
+		c.Inbox.MaxItemBytes = int64(InboxMaxItemBytes)
 	}
 	return c
 }

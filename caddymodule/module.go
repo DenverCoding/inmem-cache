@@ -28,12 +28,16 @@ import (
 // Handler is the Caddy HTTP handler that embeds scopecache.
 //
 // JSON config fields map 1:1 to the same capacity knobs the standalone
-// binary reads from env vars (SCOPECACHE_SCOPE_MAX_ITEMS, SCOPECACHE_MAX_STORE_MB,
-// SCOPECACHE_MAX_ITEM_MB). Zero values fall back to the compile-time defaults
-// declared in the core package.
+// binary reads from env vars (SCOPECACHE_SCOPE_MAX_ITEMS,
+// SCOPECACHE_MAX_STORE_MB, SCOPECACHE_MAX_ITEM_MB,
+// SCOPECACHE_INBOX_MAX_ITEMS, SCOPECACHE_INBOX_MAX_ITEM_KB). Zero
+// values fall back to the compile-time defaults declared in the core
+// package.
 //
-// MaxStoreMB and MaxItemMB are MiB-facing (matching the env-var convention);
-// they are converted to bytes in Provision before being handed to the core.
+// MaxStoreMB and MaxItemMB are MiB-facing (matching the env-var
+// convention); InboxMaxItemKB is KiB-facing because its default
+// (64 KiB) reads awkwardly as MiB. All are converted to bytes in
+// Provision before being handed to the core.
 type Handler struct {
 	// ScopeMaxItems caps items per scope. 0 = use scopecache.ScopeMaxItems.
 	ScopeMaxItems int `json:"scope_max_items,omitempty"`
@@ -41,9 +45,12 @@ type Handler struct {
 	MaxStoreMB int `json:"max_store_mb,omitempty"`
 	// MaxItemMB caps a single item's approxItemSize in MiB. 0 = use scopecache.MaxItemBytes.
 	MaxItemMB int `json:"max_item_mb,omitempty"`
-	// MaxResponseMB caps the byte size of /head and /tail responses
-	// in MiB. 0 = use scopecache.MaxResponseMiB.
-	MaxResponseMB int `json:"max_response_mb,omitempty"`
+	// InboxMaxItems caps items in the reserved `_inbox` scope. 0 =
+	// fall back to ScopeMaxItems.
+	InboxMaxItems int `json:"inbox_max_items,omitempty"`
+	// InboxMaxItemKB caps a single `_inbox` item's approxItemSize in
+	// KiB. 0 = use scopecache.InboxMaxItemBytes (64 KiB).
+	InboxMaxItemKB int `json:"inbox_max_item_kb,omitempty"`
 
 	api *scopecache.API
 	mux *http.ServeMux
@@ -71,10 +78,12 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		ScopeMaxItems: h.ScopeMaxItems,
 		MaxStoreBytes: int64(h.MaxStoreMB) << 20,
 		MaxItemBytes:  int64(h.MaxItemMB) << 20,
+		Inbox: scopecache.InboxConfig{
+			MaxItems:     h.InboxMaxItems,
+			MaxItemBytes: int64(h.InboxMaxItemKB) << 10,
+		},
 	})
-	h.api = scopecache.NewAPI(store, scopecache.APIConfig{
-		MaxResponseBytes: int64(h.MaxResponseMB) << 20,
-	})
+	h.api = scopecache.NewAPI(store, scopecache.APIConfig{})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
 	return nil
@@ -100,7 +109,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    scope_max_items     100000
 //	    max_store_mb        100
 //	    max_item_mb         1
-//	    max_response_mb     25
+//	    inbox_max_items     100000
+//	    inbox_max_item_kb   64
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -126,8 +136,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.MaxStoreMB = n
 			case "max_item_mb":
 				h.MaxItemMB = n
-			case "max_response_mb":
-				h.MaxResponseMB = n
+			case "inbox_max_items":
+				h.InboxMaxItems = n
+			case "inbox_max_item_kb":
+				h.InboxMaxItemKB = n
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}
@@ -146,7 +158,8 @@ func (h *Handler) validateConfig() error {
 		{"scope_max_items", h.ScopeMaxItems},
 		{"max_store_mb", h.MaxStoreMB},
 		{"max_item_mb", h.MaxItemMB},
-		{"max_response_mb", h.MaxResponseMB},
+		{"inbox_max_items", h.InboxMaxItems},
+		{"inbox_max_item_kb", h.InboxMaxItemKB},
 	} {
 		if e.value < 0 {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)

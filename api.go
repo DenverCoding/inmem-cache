@@ -1,39 +1,25 @@
 package scopecache
 
-// APIConfig bundles the HTTP/transport-layer knobs that adapters supply to
-// NewAPI. The split between APIConfig and Config mirrors the boundary
-// rule: Config carries cache-internal limits (per-scope item cap, store
-// byte cap, per-item byte cap), APIConfig carries everything that only
-// makes sense once a request is being served — currently just response
-// sizing.
+// APIConfig bundles the HTTP/transport-layer knobs that adapters supply
+// to NewAPI. The split between APIConfig and Config mirrors the
+// boundary rule: Config carries cache-internal limits (per-scope item
+// cap, store byte cap, per-item byte cap), APIConfig carries everything
+// that only makes sense once a request is being served.
+//
+// Currently empty: the only HTTP-layer knob (response-byte cap) is now
+// derived from the store's MaxStoreBytes inside NewAPI rather than
+// configured separately — by construction no single scope can hold
+// more than the store, so the response cap that's "guaranteed to fit
+// every full-scope tail in one response" is simply equal to the store
+// cap. The struct is kept (rather than dropped) so the first new
+// HTTP-layer knob (CORS, request tracing, …) lands without breaking
+// every adapter's `NewAPI(store, scopecache.APIConfig{})` call site.
 //
 // Multi-tenancy, auth, batching and operator-policy concerns previously
-// in this struct (ServerSecret, InboxScopes, EnableAdmin, MaxMultiCall*,
-// MaxInboxBytes) have moved out of core; they belong in the addons that
-// will reintroduce /guarded, /admin, /inbox and /multi_call as separate
-// sub-packages. See core-and-addons.md.
-//
-// Both the standalone binary and the Caddy module construct one of each
-// and hand them to NewStore + NewAPI. New HTTP-layer knobs land here
-// rather than in Config; new cache-layer knobs land in Config.
-//
-// Fields:
-//   - MaxResponseBytes:  per-response cap on read endpoints whose body can
-//     grow with limit × per-item-cap. In bytes. Default MaxResponseMiB << 20.
-type APIConfig struct {
-	MaxResponseBytes int64
-}
-
-// WithDefaults returns a copy of c with non-positive numeric fields
-// replaced by the package-level compile-time defaults. NewAPI calls this
-// internally so callers can pass a partially-filled APIConfig (or a bare
-// `APIConfig{}` for "all defaults") and still get a working API.
-func (c APIConfig) WithDefaults() APIConfig {
-	if c.MaxResponseBytes <= 0 {
-		c.MaxResponseBytes = int64(MaxResponseMiB) << 20
-	}
-	return c
-}
+// in this struct have moved out of core; they belong in addons that
+// will reintroduce /guarded, /admin, /inbox and /multi_call as
+// separate sub-packages. See core-and-addons.md.
+type APIConfig struct{}
 
 // API is the HTTP layer in front of *Store. It owns request-shape
 // concerns the core deliberately knows nothing about: response-size
@@ -55,18 +41,24 @@ type API struct {
 
 	// maxResponseBytes is the per-response byte cap for /head, /tail —
 	// endpoints whose response can grow with limit × per-item-cap.
+	// Derived from store.maxStoreBytes (not operator-configurable):
+	// any single scope is bounded by the store budget, so a response
+	// cap equal to the store cap guarantees every full-scope read
+	// fits in one response — including drainer reads of `_log` which
+	// must never be artificially capped (drainer lag → silent event
+	// drop is the failure mode, not a 507 on tail).
 	maxResponseBytes int64
 }
 
-// NewAPI wires the HTTP API to a Store and an APIConfig. Request caps that
-// scale with the store's configuration (maxBulkBytes, maxSingleBytes) are
-// derived from the store; everything else comes from the APIConfig.
-func NewAPI(store *Store, cfg APIConfig) *API {
-	cfg = cfg.WithDefaults()
+// NewAPI wires the HTTP API to a Store and an APIConfig. Every byte
+// cap on this layer is derived from the store's configuration so the
+// HTTP guardrails always track the underlying cache budget without
+// the operator having to keep two sets of knobs in sync.
+func NewAPI(store *Store, _ APIConfig) *API {
 	return &API{
 		store:            store,
 		maxBulkBytes:     bulkRequestBytesFor(store.maxStoreBytes),
 		maxSingleBytes:   singleRequestBytesFor(store.maxItemBytes),
-		maxResponseBytes: cfg.MaxResponseBytes,
+		maxResponseBytes: store.maxStoreBytes,
 	}
 }

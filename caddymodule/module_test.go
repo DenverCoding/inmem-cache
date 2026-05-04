@@ -19,7 +19,8 @@ func TestValidateConfig_RejectsNegative(t *testing.T) {
 		{"scope_max_items", func(h *Handler) { h.ScopeMaxItems = -1 }, "scope_max_items"},
 		{"max_store_mb", func(h *Handler) { h.MaxStoreMB = -1 }, "max_store_mb"},
 		{"max_item_mb", func(h *Handler) { h.MaxItemMB = -5 }, "max_item_mb"},
-		{"max_response_mb", func(h *Handler) { h.MaxResponseMB = -25 }, "max_response_mb"},
+		{"inbox_max_items", func(h *Handler) { h.InboxMaxItems = -1 }, "inbox_max_items"},
+		{"inbox_max_item_kb", func(h *Handler) { h.InboxMaxItemKB = -8 }, "inbox_max_item_kb"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,10 +48,11 @@ func TestValidateConfig_AcceptsZero(t *testing.T) {
 
 func TestValidateConfig_AcceptsPositive(t *testing.T) {
 	h := &Handler{
-		ScopeMaxItems: 100000,
-		MaxStoreMB:    100,
-		MaxItemMB:     1,
-		MaxResponseMB: 25,
+		ScopeMaxItems:  100000,
+		MaxStoreMB:     100,
+		MaxItemMB:      1,
+		InboxMaxItems:  50000,
+		InboxMaxItemKB: 64,
 	}
 	if err := h.validateConfig(); err != nil {
 		t.Errorf("positive config rejected: %v", err)
