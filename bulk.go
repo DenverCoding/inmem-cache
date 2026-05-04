@@ -1,7 +1,7 @@
 package scopecache
 
 import (
-	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -141,10 +141,23 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 
 	for scope, items := range grouped {
 		if scope == "" {
-			return 0, errors.New("the 'scope' field is required")
+			return 0, fmt.Errorf("%w: the 'scope' field is required", ErrInvalidInput)
 		}
 		if isReservedScope(scope) {
-			return 0, errors.New("scope '" + scope + "' is reserved and cannot be the target of /warm")
+			return 0, fmt.Errorf("%w: scope '%s' is reserved and cannot be the target of /warm", ErrInvalidInput, scope)
+		}
+		// Per-item shape validation. Same rules every other write path
+		// applies (validateWriteItem). Pre-step-6.7 this loop lived in
+		// the HTTP handler; centralising here means Gateway.Warm and
+		// any addon caller get the same per-item gate without
+		// duplicating it. Index is per-scope-slice (not flat across
+		// the original ItemsRequest) — slight cosmetic shift in the
+		// error string vs. pre-step-6.7, but the substring "scope X,
+		// item N" is searchable for the same operator-side debugging.
+		for i, item := range items {
+			if err := validateWriteItem(item, "/warm", s.maxItemBytes); err != nil {
+				return 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
+			}
 		}
 		if len(items) > s.defaultMaxItems {
 			offenders = append(offenders, ScopeCapacityOffender{
@@ -156,7 +169,7 @@ func (s *Store) replaceScopes(grouped map[string][]Item) (int, error) {
 		}
 		r, err := buildReplacementState(items)
 		if err != nil {
-			return 0, errors.New("scope '" + scope + "': " + err.Error())
+			return 0, fmt.Errorf("%w: scope '%s': %s", ErrInvalidInput, scope, err.Error())
 		}
 		plans = append(plans, plan{scope: scope, replacement: r, newBytes: sumItemBytes(r.items)})
 	}
@@ -297,8 +310,18 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	var offenders []ScopeCapacityOffender
 
 	for scope, items := range grouped {
+		if scope == "" {
+			return 0, 0, fmt.Errorf("%w: the 'scope' field is required", ErrInvalidInput)
+		}
 		if isReservedScope(scope) {
-			return 0, 0, errors.New("scope '" + scope + "' is reserved and cannot appear in /rebuild input")
+			return 0, 0, fmt.Errorf("%w: scope '%s' is reserved and cannot appear in /rebuild input", ErrInvalidInput, scope)
+		}
+		// Per-item shape validation, same shape as /warm — see
+		// replaceScopes for the rationale on per-scope-slice indexing.
+		for i, item := range items {
+			if err := validateWriteItem(item, "/rebuild", s.maxItemBytes); err != nil {
+				return 0, 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
+			}
 		}
 		if len(items) > s.defaultMaxItems {
 			offenders = append(offenders, ScopeCapacityOffender{
@@ -310,7 +333,7 @@ func (s *Store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		}
 		r, err := buildReplacementState(items)
 		if err != nil {
-			return 0, 0, errors.New("scope '" + scope + "': " + err.Error())
+			return 0, 0, fmt.Errorf("%w: scope '%s': %s", ErrInvalidInput, scope, err.Error())
 		}
 		// buf is not yet shared; bypass commitReplacement (which would try
 		// to adjust the store counter) and initialize state directly. The

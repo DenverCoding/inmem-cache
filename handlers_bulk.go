@@ -1,21 +1,26 @@
 package scopecache
 
 import (
+	"errors"
 	"net/http"
-	"strconv"
 	"time"
 )
 
-// Bulk write handlers (admin-only, reachable via /admin's dispatcher):
+// Bulk write handlers on the public mux:
 //
 //   - /warm     — replace the scopes carried in the request, leave others alone
 //   - /rebuild  — atomically replace the entire store
 //
-// Both decode an ItemsRequest, validate every item up-front, then route
-// through Store.replaceScopes / Store.rebuildAll which each take the
-// appropriate ascending-shard-index locks. /rebuild explicitly refuses
-// an empty items array because that is almost always a client bug rather
-// than an intentional clear-everything request.
+// Both decode an ItemsRequest and route through Store.replaceScopes /
+// Store.rebuildAll. Per-item shape validation lives at the top of those
+// Store methods (step 6.7 onwards), so handlers no longer iterate the
+// items themselves — they decode, delegate, and map errors.
+//
+// /rebuild explicitly refuses an empty items array because that is
+// almost always a client bug rather than an intentional clear-
+// everything request; the empty-input check stays in the handler
+// because it is a /rebuild-endpoint-specific policy, not a per-item
+// shape rule.
 
 func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
@@ -31,20 +36,13 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for i := range req.Items {
-		if err := validateWriteItem(req.Items[i], "/warm", api.store.maxItemBytes); err != nil {
-			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": "+err.Error())
-			return
-		}
-		if isReservedScope(req.Items[i].Scope) {
-			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": scope '"+req.Items[i].Scope+"' is reserved and cannot be the target of /warm")
-			return
-		}
-	}
-
 	grouped := groupItemsByScope(req.Items)
 	replacedScopes, err := api.store.replaceScopes(grouped)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		// /warm cannot produce *ScopeFullError (only single-item paths do);
 		// scopeForSFE is unused here.
 		if writeStoreCapacityError(w, started, err, "") {
@@ -79,26 +77,22 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	// client bug (missing payload, wrong key, serialization glitch) rather
 	// than an intentional "clear everything" call. Refuse it explicitly;
 	// clients that really want to clear the cache should /delete_scope per
-	// scope or restart the service.
+	// scope or restart the service. This /rebuild-specific guard stays in
+	// the handler — it's an HTTP policy ("explicit-non-empty-required"),
+	// not a per-item shape check; Go-API callers of Gateway.Rebuild who
+	// want a wipe-shaped rebuild can pass an empty map intentionally.
 	if len(req.Items) == 0 {
 		badRequest(w, started, "the 'items' array must not be empty for the '/rebuild' endpoint")
 		return
 	}
 
-	for i := range req.Items {
-		if err := validateWriteItem(req.Items[i], "/rebuild", api.store.maxItemBytes); err != nil {
-			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": "+err.Error())
-			return
-		}
-		if isReservedScope(req.Items[i].Scope) {
-			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": scope '"+req.Items[i].Scope+"' is reserved and cannot appear in /rebuild input")
-			return
-		}
-	}
-
 	grouped := groupItemsByScope(req.Items)
 	rebuiltScopes, rebuiltItems, err := api.store.rebuildAll(grouped)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInput) {
+			badRequest(w, started, err.Error())
+			return
+		}
 		// /rebuild cannot produce *ScopeFullError (only single-item paths
 		// do); scopeForSFE is unused here.
 		if writeStoreCapacityError(w, started, err, "") {

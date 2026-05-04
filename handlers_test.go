@@ -279,6 +279,12 @@ func TestWarm_LeavesOtherScopesUntouched(t *testing.T) {
 	}
 }
 
+// Duplicate id within the same scope in /warm input is a request-shape
+// problem (the same primary-key field appears twice in one batch), not
+// a conflict against existing state — so 400 is the right code, not
+// 409. Pre-step-6.7 this returned 409 because dup-detection happened
+// inside buildReplacementState and the handler defaulted unknown
+// errors to 409; post-6.7 the validation wrap promotes it to 400.
 func TestWarm_DuplicateIDInSameScope(t *testing.T) {
 	h, _ := newTestHandler(10)
 	body := `{"items":[
@@ -286,8 +292,8 @@ func TestWarm_DuplicateIDInSameScope(t *testing.T) {
 		{"scope":"s","id":"a","payload":{"v":2}}
 	]}`
 	code, _, _ := doAdminRequest(t, h, "/warm", body)
-	if code != 409 {
-		t.Fatalf("code=%d want 409", code)
+	if code != 400 {
+		t.Fatalf("code=%d want 400", code)
 	}
 }
 
