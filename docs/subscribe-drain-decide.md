@@ -86,18 +86,34 @@ must be possible" feature beyond that is operator-side.
 ### Subscribe
 
 ```go
-func (s *Store) Subscribe(scope string) (<-chan struct{}, func())
-//                                          coalescing    unsubscribe
+func (s *Store) Subscribe(scope string) (<-chan struct{}, func(), error)
+//                                          coalescing    unsubscribe  err
 ```
 
+- **Restricted to reserved scopes (`_events`, `_inbox`).** Settled #2.
+  Anything else → `ErrInvalidSubscribeScope`. User-managed scopes
+  (which can run into the thousands) are observable via `_events`
+  auto-populate; that's the point of `_events`.
+- **Single subscriber per reserved scope.** Settled #20. A second
+  Subscribe on the same scope while the first is active →
+  `ErrAlreadySubscribed`. Realistic deployment is one internal Go
+  drainer per scope; multi-subscriber fanout would split work non-
+  deterministically across the coalesced wake-up, the cache rejects
+  that shape upfront.
 - **Single-slot, size-1 buffered channel.** Non-blocking send: when
   the slot is full the cache drops the send (no-op). The pending
   notification already covers any subsequent write.
-- **Per-scope.** Each `*scopeBuffer` owns its own subscriber list.
 - **No slow-subscriber drop policy needed.** A subscriber that falls
   behind simply doesn't get a separate signal per missed write —
   they get one wake-up that covers all of them, and Tail-since-cursor
   catches them up.
+- **Channel survives `/wipe` and `/rebuild` transparently.** The
+  reserved scope is dropped + immediately re-created under the same
+  all-shard write lock; the subscriber slot lives at Store level
+  keyed by scope name (NOT in `*scopeBuffer`), so the subscription
+  re-attaches to the freshly-recreated buffer without the drainer
+  having to reconnect. The drainer detects wipe/rebuild via cursor-
+  rewind on the next Tail call (`_events.lastSeq` < `lastSeenSeq`).
 - **Capture-under-lock, emit-outside-lock.** Writes commit under
   `b.mu`; the notification fanout happens after `b.mu` is released,
   so slow channel-sends never extend the write-path's critical
@@ -232,7 +248,7 @@ weaker substitute.
 These should NOT need re-litigation in the implementation phase:
 
 1. **Single-slot coalescing channel** — not deep-buffered. `select { case ch <- struct{}{}: default: }`.
-2. **Per-scope subscribe** — not global. The Subscribe primitive takes a scope arg; in practice subscribers only call it for `_events` and `_inbox`, but the primitive itself is general.
+2. **Subscribe restricted to reserved scopes (`_events`, `_inbox`).** The cache does NOT support subscribing to user-managed scopes. Rationale: (a) `_events` is the singular monitoring channel for all writes — that is *why* it exists; thousands of per-user-scope subscribers would invert that design and add per-scope lock + fanout cost on the hot path for no realistic benefit. (b) The drainer is an internal Go process, not many-clients-fan-out — there is one drainer per reserved scope, sometimes one drainer for both. (c) Reserved scopes always exist (pre-created at boot, re-created at /wipe and /rebuild), which closes Q16 and Q17 by construction. Implementation: `Subscribe` takes a `scope string` arg and returns `ErrInvalidSubscribeScope` for any non-reserved name; `isReservedScope(scope)` is the gate. Pre-1.0: the API stays string-based (rather than `SubscribeEvents()` / `SubscribeInbox()` per-method) so the validator carries the rule and a future expansion to more reserved names is a one-line constant change.
 3. **`_events` is auto-populated by core** — not by an addon-side hook registry.
 4. **`_events` includes payload** — required for the file-drain pattern to be useful (files must be self-contained).
 5. **Bulk operations emit summaries, not per-item events** — `/warm` and `/rebuild` produce 1 log entry each.
@@ -288,6 +304,10 @@ These should NOT need re-litigation in the implementation phase:
 
 19. **Reserved scope names hardcoded.** Resolves Q14. `_events` and `_inbox` are compile-time constants; not exposed as adapter knobs. Operators concerned about collision with their own scope-namespacing prefix their own scopes (e.g., `acme:posts:42`). An `EventsScopeName` / `InboxScopeName` operator-tunable knob would not solve the collision problem (third-party addons that also reference the constants would diverge per deployment). **Implemented.**
 
+20. **Single subscriber per reserved scope.** A second `Subscribe` to the same scope while the first is still active returns `ErrAlreadySubscribed`. Multi-subscriber fanout (one wake-up to N drainers) was considered but doesn't match any realistic deployment shape: the drainer is an internal Go process, not a many-client broadcast, and two drainers competing for the same scope would race on the coalesced single-slot wake-up — first one to read the slot wins, the other never sees the signal. The cache rejects that shape upfront. Composing two sinks (e.g. JSONL + webhook) is the drainer's job: one drainer reads, fans out to two writers internally. Implementation: per-scope `subscriber` field on `*Store` (NOT a list), set under `subsMu` on Subscribe, cleared on `unsub()`. ~10 lines saved vs the list-based shape.
+
+21. **Subscribe state lives at Store level, not on `*scopeBuffer`.** Per-scope `subscriber` map keyed by scope name on `*Store`, guarded by `subsMu`. Survives buffer churn: when `/wipe` and `/rebuild` drop+recreate `_events` and `_inbox`, the subscriber slot stays attached and re-points at the freshly-recreated buffer transparently, so drainers don't have to reconnect across destructive ops. Drainer detects wipe/rebuild via cursor-rewind (`lastSeq` going backwards on the next Tail) and resets its own state — same shape as the no-emit decision for /wipe and /rebuild events.
+
 ## Open design decisions
 
 ### Auto-populate semantics (still open)
@@ -319,28 +339,32 @@ document.
 
 ### Subscribe semantics
 
-- **Q16 — Subscribe-on-not-yet-existent scope.** Should
-  `Store.Subscribe("foo")` succeed when scope "foo" has not been
-  created yet? If yes, the cache must auto-create the (empty) scope
-  buffer on Subscribe — same overhead reservation as `ensureScope`.
-  In the new architecture the only realistic Subscribe targets are
-  `_events` and `_inbox`, both pre-created — so this question matters
-  less, but the primitive is generic.
+- **Q16 — Subscribe-on-not-yet-existent scope.** ✅ **Resolved by
+  settled #2 (restrict to reserved scopes).** Reserved scopes are
+  pre-created at boot via `initReservedScopes`, so a Subscribe to
+  `_events` or `_inbox` always finds the buffer present. Non-reserved
+  scopes return `ErrInvalidSubscribeScope` upfront — auto-create-on-
+  Subscribe is not needed.
 
-- **Q17 — Scope-deleted-while-subscribed.** When `/delete_scope`
-  removes a scope that has subscribers, the channel should close
-  cleanly. Sentinel "scope detached" event before close, or silent
-  close? Under coalescing-channel-of-struct{} this question reduces:
-  there's no payload to carry the sentinel. Silent close + the
-  `scope_detached` entry in `_events` is probably enough — subscribers
-  who care can see that entry in their next drain.
+- **Q17 — Scope-deleted-while-subscribed.** ✅ **Resolved by
+  settled #2 + #21.** Reserved scopes cannot be `/delete_scope`'d
+  (validator rejects the request — the reserved-scopes contract pre-
+  dates auto-populate). The only destructive ops that touch them are
+  `/wipe` and `/rebuild`, both of which drop+recreate the reserved
+  scopes under the same all-shard write lock. Per settled #21 the
+  Subscribe state lives at Store level keyed by scope name, so the
+  subscription transparently re-attaches to the recreated buffer; the
+  channel never closes and the drainer never has to reconnect. Wipe-
+  detection is the drainer's job via cursor-rewind on the next Tail.
 
 - **Q18 — Lock order between `subsMu` and `b.mu`.** Subscribe pins a
-  channel into the per-scope subscriber list under `subsMu`. Writes
-  pin the buffer under `b.mu` and need to read the subscriber list
-  for fanout. Proposal: `b.mu` first, snapshot the event under it,
-  release `b.mu`, then `subsMu.RLock` for fanout. Verify no path
-  takes them in the opposite order.
+  channel into the Store-level `subscriber` slot under `subsMu`.
+  Writes pin the buffer under `b.mu` and need to read the subscriber
+  slot for fanout. Proposal: `b.mu` first, snapshot the event under
+  it, release `b.mu`, then `subsMu.RLock` for fanout. Verify no path
+  takes them in the opposite order. **Mostly mechanical at this
+  point**; one-decision-per-write-path so a `go vet` shadow-check is
+  enough to keep us honest.
 
 - **Q19 — Unsubscribe-during-fanout race.** Cache is in the
   `select { case ch <- evt: default: }` send when the subscriber's
@@ -384,10 +408,15 @@ Remaining for Subscribe + auto-populate (Q3 + Q16-Q19 outstanding):
 4. **Step 5e** — best-effort drop-on-overflow + `event_drops_total`
    atomic counter; surface on `/stats` (one-line addition to the
    /stats enrichment TODO). ~20 lines + tests.
-5. **Step 6** — `Subscribe` primitive in core (~120 lines):
-   `Store.Subscribe(scope) (<-chan struct{}, func())`, per-scope
-   subscriber list with `subsMu`, capture-under-lock + emit-outside-
-   lock fanout from each write path. Resolves Q16-Q19.
+5. **Step 6** — `Subscribe` primitive in core (~80 lines):
+   `Store.Subscribe(scope) (<-chan struct{}, func(), error)` —
+   restricted to reserved scopes, single subscriber per scope (settled
+   #2, #20), state at Store level keyed by name (settled #21).
+   `subsMu` + `subscribers map[string]*subscriber{ch chan struct{};
+   closed bool}`, capture-under-lock + emit-outside-lock notify hooks
+   in `Store.appendOne` and the buffer-write path that targets `_inbox`.
+   Q16/Q17 resolved by the restriction; Q18/Q19 are mechanical (lock-
+   order rule + closed-flag pattern).
 6. **Step 7** — `addons/drainer-*` reference implementations
    (~200 lines): drainer addon + integration tests demonstrating
    the JSONL / SQLite / webhook sinks.
