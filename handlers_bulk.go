@@ -36,6 +36,10 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": "+err.Error())
 			return
 		}
+		if isReservedScope(req.Items[i].Scope) {
+			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": scope '"+req.Items[i].Scope+"' is reserved and cannot be the target of /warm")
+			return
+		}
 	}
 
 	grouped := groupItemsByScope(req.Items)
@@ -84,6 +88,10 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	for i := range req.Items {
 		if err := validateWriteItem(req.Items[i], "/rebuild", api.store.maxItemBytes); err != nil {
 			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": "+err.Error())
+			return
+		}
+		if isReservedScope(req.Items[i].Scope) {
+			badRequest(w, started, "invalid item at index "+strconv.Itoa(i)+": scope '"+req.Items[i].Scope+"' is reserved and cannot appear in /rebuild input")
 			return
 		}
 	}

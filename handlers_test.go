@@ -1916,3 +1916,367 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 	// atomic counters.
 	assertStatsCountersInvariant(t, api.store, "after parallel race workload")
 }
+
+// --- Reserved-scope HTTP-level integration tests -----------------------------
+//
+// These exercise the reservation contract end-to-end via the HTTP handler
+// rather than via the validator or Store-method layer alone. They pin the
+// guarantees an operator actually relies on:
+//   - /append on _inbox round-trips the item, and the per-scope counters
+//     in /scopelist plus the store-wide counters in /stats reflect the
+//     append correctly.
+//   - The drainer pattern (append → tail → delete_up_to) actually frees
+//     items + bytes on a reserved scope.
+//   - The HTTP layer rejects every operation that the reservation contract
+//     forbids (/upsert, /update, /counter_add, /delete_scope, /warm,
+//     /rebuild) with status 400.
+//   - /wipe restores the reserved-scope baseline (scope_count=2, items=0,
+//     small but non-zero approx_store_mb) so subscribers attached to
+//     either reserved scope find their target still present.
+
+// TestReservedScopes_AppendInboxRoundTrip drives the happy path: append a
+// single item to _inbox and verify it shows up everywhere — /get, /tail,
+// /scopelist row, /stats counters, byte budget.
+//
+// The byte-counter assertions go through api.store.totalBytes directly
+// rather than via /stats's `approx_store_mb` because the MB serialiser
+// rounds to 4 decimals (~105-byte resolution); a small payload would
+// not produce a detectable delta. /stats is checked for shape + the
+// values it CAN render exactly (scope_count, total_items).
+func TestReservedScopes_AppendInboxRoundTrip(t *testing.T) {
+	h, api := newTestHandler(10)
+
+	// Snapshot the boot baseline via the store's exact atomic counters.
+	preBytes := api.store.totalBytes.Load()
+	preItems := api.store.totalItems.Load()
+	preScopes := api.store.scopeCount.Load()
+	if preScopes != int64(len(reservedScopeNames)) {
+		t.Fatalf("pre-append scopeCount=%d want %d (reserved baseline)", preScopes, len(reservedScopeNames))
+	}
+	if preItems != 0 {
+		t.Fatalf("pre-append totalItems=%d want 0", preItems)
+	}
+	if preBytes <= 0 {
+		t.Fatalf("pre-append totalBytes=%d want >0 (reserved-overhead baseline)", preBytes)
+	}
+
+	// Append one item to _inbox. Payload is sized to be unambiguous at
+	// MB-precision too (>105 bytes per item), but the exact byte check
+	// happens against totalBytes regardless.
+	body := `{"scope":"_inbox","id":"msg-1","payload":{"text":"this is a moderately sized inbox message used to ensure the byte delta is visible at MB precision"}}`
+	code, out, raw := doRequest(t, h, "POST", "/append", body)
+	if code != 200 {
+		t.Fatalf("/append _inbox: code=%d body=%s", code, raw)
+	}
+	if !mustBool(t, out, "ok") {
+		t.Errorf("/append: ok=false body=%s", raw)
+	}
+	item, _ := out["item"].(map[string]interface{})
+	seq := mustFloat(t, item, "seq")
+	if seq <= 0 {
+		t.Errorf("/append: seq=%v want >0", seq)
+	}
+
+	// Internal counters: scope_count unchanged (append to existing scope),
+	// totalItems +1, totalBytes strictly greater.
+	if got := api.store.scopeCount.Load(); got != preScopes {
+		t.Errorf("post-append scopeCount=%d want %d (no new scope created)", got, preScopes)
+	}
+	if got := api.store.totalItems.Load(); got != preItems+1 {
+		t.Errorf("post-append totalItems=%d want %d", got, preItems+1)
+	}
+	if got := api.store.totalBytes.Load(); got <= preBytes {
+		t.Errorf("post-append totalBytes=%d want >%d (item bytes added)", got, preBytes)
+	}
+
+	// /get must return the item bytes back.
+	_, out, _ = doRequest(t, h, "GET", "/get?scope=_inbox&id=msg-1", "")
+	if !mustBool(t, out, "hit") {
+		t.Errorf("/get _inbox: hit=false")
+	}
+	gotItem, _ := out["item"].(map[string]interface{})
+	if gotID, _ := gotItem["id"].(string); gotID != "msg-1" {
+		t.Errorf("/get _inbox: id=%v want msg-1", gotItem["id"])
+	}
+
+	// /tail must surface the item too.
+	_, out, _ = doRequest(t, h, "GET", "/tail?scope=_inbox&limit=10", "")
+	if !mustBool(t, out, "hit") {
+		t.Errorf("/tail _inbox: hit=false")
+	}
+	if mustFloat(t, out, "count") != 1 {
+		t.Errorf("/tail _inbox: count=%v want 1", out["count"])
+	}
+
+	// /stats reports the same counts.
+	_, stats, _ := doAdminRequest(t, h, "/stats", "")
+	if got := mustFloat(t, stats, "scope_count"); got != float64(len(reservedScopeNames)) {
+		t.Errorf("/stats scope_count=%v want %d", got, len(reservedScopeNames))
+	}
+	if got := mustFloat(t, stats, "total_items"); got != 1 {
+		t.Errorf("/stats total_items=%v want 1", got)
+	}
+
+	// /scopelist must include _inbox with the new item count.
+	_, out, _ = doRequest(t, h, "GET", "/scopelist", "")
+	rows := mustScopelistEntries(t, out)
+	var inboxRow map[string]interface{}
+	for _, r := range rows {
+		if name, _ := r["scope"].(string); name == InboxScopeName {
+			inboxRow = r
+			break
+		}
+	}
+	if inboxRow == nil {
+		t.Fatalf("/scopelist: _inbox row missing from %v", rows)
+	}
+	if got := mustFloat(t, inboxRow, "item_count"); got != 1 {
+		t.Errorf("/scopelist _inbox row: item_count=%v want 1", got)
+	}
+	if got := mustFloat(t, inboxRow, "last_seq"); got != seq {
+		t.Errorf("/scopelist _inbox row: last_seq=%v want %v", got, seq)
+	}
+
+	// Cross-check store internals match the per-scope row.
+	if buf, ok := api.store.getScope(InboxScopeName); ok {
+		buf.mu.RLock()
+		if len(buf.items) != 1 {
+			t.Errorf("buf.items=%d want 1", len(buf.items))
+		}
+		bufBytes := buf.bytes
+		buf.mu.RUnlock()
+		if bufBytes <= 0 {
+			t.Errorf("buf.bytes=%d want >0", bufBytes)
+		}
+	} else {
+		t.Errorf("api.store.getScope(_inbox) returned !ok")
+	}
+}
+
+// TestReservedScopes_DrainerPattern exercises the canonical drainer flow:
+// append-many → /tail → /delete_up_to → verify scope still exists with
+// item_count=0. This is the operational pattern the reservation is
+// designed to support.
+func TestReservedScopes_DrainerPattern(t *testing.T) {
+	h, _ := newTestHandler(100)
+
+	const N = 10
+	for i := 0; i < N; i++ {
+		body := fmt.Sprintf(`{"scope":"_inbox","id":"msg-%d","payload":{"i":%d}}`, i, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("/append iter %d: code=%d body=%s", i, code, raw)
+		}
+	}
+
+	// Drainer reads in bulk via /tail.
+	_, out, _ := doRequest(t, h, "GET", "/tail?scope=_inbox&limit=100", "")
+	if got := mustFloat(t, out, "count"); got != N {
+		t.Fatalf("/tail _inbox: count=%v want %d", got, N)
+	}
+	items, _ := out["items"].([]interface{})
+	last, _ := items[len(items)-1].(map[string]interface{})
+	lastSeq := mustFloat(t, last, "seq")
+
+	// Drainer cleanup via /delete_up_to.
+	body := fmt.Sprintf(`{"scope":"_inbox","max_seq":%d}`, int64(lastSeq))
+	code, out, raw := doRequest(t, h, "POST", "/delete_up_to", body)
+	if code != 200 {
+		t.Fatalf("/delete_up_to _inbox: code=%d body=%s", code, raw)
+	}
+	if got := mustFloat(t, out, "deleted_count"); got != N {
+		t.Errorf("/delete_up_to _inbox: deleted_count=%v want %d", got, N)
+	}
+
+	// Scope must still exist, but be empty.
+	_, out, _ = doRequest(t, h, "GET", "/scopelist?prefix=_inbox", "")
+	rows := mustScopelistEntries(t, out)
+	if len(rows) != 1 {
+		t.Fatalf("/scopelist after drain: got %d rows want 1", len(rows))
+	}
+	if got := mustFloat(t, rows[0], "item_count"); got != 0 {
+		t.Errorf("/scopelist _inbox after drain: item_count=%v want 0", got)
+	}
+
+	// Re-appending to the drained _inbox must still work — this is the
+	// whole point of "drain doesn't destroy the scope".
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"_inbox","id":"msg-after-drain","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append after drain: code=%d body=%s", code, raw)
+	}
+}
+
+// TestReservedScopes_HTTPRejections asserts every forbidden operation
+// returns 400 over the wire on _log and _inbox.
+func TestReservedScopes_HTTPRejections(t *testing.T) {
+	for _, scope := range reservedScopeNames {
+		scope := scope
+		t.Run("scope="+scope, func(t *testing.T) {
+			h, _ := newTestHandler(10)
+
+			// Pre-seed an item so /update has something to (notionally) target.
+			if code, _, _ := doRequest(t, h, "POST", "/append",
+				fmt.Sprintf(`{"scope":%q,"id":"x","payload":{"v":1}}`, scope)); code != 200 {
+				t.Fatalf("pre-seed append: code=%d", code)
+			}
+
+			cases := []struct {
+				name, method, path, body string
+			}{
+				{"upsert", "POST", "/upsert", fmt.Sprintf(`{"scope":%q,"id":"x","payload":{"v":2}}`, scope)},
+				{"update", "POST", "/update", fmt.Sprintf(`{"scope":%q,"id":"x","payload":{"v":3}}`, scope)},
+				{"counter_add", "POST", "/counter_add", fmt.Sprintf(`{"scope":%q,"id":"c","by":1}`, scope)},
+				{"delete_scope", "POST", "/delete_scope", fmt.Sprintf(`{"scope":%q}`, scope)},
+				{"warm", "POST", "/warm", fmt.Sprintf(`{"items":[{"scope":%q,"id":"x","payload":{"v":1}}]}`, scope)},
+				{"rebuild", "POST", "/rebuild", fmt.Sprintf(`{"items":[{"scope":%q,"id":"x","payload":{"v":1}}]}`, scope)},
+			}
+			for _, c := range cases {
+				code, out, raw := doRequest(t, h, c.method, c.path, c.body)
+				if code != 400 {
+					t.Errorf("%s on %q: code=%d want 400 body=%s", c.name, scope, code, raw)
+					continue
+				}
+				errStr, _ := out["error"].(string)
+				if !strings.Contains(errStr, "reserved") {
+					t.Errorf("%s on %q: error=%q does not mention 'reserved'", c.name, scope, errStr)
+				}
+			}
+
+			// Sanity: legitimate ops MUST still work after the rejections.
+			if code, _, raw := doRequest(t, h, "POST", "/append",
+				fmt.Sprintf(`{"scope":%q,"id":"y","payload":{"v":1}}`, scope)); code != 200 {
+				t.Errorf("/append after rejections: code=%d body=%s", code, raw)
+			}
+			if code, out, _ := doRequest(t, h, "GET",
+				fmt.Sprintf("/get?scope=%s&id=x", scope), ""); code != 200 || !mustBool(t, out, "hit") {
+				t.Errorf("/get after rejections: code=%d hit=%v", code, out["hit"])
+			}
+		})
+	}
+}
+
+// TestReservedScopes_WipeRestoresBaseline pins the lifecycle guarantee:
+// after /wipe, the reserved scopes are still present (re-created under the
+// same all-shard write lock) so subscribers attached to either reserved
+// scope find their target waiting for them. Pre-Subscribe this is verified
+// at the cache level only; once Subscribe ships the same property
+// guarantees subscribers don't see channel-close.
+func TestReservedScopes_WipeRestoresBaseline(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	// Add a user scope plus content in both reserved scopes.
+	if code, _, _ := doRequest(t, h, "POST", "/append",
+		`{"scope":"user-data","id":"u1","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append user-data: code=%d", code)
+	}
+	if code, _, _ := doRequest(t, h, "POST", "/append",
+		`{"scope":"_inbox","id":"i1","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _inbox: code=%d", code)
+	}
+	if code, _, _ := doRequest(t, h, "POST", "/append",
+		`{"scope":"_log","id":"l1","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _log: code=%d", code)
+	}
+
+	// Wipe everything.
+	if code, _, _ := doAdminRequest(t, h, "/wipe", ""); code != 200 {
+		t.Fatalf("/wipe: code=%d", code)
+	}
+
+	// /stats must show reserved baseline restored: 2 scopes, 0 items,
+	// approx_store_mb is the reserved-scope overhead (small but non-zero).
+	_, stats, _ := doAdminRequest(t, h, "/stats", "")
+	if got := mustFloat(t, stats, "scope_count"); got != float64(len(reservedScopeNames)) {
+		t.Errorf("post-wipe scope_count=%v want %d (reserved restored)", got, len(reservedScopeNames))
+	}
+	if got := mustFloat(t, stats, "total_items"); got != 0 {
+		t.Errorf("post-wipe total_items=%v want 0", got)
+	}
+	if got := mustFloat(t, stats, "approx_store_mb"); got <= 0 {
+		t.Errorf("post-wipe approx_store_mb=%v want >0 (reserved overhead)", got)
+	}
+
+	// /scopelist enumerates exactly the two reserved names.
+	_, out, _ := doRequest(t, h, "GET", "/scopelist", "")
+	rows := mustScopelistEntries(t, out)
+	if len(rows) != len(reservedScopeNames) {
+		t.Fatalf("post-wipe /scopelist: got %d rows want %d", len(rows), len(reservedScopeNames))
+	}
+	got := make(map[string]bool)
+	for _, r := range rows {
+		name, _ := r["scope"].(string)
+		got[name] = true
+		if c := mustFloat(t, r, "item_count"); c != 0 {
+			t.Errorf("post-wipe row %q: item_count=%v want 0", name, c)
+		}
+	}
+	for _, name := range reservedScopeNames {
+		if !got[name] {
+			t.Errorf("post-wipe: reserved scope %q missing from /scopelist", name)
+		}
+	}
+
+	// User scope is gone (wiped, not restored).
+	_, out, _ = doRequest(t, h, "GET", "/get?scope=user-data&id=u1", "")
+	if mustBool(t, out, "hit") {
+		t.Error("post-wipe: user-data/u1 still present (should be wiped)")
+	}
+
+	// Reserved scopes are usable again — the post-wipe baseline isn't a
+	// dead state, the cache is ready for new traffic immediately.
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"_inbox","id":"after-wipe","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _inbox after wipe: code=%d body=%s", code, raw)
+	}
+}
+
+// TestReservedScopes_RebuildRestoresBaseline mirrors WipeRestoresBaseline
+// but for /rebuild, which has the additional twist that input containing a
+// reserved scope must be rejected before any state mutation.
+func TestReservedScopes_RebuildRestoresBaseline(t *testing.T) {
+	h, _ := newTestHandler(10)
+
+	// Pre-seed both reserved and user content.
+	if code, _, _ := doRequest(t, h, "POST", "/append",
+		`{"scope":"_inbox","id":"i1","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _inbox: code=%d", code)
+	}
+	if code, _, _ := doRequest(t, h, "POST", "/append",
+		`{"scope":"original","id":"o1","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append original: code=%d", code)
+	}
+
+	// Rebuild with input that does NOT include reserved scopes.
+	rebuildBody := `{"items":[
+		{"scope":"new-a","id":"a1","payload":{"v":1}},
+		{"scope":"new-b","id":"b1","payload":{"v":1}}
+	]}`
+	if code, _, raw := doRequest(t, h, "POST", "/rebuild", rebuildBody); code != 200 {
+		t.Fatalf("/rebuild: code=%d body=%s", code, raw)
+	}
+
+	// Post-rebuild: 2 user scopes from input + 2 reserved scopes = 4.
+	_, stats, _ := doAdminRequest(t, h, "/stats", "")
+	if got := mustFloat(t, stats, "scope_count"); got != float64(2+len(reservedScopeNames)) {
+		t.Errorf("post-rebuild scope_count=%v want %d", got, 2+len(reservedScopeNames))
+	}
+	if got := mustFloat(t, stats, "total_items"); got != 2 {
+		t.Errorf("post-rebuild total_items=%v want 2 (only the 2 input items)", got)
+	}
+
+	// Original user scope is gone; reserved scope contents are also gone
+	// (rebuild dropped everything, then re-init created empty reserved).
+	_, out, _ := doRequest(t, h, "GET", "/get?scope=original&id=o1", "")
+	if mustBool(t, out, "hit") {
+		t.Error("post-rebuild: original/o1 still present")
+	}
+	_, out, _ = doRequest(t, h, "GET", "/get?scope=_inbox&id=i1", "")
+	if mustBool(t, out, "hit") {
+		t.Error("post-rebuild: _inbox/i1 still present (rebuild drops, init re-creates empty)")
+	}
+
+	// Reserved scopes accept new traffic immediately.
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"_log","id":"after-rebuild","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _log after rebuild: code=%d body=%s", code, raw)
+	}
+}
