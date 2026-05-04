@@ -44,7 +44,7 @@ type API struct {
 	// Derived from store.maxStoreBytes (not operator-configurable):
 	// any single scope is bounded by the store budget, so a response
 	// cap equal to the store cap guarantees every full-scope read
-	// fits in one response — including drainer reads of `_log` which
+	// fits in one response — including drainer reads of `_events` which
 	// must never be artificially capped (drainer lag → silent event
 	// drop is the failure mode, not a 507 on tail).
 	maxResponseBytes int64

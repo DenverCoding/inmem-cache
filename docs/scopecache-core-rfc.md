@@ -200,7 +200,7 @@ commodity hardware (`BenchmarkStore_GetByID` and
 payloads, ~57 MiB store).
 
 The core makes **two specific exceptions** to the "names are
-opaque, no special interpretation" rule: the scope names `_log`
+opaque, no special interpretation" rule: the scope names `_events`
 and `_inbox` are reserved infrastructure scopes that the cache
 pre-creates at boot and protects from scope-level destruction
 (see §2.6). Other underscore-prefixed names (`_tokens`,
@@ -287,7 +287,7 @@ clocks advance out of order across CPUs.
 
 ### 2.6 Reserved scopes and boot-time initialisation
 
-The cache reserves exactly two scope names: `_log` and `_inbox`.
+The cache reserves exactly two scope names: `_events` and `_inbox`.
 Both are pre-created at `NewStore` time so subscribers and apps
 can attach to a known-stable target without a "scope-doesn't-
 exist-yet" race, and both are re-created automatically after
@@ -296,16 +296,16 @@ post-event baseline.
 
 | Reserved scope | Role | Writer | Reader |
 |---|---|---|---|
-| `_log` | Cache-managed write-event log (Phase A "Subscribe + log-scope drain architecture") | The cache itself, on every successful mutation to any non-reserved scope | Drainer addons via `Subscribe` + `Tail` |
+| `_events` | Cache-managed write-event log (Phase A "Subscribe + events-scope drain architecture") | The cache itself, on every successful mutation to any non-reserved scope | Drainer addons via `Subscribe` + `Tail` |
 | `_inbox` | Application-side fan-in ingestion scope | External clients via `/append` | Drainer addons via `Subscribe` + `Tail` |
 
 **Operations on reserved scopes** follow the
 append-only-drain-stream pattern. The cache allows the operations
 that fit that pattern and rejects the operations that don't:
 
-| Operation | On `_log` / `_inbox` | Rationale |
+| Operation | On `_events` / `_inbox` | Rationale |
 |---|---|---|
-| `/append` | ✅ allowed | Apps write to `_inbox`; cache auto-populates `_log` |
+| `/append` | ✅ allowed | Apps write to `_inbox`; cache auto-populates `_events` |
 | `/delete`, `/delete_up_to` | ✅ allowed | Drainer cleanup — releasing items the consumer has handled |
 | `/get`, `/head`, `/tail`, `/render` | ✅ allowed | Drainers and observers must be able to read |
 | `/stats`, `/scopelist` | ✅ allowed | Operators must see infrastructure scopes for capacity planning |
@@ -321,7 +321,7 @@ because the drainer pattern fundamentally requires them.
 
 **Boot-time initialisation.** `NewStore` calls
 `s.initReservedScopes()` after the per-shard maps are allocated.
-This pre-creates `_log` and `_inbox` via `ensureScope`-equivalent
+This pre-creates `_events` and `_inbox` via `ensureScope`-equivalent
 logic, charges `len(reservedScopeNames) × scopeBufferOverhead`
 (2 × 1024 = 2048 bytes by default) against the store byte budget,
 and bumps `scope_count` by 2. Boot-time pre-creation does NOT bump
@@ -335,7 +335,7 @@ clients.
   under the same all-shard write lock, before releasing —
   re-creates the reserved scopes via `s.initReservedScopesLocked()`.
   The re-creation is atomic with the wipe: subscribers attached to
-  `_log` or `_inbox` never observe a moment where their scope
+  `_events` or `_inbox` never observe a moment where their scope
   doesn't exist. Post-wipe baseline is `scope_count = 2`,
   `total_items = 0`, `approx_store_mb = reservedScopesOverhead`.
 
@@ -365,7 +365,7 @@ only where decoupling buys something. The rest is derived.
 | Scope | Item count cap | Per-item byte cap | Configurable? |
 |---|---|---|---|
 | `_inbox` | `Inbox.MaxItems` (default = `ScopeMaxItems`) | `Inbox.MaxItemBytes` (default = 64 KiB) | Both knobs are operator-tunable |
-| `_log` | *(none — exempt from `ScopeMaxItems`)* | `MaxItemBytes + 1 KiB` (derived) | Neither is a knob |
+| `_events` | *(none — exempt from `ScopeMaxItems`)* | `MaxItemBytes + 1 KiB` (derived) | Neither is a knob |
 
 `_inbox` is **operator-tunable on both axes**. It carries app-
 written fan-in events that are typically much smaller than user
@@ -376,25 +376,25 @@ cap defaults to the global `ScopeMaxItems` but is also separately
 tunable so a high-throughput inbox can hold a different number of
 events than user scopes.
 
-`_log` is **fully derived**. Two reasons:
+`_events` is **fully derived**. Two reasons:
 
-1. *Per-item byte cap.* A `_log` entry wraps the user payload
+1. *Per-item byte cap.* A `_events` entry wraps the user payload
    produced by the write that triggered it (op-type, scope, seq,
    ts, payload). It must always be at least as wide as the
    user-write itself, plus a small envelope overhead. Setting it
    independently invites the misconfiguration "log smaller than
    user-item" → max-size user-writes silently drop their log
-   entry. The cache derives `_log`'s cap as
+   entry. The cache derives `_events`'s cap as
    `MaxItemBytes + 1 KiB` so operators only ever tune
-   `MaxItemBytes` and `_log` follows.
+   `MaxItemBytes` and `_events` follows.
 
-2. *Item-count cap.* `_log` is best-effort observability, not
+2. *Item-count cap.* `_events` is best-effort observability, not
    durable user data. The only meaningful begrenzer is the
-   global byte budget (`MaxStoreBytes`), which `_log` shares
-   with every other scope. A separate item-count cap on `_log`
+   global byte budget (`MaxStoreBytes`), which `_events` shares
+   with every other scope. A separate item-count cap on `_events`
    would be arbitrary; `ScopeMaxItems = 100,000` is no more
-   right for `_log` than `1,000,000` would be. The cache
-   exempts `_log` from `ScopeMaxItems` entirely; bytes-pressure
+   right for `_events` than `1,000,000` would be. The cache
+   exempts `_events` from `ScopeMaxItems` entirely; bytes-pressure
    alone gates writes there.
 
 **HTTP response cap.** The per-response byte cap on `/head`,
@@ -403,19 +403,38 @@ configured separately. By construction no scope can exceed the
 store budget, so any single-scope read is bounded by the store
 cap; making the response cap equal to the store cap guarantees
 every full-scope read fits in one response. This matters most
-for drainers that need to slurp `_log` or `_inbox` in large
+for drainers that need to slurp `_events` or `_inbox` in large
 batches without artificial response-size 507s.
 
-**Implementation locus.** Constants `LogScopeName` and
+**`_events` auto-populate mode (`Events.Mode`).** Controls whether
+the cache writes a write-event entry to `_events` on every
+successful mutation, and how much each entry contains:
+
+| Mode | Semantics |
+|---|---|
+| `off` *(default)* | Auto-populate disabled; zero overhead on the write path. Operators opt in when a drainer is ready to consume. |
+| `notify` | Each committed mutation produces an event with addressing only — `{op, scope, id?, seq, ts}`. Sufficient for drainers that re-fetch from cache state on wake-up. |
+| `full` | Each committed mutation produces an event with the action-payload included. Sufficient for drainers replicating state without re-querying. |
+
+Action-payload here means the inputs the caller sent, not the
+result the cache computed. `/counter_add` events carry `by` (the
+increment), not the new value; `/delete_up_to` events carry
+`max_seq`, not the deleted-count. This makes the event stream
+replay-able and matches the WAL discipline downstream sinks
+expect. The auto-populate behaviour itself is wired in steps
+5b-5e of the Phase A roadmap; until those land, `Events.Mode` is
+accepted by config but consulted by no write path.
+
+**Implementation locus.** Constants `EventsScopeName` and
 `InboxScopeName` live in `types.go`, alongside `InboxMaxItemBytes`
-(default 64 KiB) and `LogItemEnvelopeOverhead` (1 KiB derivation
+(default 64 KiB) and `EventsItemEnvelopeOverhead` (1 KiB derivation
 slack). The `reservedScopeNames` array, the
 `reservedScopesOverhead` constant, the `isReservedScope(scope)`
 helper, and the `initReservedScopes` / `initReservedScopesLocked`
 methods all live in `store.go`, together with the per-scope cap
 dispatchers `maxItemBytesFor(scope)` and `maxItemsFor(scope)` that
 single-source the "which cap applies here?" decision. The
-`_log` exemption from the item-count cap is implemented as the
+`_events` exemption from the item-count cap is implemented as the
 `unboundedScopeMaxItems` (= 0) sentinel installed on the buffer
 at create time; `appendItem` in `buffer_write.go` skips the count
 check when the sentinel is present. The validators in
@@ -767,7 +786,7 @@ keeps its original value; on create, `seq` is freshly assigned.
 
 | status | error                                  | when                          |
 |--------|----------------------------------------|-------------------------------|
-| 400    | `scope '<name>' is reserved …`         | `scope` is `_log` or `_inbox` (§2.6) |
+| 400    | `scope '<name>' is reserved …`         | `scope` is `_events` or `_inbox` (§2.6) |
 
 **Example**
 
@@ -816,7 +835,7 @@ applied.
 
 | status | error                                  | when                          |
 |--------|----------------------------------------|-------------------------------|
-| 400    | `scope '<name>' is reserved …`         | `scope` is `_log` or `_inbox` (§2.6) |
+| 400    | `scope '<name>' is reserved …`         | `scope` is `_events` or `_inbox` (§2.6) |
 
 **Example**
 
@@ -860,7 +879,7 @@ bytes.
 | status | error                                                      | when                                              |
 |--------|------------------------------------------------------------|---------------------------------------------------|
 | 400    | `the counter operation would exceed the allowed range of ±(2^53-1)` | result would overflow the JS-safe integer range |
-| 400    | `scope '<name>' is reserved …`                             | `scope` is `_log` or `_inbox` (§2.6)              |
+| 400    | `scope '<name>' is reserved …`                             | `scope` is `_events` or `_inbox` (§2.6)              |
 | 409    | `payload is not a JSON integer` (or similar)               | existing item's payload is not a valid integer    |
 
 **Side effects**
@@ -987,7 +1006,7 @@ budget.
 
 | status | error                                  | when                          |
 |--------|----------------------------------------|-------------------------------|
-| 400    | `scope '<name>' is reserved …`         | `scope` is `_log` or `_inbox` (§2.6); use `/delete_up_to` to release items without removing the scope |
+| 400    | `scope '<name>' is reserved …`         | `scope` is `_events` or `_inbox` (§2.6); use `/delete_up_to` to release items without removing the scope |
 
 **Example**
 
@@ -1020,7 +1039,7 @@ at 1 KiB to prevent memory abuse.
 **Side effects**
 
 In-flight writes against any scope detach (409). The reserved
-scopes `_log` and `_inbox` (§2.6) are dropped along with everything
+scopes `_events` and `_inbox` (§2.6) are dropped along with everything
 else, then immediately re-created under the same all-shard write
 lock — subscribers attached to either reserved scope do not observe
 a gap. Post-call baseline is `scope_count = 2`,
@@ -1079,7 +1098,7 @@ replaced scope detach (409).
 
 | status | error                                  | when                          |
 |--------|----------------------------------------|-------------------------------|
-| 400    | `scope '<name>' is reserved …`         | any item's `scope` is `_log` or `_inbox` (§2.6) |
+| 400    | `scope '<name>' is reserved …`         | any item's `scope` is `_events` or `_inbox` (§2.6) |
 
 **Example**
 
@@ -1110,7 +1129,7 @@ single atomic operation.
 | status | error                                              | when                  |
 |--------|----------------------------------------------------|-----------------------|
 | 400    | `the 'items' array must not be empty for the '/rebuild' endpoint` | empty `items[]`       |
-| 400    | `scope '<name>' is reserved …`                     | any item's `scope` is `_log` or `_inbox` (§2.6) |
+| 400    | `scope '<name>' is reserved …`                     | any item's `scope` is `_events` or `_inbox` (§2.6) |
 
 An empty `items[]` is rejected explicitly because it would silently
 wipe the store — almost always a client bug. Operators that really
@@ -1124,7 +1143,7 @@ want to clear the store should call `/wipe`.
 
 **Side effects**
 
-After the swap, the cache re-creates the reserved scopes (`_log`,
+After the swap, the cache re-creates the reserved scopes (`_events`,
 `_inbox`) under the same all-shard write lock so subscribers don't
 observe a gap (§2.6). The post-rebuild byte total is `Σ items +
 Σ scopeBufferOverhead + reservedScopesOverhead`; the cap check

@@ -23,32 +23,35 @@ const (
 	// SCOPECACHE_INBOX_MAX_ITEM_KB (integer KiB).
 	InboxMaxItemBytes = 64 << 10
 
-	// LogItemEnvelopeOverhead is the slack added to the user-facing
-	// MaxItemBytes to derive the `_log` scope's per-item cap. A log
-	// entry wraps the user payload in a JSON envelope (op, scope, seq,
-	// ts, plus framing); 1 KiB is generous over the actual ~150 B of
-	// envelope so future field additions don't force a knob bump.
+	// EventsItemEnvelopeOverhead is the slack added to the user-facing
+	// MaxItemBytes to derive the `_events` scope's per-item cap. An
+	// event entry wraps the user payload in a JSON envelope (op,
+	// scope, id?, seq, ts, plus framing); 1 KiB is generous over the
+	// actual ~150 B of envelope so future field additions don't force
+	// a knob bump.
 	//
-	// `_log`'s per-item cap is derived (`MaxItemBytes +
-	// LogItemEnvelopeOverhead`), not exposed as a knob: a log entry
-	// must always be at least as wide as the user-write that produced
-	// it, otherwise large user-writes would 507 on the auto-populate
-	// path. Operators tune `MaxItemBytes`; `_log` follows.
-	LogItemEnvelopeOverhead = 1024
+	// `_events`'s per-item cap is derived (`MaxItemBytes +
+	// EventsItemEnvelopeOverhead`), not exposed as a knob: an event
+	// entry must always be at least as wide as the user-write that
+	// produced it, otherwise large user-writes would 507 on the
+	// auto-populate path. Operators tune `MaxItemBytes`; `_events`
+	// follows.
+	EventsItemEnvelopeOverhead = 1024
 
-	// LogScopeName is the well-known scope name for the auto-populated
-	// write-event log (Phase A "Subscribe + log-scope drain
-	// architecture"). Pre-created at NewStore time and re-created at
-	// /wipe / /rebuild time. Scope-level destructive operations
-	// (/delete_scope, /warm-target, /rebuild-input) reject this name;
-	// item-level operations (/append, /delete, /delete_up_to, /get,
-	// /head, /tail, /render) work normally so the drainer pattern
-	// (subscribe → tail → process → delete_up_to) functions.
-	LogScopeName = "_log"
+	// EventsScopeName is the well-known scope name for the
+	// auto-populated write-event stream (Phase A "Subscribe + event
+	// drain architecture"). Pre-created at NewStore time and
+	// re-created at /wipe / /rebuild time. Scope-level destructive
+	// operations (/delete_scope, /warm-target, /rebuild-input) reject
+	// this name; item-level operations (/append, /delete,
+	// /delete_up_to, /get, /head, /tail, /render) work normally so
+	// the drainer pattern (subscribe → tail → process →
+	// delete_up_to) functions.
+	EventsScopeName = "_events"
 
 	// InboxScopeName is the well-known scope name for application-side
 	// fan-in ingestion. Pre-created and re-created the same way as
-	// LogScopeName, with the same scope-level reservation. Apps may
+	// EventsScopeName, with the same scope-level reservation. Apps may
 	// freely /append into _inbox; the cache itself never auto-writes
 	// to it.
 	InboxScopeName = "_inbox"
@@ -89,14 +92,14 @@ const (
 //
 // Fields:
 //   - ScopeMaxItems: per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
-//     Does NOT apply to the reserved `_log` scope (best-effort observability;
+//     Does NOT apply to the reserved `_events` scope (best-effort observability;
 //     bytes-cap on MaxStoreBytes is the only real begrenzer there).
 //   - MaxStoreBytes: aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
 //   - MaxItemBytes:  per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
-//     Applies to user-scopes; `_log` derives `MaxItemBytes + LogItemEnvelopeOverhead`,
+//     Applies to user-scopes; `_events` derives `MaxItemBytes + EventsItemEnvelopeOverhead`,
 //     `_inbox` uses the operator-tunable Inbox.MaxItemBytes instead.
-//   - Log:           reserved-scope settings for `_log` (currently empty —
-//     forward-compat for any future log-specific knob).
+//   - Events:        reserved-scope settings for `_events` (write-event
+//     auto-populate mode; cap is derived, not configurable).
 //   - Inbox:         reserved-scope settings for `_inbox` (per-item cap +
 //     item-count cap; both operator-tunable).
 //
@@ -108,17 +111,87 @@ type Config struct {
 	MaxStoreBytes int64
 	MaxItemBytes  int64
 
-	Log   LogConfig
-	Inbox InboxConfig
+	Events EventsConfig
+	Inbox  InboxConfig
 }
 
-// LogConfig holds reserved-scope settings for `_log`. Intentionally
-// empty: every plausible knob (per-item cap, item-count cap) is either
-// derived from the global Config or deliberately unbounded for
-// best-effort observability semantics. Kept as a struct (rather than
-// dropped) so a future log-specific knob lands without a breaking
-// change to Config's shape.
-type LogConfig struct{}
+// EventMode controls whether the cache auto-populates the reserved
+// `_events` scope on every successful mutation, and how much each
+// event entry contains.
+//
+//   - EventModeOff      — auto-populate disabled. Zero overhead on
+//     the write path; default. Operators opt in
+//     when they have a drainer ready.
+//   - EventModeNotify   — every committed mutation produces a metadata
+//     event (op, scope, id?, seq, ts) with NO
+//     payload. Smallest log entries; sufficient
+//     for drainers that re-fetch from cache state
+//     on wake-up.
+//   - EventModeFull     — every committed mutation produces a full
+//     event including the action-payload. Largest
+//     log entries; sufficient for drainers that
+//     replicate state without re-querying.
+//
+// "Action-payload" here means the inputs the caller sent — for
+// /counter_add it's `by` (the increment), not the new value. The
+// cache logs what was REQUESTED, not what was COMPUTED. This makes
+// the event stream replay-able and matches the WAL discipline most
+// downstream sinks expect.
+type EventMode int
+
+const (
+	EventModeOff    EventMode = iota // 0 — default; no auto-populate
+	EventModeNotify                  // 1 — events without payload
+	EventModeFull                    // 2 — events with payload
+)
+
+// String returns the canonical lowercase string form of m, matching
+// the values accepted by SCOPECACHE_EVENT_MODE / Caddyfile event_mode.
+// Unknown values render as "unknown(N)" so a forgotten new mode is
+// visible in /help and stats output rather than silently rendering
+// as "off".
+func (m EventMode) String() string {
+	switch m {
+	case EventModeOff:
+		return "off"
+	case EventModeNotify:
+		return "notify"
+	case EventModeFull:
+		return "full"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseEventMode parses the string form (off / notify / full) into
+// the typed enum. The empty string maps to EventModeOff so adapter
+// code can pass through "unset" without special-casing. Used by
+// SCOPECACHE_EVENT_MODE parsing in cmd/scopecache and by the Caddy
+// module's event_mode directive.
+func ParseEventMode(s string) (EventMode, error) {
+	switch s {
+	case "", "off":
+		return EventModeOff, nil
+	case "notify":
+		return EventModeNotify, nil
+	case "full":
+		return EventModeFull, nil
+	default:
+		return EventModeOff, fmt.Errorf("invalid event_mode %q (expected: off | notify | full)", s)
+	}
+}
+
+// EventsConfig holds reserved-scope settings for `_events`.
+//
+// Mode controls auto-populate (off / notify / full); see EventMode.
+// Per-item byte cap and item-count cap are NOT configurable here —
+// they're derived from `Config.MaxItemBytes` (+ envelope slack) and
+// fully exempt respectively, because per-event cap arithmetic must
+// stay coupled to the user-write that produced the event. See
+// EventsItemEnvelopeOverhead for the rationale.
+type EventsConfig struct {
+	Mode EventMode
+}
 
 // InboxConfig holds operator-tunable settings for the reserved `_inbox`
 // scope. `_inbox` is app-populated fan-in storage; its per-item cap is

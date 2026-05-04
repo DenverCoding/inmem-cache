@@ -764,7 +764,7 @@ func TestWipe_EmptyStore(t *testing.T) {
 	if !mustBool(t, out, "ok") {
 		t.Error("ok=false")
 	}
-	// "Empty" still has the two reserved scopes (_log, _inbox) pre-created
+	// "Empty" still has the two reserved scopes (_events, _inbox) pre-created
 	// at boot. /wipe drops them (counted in deleted_scopes) then immediately
 	// re-creates them, so the cache lands back at its boot baseline.
 	if mustFloat(t, out, "deleted_scopes") != float64(len(reservedScopeNames)) {
@@ -785,7 +785,7 @@ func TestWipe_ClearsEveryScope(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code=%d want 200", code)
 	}
-	// 2 user scopes + 2 reserved scopes (_log, _inbox) all dropped by /wipe.
+	// 2 user scopes + 2 reserved scopes (_events, _inbox) all dropped by /wipe.
 	wantDeleted := float64(2 + len(reservedScopeNames))
 	if mustFloat(t, out, "deleted_scopes") != wantDeleted {
 		t.Errorf("deleted_scopes=%v want %v", out["deleted_scopes"], wantDeleted)
@@ -1184,7 +1184,7 @@ func TestStats_Structure(t *testing.T) {
 	_, _, _ = doRequest(t, h, "POST", "/append", `{"scope":"s","payload":{"v":1}}`)
 
 	_, out, _ := doAdminRequest(t, h, "/stats", "")
-	// 1 user scope ("s") + reserved scopes (_log, _inbox).
+	// 1 user scope ("s") + reserved scopes (_events, _inbox).
 	if got := mustFloat(t, out, "scope_count"); got != float64(1+len(reservedScopeNames)) {
 		t.Errorf("scope_count=%v want %d (user + reserved)", got, 1+len(reservedScopeNames))
 	}
@@ -1252,7 +1252,7 @@ func mustScopeNames(t *testing.T, out map[string]interface{}) []string {
 // each row carrying the seven §2.4 primitives + scope name.
 func TestScopelist_AlphaSortAndShape(t *testing.T) {
 	h, _ := newTestHandler(10)
-	for _, s := range []string{"thread:42", "alpha", "events", "thread:1"} {
+	for _, s := range []string{"thread:42", "alpha", "echo", "thread:1"} {
 		body := fmt.Sprintf(`{"scope":%q,"payload":{"v":1}}`, s)
 		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
 			t.Fatalf("seed %q: code=%d body=%s", s, code, raw)
@@ -1269,7 +1269,7 @@ func TestScopelist_AlphaSortAndShape(t *testing.T) {
 	if !mustBool(t, out, "hit") {
 		t.Error("hit=false with non-empty scopes (must be count>0)")
 	}
-	// 4 user scopes + 2 reserved scopes (_log, _inbox) = 6 total.
+	// 4 user scopes + 2 reserved scopes (_events, _inbox) = 6 total.
 	// Reserved scopes sort before user scopes because '_' (0x5F) < 'a' (0x61).
 	if mustFloat(t, out, "count") != float64(4+len(reservedScopeNames)) {
 		t.Errorf("count=%v want %d (4 user + %d reserved)", out["count"], 4+len(reservedScopeNames), len(reservedScopeNames))
@@ -1279,7 +1279,7 @@ func TestScopelist_AlphaSortAndShape(t *testing.T) {
 	}
 
 	got := mustScopeNames(t, out)
-	want := []string{"_inbox", "_log", "alpha", "events", "thread:1", "thread:42"}
+	want := []string{"_events", "_inbox", "alpha", "echo", "thread:1", "thread:42"}
 	if len(got) != len(want) {
 		t.Fatalf("scopes=%v want %v", got, want)
 	}
@@ -1305,7 +1305,7 @@ func TestScopelist_AlphaSortAndShape(t *testing.T) {
 // Empty prefix is the no-filter case, equivalent to omitting the param.
 func TestScopelist_PrefixFilter(t *testing.T) {
 	h, _ := newTestHandler(10)
-	for _, s := range []string{"thread:42", "alpha", "events", "thread:1"} {
+	for _, s := range []string{"thread:42", "alpha", "echo", "thread:1"} {
 		body := fmt.Sprintf(`{"scope":%q,"payload":{"v":1}}`, s)
 		_, _, _ = doRequest(t, h, "POST", "/append", body)
 	}
@@ -1341,7 +1341,7 @@ func TestScopelist_PrefixFilter(t *testing.T) {
 // `truncated` flips when more matching scopes exist past the page,
 // and resuming with after=<last scope> walks the next page.
 //
-// Reserved scopes (_log, _inbox) sort before every user scope because
+// Reserved scopes (_events, _inbox) sort before every user scope because
 // '_' (0x5F) < 'a' (0x61). This test uses after=_zzz as the initial
 // cursor to skip past reserved scopes and exercise pagination on the
 // user-managed scopes alone.
@@ -1446,7 +1446,7 @@ func TestScopelist_MethodNotAllowed(t *testing.T) {
 
 // Empty store → empty array, count=0, truncated=false. Wire-format check
 // that no client sees null instead of []. Uses after=_zzz to skip past
-// the reserved scopes (_log, _inbox) that NewStore pre-creates so the
+// the reserved scopes (_events, _inbox) that NewStore pre-creates so the
 // "empty" assertion exercises the empty-result code path.
 func TestScopelist_EmptyStore(t *testing.T) {
 	h, _ := newTestHandler(10)
@@ -1612,7 +1612,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 	// --- Assertions on /stats ---
 	_, stats, _ := doAdminRequest(t, h, "/stats", "")
 
-	// 2 user scopes (x, y) + reserved scopes (_log, _inbox).
+	// 2 user scopes (x, y) + reserved scopes (_events, _inbox).
 	wantScopeCount := float64(2 + len(reservedScopeNames))
 	if got := mustFloat(t, stats, "scope_count"); got != wantScopeCount {
 		t.Errorf("scope_count=%v want %v (rejected too-long-scope must not register; reserved baseline)", got, wantScopeCount)
@@ -2106,7 +2106,7 @@ func TestReservedScopes_DrainerPattern(t *testing.T) {
 }
 
 // TestReservedScopes_HTTPRejections asserts every forbidden operation
-// returns 400 over the wire on _log and _inbox.
+// returns 400 over the wire on _events and _inbox.
 func TestReservedScopes_HTTPRejections(t *testing.T) {
 	for _, scope := range reservedScopeNames {
 		scope := scope
@@ -2173,8 +2173,8 @@ func TestReservedScopes_WipeRestoresBaseline(t *testing.T) {
 		t.Fatalf("/append _inbox: code=%d", code)
 	}
 	if code, _, _ := doRequest(t, h, "POST", "/append",
-		`{"scope":"_log","id":"l1","payload":{"v":1}}`); code != 200 {
-		t.Fatalf("/append _log: code=%d", code)
+		`{"scope":"_events","id":"l1","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _events: code=%d", code)
 	}
 
 	// Wipe everything.
@@ -2276,8 +2276,8 @@ func TestReservedScopes_RebuildRestoresBaseline(t *testing.T) {
 
 	// Reserved scopes accept new traffic immediately.
 	if code, _, raw := doRequest(t, h, "POST", "/append",
-		`{"scope":"_log","id":"after-rebuild","payload":{"v":1}}`); code != 200 {
-		t.Fatalf("/append _log after rebuild: code=%d body=%s", code, raw)
+		`{"scope":"_events","id":"after-rebuild","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("/append _events after rebuild: code=%d body=%s", code, raw)
 	}
 }
 
@@ -2293,13 +2293,13 @@ func newReservedScopesTestHandler(t *testing.T, cfg Config) (http.Handler, *API)
 	return mux, api
 }
 
-// _log is exempt from ScopeMaxItems: best-effort observability gated
+// _events is exempt from ScopeMaxItems: best-effort observability gated
 // only by the global byte budget, never by an arbitrary item-count.
 // Cross-checks that the same store still enforces ScopeMaxItems on
-// user-scopes — the exemption must be scoped to `_log` alone, not
+// user-scopes — the exemption must be scoped to `_events` alone, not
 // leaked store-wide.
-func TestReservedScopes_LogExemptFromScopeMaxItems(t *testing.T) {
-	// Tiny ScopeMaxItems = 3. _log should accept far more than that;
+func TestReservedScopes_EventsExemptFromScopeMaxItems(t *testing.T) {
+	// Tiny ScopeMaxItems = 3. _events should accept far more than that;
 	// a regular scope should 507 on the 4th item.
 	h, _ := newReservedScopesTestHandler(t, Config{
 		ScopeMaxItems: 3,
@@ -2307,18 +2307,18 @@ func TestReservedScopes_LogExemptFromScopeMaxItems(t *testing.T) {
 		MaxItemBytes:  1 << 20,
 	})
 
-	// Append 10 items to _log — all must succeed even though
+	// Append 10 items to _events — all must succeed even though
 	// ScopeMaxItems = 3 globally.
 	for i := 0; i < 10; i++ {
-		body := fmt.Sprintf(`{"scope":"_log","id":"e-%d","payload":{"i":%d}}`, i, i)
+		body := fmt.Sprintf(`{"scope":"_events","id":"e-%d","payload":{"i":%d}}`, i, i)
 		code, _, raw := doRequest(t, h, "POST", "/append", body)
 		if code != 200 {
-			t.Fatalf("append #%d to _log: code=%d body=%s (cap exemption broken)", i, code, raw)
+			t.Fatalf("append #%d to _events: code=%d body=%s (cap exemption broken)", i, code, raw)
 		}
 	}
 
 	// Cross-check: the same store still 507s a user-scope at the 4th
-	// item, proving the exemption is scoped to _log only.
+	// item, proving the exemption is scoped to _events only.
 	for i := 0; i < 3; i++ {
 		body := fmt.Sprintf(`{"scope":"user","id":"u-%d","payload":{"i":%d}}`, i, i)
 		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
@@ -2410,11 +2410,11 @@ func TestReservedScopes_InboxRespectsCustomItemCount(t *testing.T) {
 	}
 }
 
-// _log's per-item byte cap is derived (MaxItemBytes + 1 KiB envelope
+// _events's per-item byte cap is derived (MaxItemBytes + 1 KiB envelope
 // slack) so the cap is always at least as wide as any user-write. A
-// payload that's accepted by _log but rejected by user-scope proves
-// _log's cap really is the global cap plus the slack — and a payload
-// past the derived cap is still rejected on _log itself.
+// payload that's accepted by _events but rejected by user-scope proves
+// _events's cap really is the global cap plus the slack — and a payload
+// past the derived cap is still rejected on _events itself.
 //
 // The test uses a JSON-object payload (not a top-level string)
 // deliberately: top-level JSON-string payloads pre-render at write
@@ -2422,8 +2422,8 @@ func TestReservedScopes_InboxRespectsCustomItemCount(t *testing.T) {
 // in approxItemSize, so payload-byte arithmetic doubles. Objects
 // skip renderBytes; len(Payload) is the only payload cost the cap
 // sees.
-func TestReservedScopes_LogDerivedItemBytesCap(t *testing.T) {
-	const globalCap = 8 << 10 // 8 KiB; _log derives globalCap + 1 KiB.
+func TestReservedScopes_EventsDerivedItemBytesCap(t *testing.T) {
+	const globalCap = 8 << 10 // 8 KiB; _events derives globalCap + 1 KiB.
 	h, _ := newReservedScopesTestHandler(t, Config{
 		ScopeMaxItems: 1000,
 		MaxStoreBytes: 100 << 20,
@@ -2439,7 +2439,7 @@ func TestReservedScopes_LogDerivedItemBytesCap(t *testing.T) {
 		return fmt.Sprintf(`{"d":"%s"}`, filler)
 	}
 
-	// Fits _log's derived 9 KiB cap (with envelope ≈ 8556 B), past
+	// Fits _events's derived 9 KiB cap (with envelope ≈ 8556 B), past
 	// the user's 8 KiB cap.
 	logOnly := mkPayload(globalCap + 256)
 
@@ -2447,15 +2447,15 @@ func TestReservedScopes_LogDerivedItemBytesCap(t *testing.T) {
 	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 400 {
 		t.Errorf("/append user with payload > global cap: code=%d body=%s want 400", code, raw)
 	}
-	body = fmt.Sprintf(`{"scope":"_log","id":"big","payload":%s}`, logOnly)
+	body = fmt.Sprintf(`{"scope":"_events","id":"big","payload":%s}`, logOnly)
 	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
-		t.Errorf("/append _log with same payload: code=%d body=%s want 200 (within derived cap)", code, raw)
+		t.Errorf("/append _events with same payload: code=%d body=%s want 200 (within derived cap)", code, raw)
 	}
 
-	// Past _log's derived cap (global + 1 KiB) — even _log says no.
-	overLogCap := mkPayload(globalCap + (1 << 10) + 256)
-	body = fmt.Sprintf(`{"scope":"_log","id":"too-big","payload":%s}`, overLogCap)
+	// Past _events's derived cap (global + 1 KiB) — even _events says no.
+	overEventsCap := mkPayload(globalCap + (1 << 10) + 256)
+	body = fmt.Sprintf(`{"scope":"_events","id":"too-big","payload":%s}`, overEventsCap)
 	if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 400 {
-		t.Errorf("/append _log with payload past derived cap: code=%d body=%s want 400", code, raw)
+		t.Errorf("/append _events with payload past derived cap: code=%d body=%s want 400", code, raw)
 	}
 }

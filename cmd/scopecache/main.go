@@ -127,6 +127,21 @@ func inboxMaxItemBytesFromEnv() int64 {
 	return int64(n) << 10
 }
 
+// eventModeFromEnv returns the SCOPECACHE_EVENT_MODE setting parsed
+// into the typed scopecache.EventMode. Empty string maps to
+// EventModeOff (the default — auto-populate disabled). Any other
+// invalid value logs a warning and falls back to EventModeOff so a
+// fat-fingered env var doesn't prevent the server from starting.
+func eventModeFromEnv() scopecache.EventMode {
+	raw := os.Getenv("SCOPECACHE_EVENT_MODE")
+	mode, err := scopecache.ParseEventMode(raw)
+	if err != nil {
+		log.Printf("SCOPECACHE_EVENT_MODE=%q is invalid; falling back to off (valid: off | notify | full)", raw)
+		return scopecache.EventModeOff
+	}
+	return mode
+}
+
 const shutdownGracePeriod = 5 * time.Second
 
 func listenUnixSocket(path string) (net.Listener, error) {
@@ -178,6 +193,9 @@ func main() {
 		ScopeMaxItems: scopeMaxItemsFromEnv(),
 		MaxStoreBytes: maxStoreBytesFromEnv(),
 		MaxItemBytes:  maxItemBytesFromEnv(),
+		Events: scopecache.EventsConfig{
+			Mode: eventModeFromEnv(),
+		},
 		Inbox: scopecache.InboxConfig{
 			MaxItems:     inboxMaxItemsFromEnv(),
 			MaxItemBytes: inboxMaxItemBytesFromEnv(),
@@ -187,9 +205,10 @@ func main() {
 	store := scopecache.NewStore(cfg)
 	api := scopecache.NewAPI(store, scopecache.APIConfig{})
 
-	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item",
+	log.Printf("scopecache capacity: %d items per scope, %d MiB store-wide, %d MiB per item; inbox %d items, %d KiB per item; event_mode=%s",
 		cfg.ScopeMaxItems, cfg.MaxStoreBytes>>20, cfg.MaxItemBytes>>20,
-		cfg.Inbox.MaxItems, cfg.Inbox.MaxItemBytes>>10)
+		cfg.Inbox.MaxItems, cfg.Inbox.MaxItemBytes>>10,
+		cfg.Events.Mode)
 
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)

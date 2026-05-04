@@ -43,12 +43,12 @@ type Store struct {
 
 	// Reserved-scope derived caps. Computed once at NewStore time from
 	// Config so write-path checks can read these directly without
-	// re-deriving on every call. See types.go LogConfig / InboxConfig
-	// for the shape rationale (why `_log` has no item-count knob and
-	// `_inbox` has both item-count and item-byte knobs).
+	// re-deriving on every call. See types.go EventsConfig / InboxConfig
+	// for the shape rationale (why `_events` has no item-count knob
+	// and `_inbox` has both item-count and item-byte knobs).
 	//
-	//   - logMaxItemBytes:    MaxItemBytes + LogItemEnvelopeOverhead.
-	//                         Derived, not a knob — a log entry must
+	//   - eventsMaxItemBytes: MaxItemBytes + EventsItemEnvelopeOverhead.
+	//                         Derived, not a knob — an event entry must
 	//                         always fit the user-write that produced it.
 	//   - inboxMaxItems:      Inbox.MaxItems (default = ScopeMaxItems).
 	//                         Operator-tunable independently of the global.
@@ -58,12 +58,21 @@ type Store struct {
 	//                         `_inbox` is for small fan-in events, not
 	//                         arbitrary user payloads.
 	//
-	// `_log` does NOT have an item-count cap: ScopeMaxItems is bypassed
-	// for that scope (best-effort observability — the only real
-	// begrenzer is the global byte budget on MaxStoreBytes).
-	logMaxItemBytes   int64
-	inboxMaxItems     int
-	inboxMaxItemBytes int64
+	// `_events` does NOT have an item-count cap: ScopeMaxItems is
+	// bypassed for that scope (best-effort observability — the only
+	// real begrenzer is the global byte budget on MaxStoreBytes).
+	eventsMaxItemBytes int64
+	inboxMaxItems      int
+	inboxMaxItemBytes  int64
+
+	// eventMode controls auto-populate of the reserved `_events` scope.
+	// See types.go EventMode for the three states. Resolved from
+	// Config.Events.Mode at NewStore time. The auto-populate paths
+	// (Phase A "Subscribe + event drain architecture", landing in
+	// follow-up steps) consult this field; with eventMode ==
+	// EventModeOff (the default) those paths are no-ops and the cache
+	// behaves identically to a pre-Phase-A build.
+	eventMode EventMode
 
 	// totalBytes tracks the running sum of every store-byte reservation:
 	// approxItemSize per item plus scopeBufferOverhead per allocated
@@ -177,10 +186,10 @@ func (s *Store) bumpLastWriteTS(nowUs int64) {
 // protected from scope-level destruction. Item-level operations
 // (/append, /delete, /delete_up_to, /get, /head, /tail, /render)
 // remain open on these scopes — the drainer pattern requires
-// /delete_up_to and /tail on _log to function, and apps freely
+// /delete_up_to and /tail on _events to function, and apps freely
 // /append into _inbox. See types.go for per-scope rationale and
 // CLAUDE.md "Two reserved scopes" for the principle.
-var reservedScopeNames = [...]string{LogScopeName, InboxScopeName}
+var reservedScopeNames = [...]string{EventsScopeName, InboxScopeName}
 
 // reservedScopesOverhead is the byte cost of pre-creating every
 // reserved scope. Used by rebuildAll's cap check so a /rebuild input
@@ -203,10 +212,10 @@ func isReservedScope(scope string) bool {
 
 // maxItemBytesFor returns the per-item byte cap that applies to writes
 // against scope. The reserved scopes have caps decoupled from the
-// global one (see types.go LogConfig / InboxConfig and RFC §2.6):
+// global one (see types.go EventsConfig / InboxConfig and RFC §2.6):
 //
-//   - `_log`   uses logMaxItemBytes   (= MaxItemBytes + LogItemEnvelopeOverhead)
-//   - `_inbox` uses inboxMaxItemBytes (operator-tunable, default 64 KiB)
+//   - `_events` uses eventsMaxItemBytes (= MaxItemBytes + EventsItemEnvelopeOverhead)
+//   - `_inbox`  uses inboxMaxItemBytes  (operator-tunable, default 64 KiB)
 //   - everything else uses maxItemBytes (the global Config.MaxItemBytes)
 //
 // Called by handlers that mutate items (currently /append) right before
@@ -215,8 +224,8 @@ func isReservedScope(scope string) bool {
 // before reaching this path, so they always see the global cap.
 func (s *Store) maxItemBytesFor(scope string) int64 {
 	switch scope {
-	case LogScopeName:
-		return s.logMaxItemBytes
+	case EventsScopeName:
+		return s.eventsMaxItemBytes
 	case InboxScopeName:
 		return s.inboxMaxItemBytes
 	default:
@@ -226,14 +235,15 @@ func (s *Store) maxItemBytesFor(scope string) int64 {
 
 // maxItemsFor returns the per-scope item-count cap to install on a
 // freshly-created buffer for scope. Mirrors maxItemBytesFor's
-// per-reserved-scope dispatch, with one extra wrinkle: `_log` returns
-// the unboundedScopeMaxItems sentinel so its appendItem path skips the
-// count cap entirely (best-effort observability — only the global
-// byte budget gates writes there). Used by initReservedScopes(Locked)
-// to install the right cap at boot / after wipe / after rebuild.
+// per-reserved-scope dispatch, with one extra wrinkle: `_events`
+// returns the unboundedScopeMaxItems sentinel so its appendItem path
+// skips the count cap entirely (best-effort observability — only the
+// global byte budget gates writes there). Used by
+// initReservedScopes(Locked) to install the right cap at boot /
+// after wipe / after rebuild.
 func (s *Store) maxItemsFor(scope string) int {
 	switch scope {
-	case LogScopeName:
+	case EventsScopeName:
 		return unboundedScopeMaxItems
 	case InboxScopeName:
 		return s.inboxMaxItems
@@ -245,9 +255,9 @@ func (s *Store) maxItemsFor(scope string) int {
 // unboundedScopeMaxItems is the sentinel value for "no item-count cap
 // on this scope" stored in scopeBuffer.maxItems. The write paths in
 // buffer_write.go treat 0 as "skip the count check" — only the
-// reserved `_log` scope is created with this sentinel because best-
-// effort observability writes are gated by the global byte budget,
-// not by an arbitrary item-count cap.
+// reserved `_events` scope is created with this sentinel because
+// best-effort observability writes are gated by the global byte
+// budget, not by an arbitrary item-count cap.
 const unboundedScopeMaxItems = 0
 
 // initReservedScopes pre-creates every entry in reservedScopeNames at
@@ -271,7 +281,7 @@ func (s *Store) initReservedScopes() {
 		if _, exists := sh.scopes[name]; !exists {
 			if ok, _, _ := s.reserveBytes(scopeBufferOverhead); ok {
 				buf := s.newscopeBuffer()
-				// Per-scope cap dispatch: _log gets the unbounded
+				// Per-scope cap dispatch: _events gets the unbounded
 				// sentinel, _inbox gets the operator-tunable cap.
 				// See maxItemsFor for the rationale.
 				buf.maxItems = s.maxItemsFor(name)
@@ -319,13 +329,14 @@ func (s *Store) initReservedScopesLocked() {
 func NewStore(c Config) *Store {
 	c = c.WithDefaults()
 	s := &Store{
-		hashSeed:          maphash.MakeSeed(),
-		defaultMaxItems:   c.ScopeMaxItems,
-		maxStoreBytes:     c.MaxStoreBytes,
-		maxItemBytes:      c.MaxItemBytes,
-		logMaxItemBytes:   c.MaxItemBytes + LogItemEnvelopeOverhead,
-		inboxMaxItems:     c.Inbox.MaxItems,
-		inboxMaxItemBytes: c.Inbox.MaxItemBytes,
+		hashSeed:           maphash.MakeSeed(),
+		defaultMaxItems:    c.ScopeMaxItems,
+		maxStoreBytes:      c.MaxStoreBytes,
+		maxItemBytes:       c.MaxItemBytes,
+		eventsMaxItemBytes: c.MaxItemBytes + EventsItemEnvelopeOverhead,
+		inboxMaxItems:      c.Inbox.MaxItems,
+		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
+		eventMode:          c.Events.Mode,
 	}
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)

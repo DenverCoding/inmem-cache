@@ -53,8 +53,35 @@ func TestValidateConfig_AcceptsPositive(t *testing.T) {
 		MaxItemMB:      1,
 		InboxMaxItems:  50000,
 		InboxMaxItemKB: 64,
+		EventMode:      "full",
 	}
 	if err := h.validateConfig(); err != nil {
 		t.Errorf("positive config rejected: %v", err)
 	}
+}
+
+// event_mode must accept "", "off", "notify", "full" and reject
+// anything else. The empty string is the documented sentinel for
+// "use the compile-time default" (= off), same shape as the integer
+// knobs accepting zero.
+func TestValidateConfig_EventMode(t *testing.T) {
+	t.Run("valid values", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "notify", "full"} {
+			h := &Handler{EventMode: mode}
+			if err := h.validateConfig(); err != nil {
+				t.Errorf("event_mode=%q rejected: %v", mode, err)
+			}
+		}
+	})
+
+	t.Run("invalid string rejected", func(t *testing.T) {
+		h := &Handler{EventMode: "verbose"}
+		err := h.validateConfig()
+		if err == nil {
+			t.Fatal("expected error for event_mode=verbose; got nil")
+		}
+		if !strings.Contains(err.Error(), "event_mode") {
+			t.Errorf("error %q does not name the offending key", err.Error())
+		}
+	})
 }

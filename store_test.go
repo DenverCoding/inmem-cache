@@ -139,18 +139,98 @@ func TestConfig_WithDefaults(t *testing.T) {
 	})
 }
 
+// EventMode parses the four documented adapter strings (off / notify /
+// full / "") into the typed enum, and rejects everything else with a
+// helpful error. The empty string is the documented sentinel for "use
+// the default" so adapters can pass through unset values without
+// special-casing; the default itself is EventModeOff.
+func TestParseEventMode(t *testing.T) {
+	cases := []struct {
+		in        string
+		want      EventMode
+		expectErr bool
+	}{
+		{"", EventModeOff, false},
+		{"off", EventModeOff, false},
+		{"notify", EventModeNotify, false},
+		{"full", EventModeFull, false},
+		{"verbose", EventModeOff, true},
+		{"OFF", EventModeOff, true}, // case-sensitive — operators must use lowercase
+		{" off", EventModeOff, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := ParseEventMode(tc.in)
+			if (err != nil) != tc.expectErr {
+				t.Fatalf("ParseEventMode(%q) err=%v, expectErr=%v", tc.in, err, tc.expectErr)
+			}
+			if got != tc.want {
+				t.Errorf("ParseEventMode(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// EventMode.String roundtrips through ParseEventMode for every defined
+// value. Unknown ints render as "unknown" so a forgotten case in
+// future code is visible rather than silently masquerading as off.
+func TestEventMode_StringRoundtrip(t *testing.T) {
+	for _, m := range []EventMode{EventModeOff, EventModeNotify, EventModeFull} {
+		s := m.String()
+		got, err := ParseEventMode(s)
+		if err != nil {
+			t.Errorf("ParseEventMode(%q) failed roundtrip from %v: %v", s, m, err)
+		}
+		if got != m {
+			t.Errorf("roundtrip %v -> %q -> %v", m, s, got)
+		}
+	}
+	// Sanity-check on the unknown rendering — unknown values must
+	// render as a non-empty string distinguishable from valid modes.
+	if got := EventMode(99).String(); got == "" || got == "off" || got == "notify" || got == "full" {
+		t.Errorf("EventMode(99).String() = %q; want a non-empty unknown sentinel", got)
+	}
+}
+
+// NewStore copies the resolved EventMode onto the Store so write-path
+// hooks (when wired in steps 5b+) can read it without going back
+// through Config. Today the field is accepted but not consulted —
+// this test exists to catch a future breakage where the Mode config
+// stops propagating from Config to Store.
+func TestNewStore_PropagatesEventMode(t *testing.T) {
+	for _, mode := range []EventMode{EventModeOff, EventModeNotify, EventModeFull} {
+		s := NewStore(Config{Events: EventsConfig{Mode: mode}})
+		if s.eventMode != mode {
+			t.Errorf("eventMode=%v want %v", s.eventMode, mode)
+		}
+	}
+}
+
+// Default Config (Config{}) has EventMode == Off because that's the
+// zero-value of the EventMode int and the documented default.
+// WithDefaults must not promote the zero-value to anything else for
+// this field — operators who omit it get "no auto-populate", not
+// surprise side-effects on every write.
+func TestConfig_WithDefaults_EventModeStaysOff(t *testing.T) {
+	got := Config{}.WithDefaults()
+	if got.Events.Mode != EventModeOff {
+		t.Errorf("Config{}.WithDefaults().Events.Mode = %v, want EventModeOff",
+			got.Events.Mode)
+	}
+}
+
 // NewStore derives the reserved-scope caps from the resolved Config.
 // Pinning these in a dedicated test means a future refactor of
-// LogItemEnvelopeOverhead, the inbox-default unit, or the derivation
-// formula breaks here loudly rather than silently shifting the
-// production caps.
+// EventsItemEnvelopeOverhead, the inbox-default unit, or the
+// derivation formula breaks here loudly rather than silently
+// shifting the production caps.
 func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 	t.Run("default config", func(t *testing.T) {
 		s := NewStore(Config{})
-		wantLog := int64(MaxItemBytes) + LogItemEnvelopeOverhead
-		if s.logMaxItemBytes != wantLog {
-			t.Errorf("logMaxItemBytes=%d want %d (= MaxItemBytes + LogItemEnvelopeOverhead)",
-				s.logMaxItemBytes, wantLog)
+		wantEvents := int64(MaxItemBytes) + EventsItemEnvelopeOverhead
+		if s.eventsMaxItemBytes != wantEvents {
+			t.Errorf("eventsMaxItemBytes=%d want %d (= MaxItemBytes + EventsItemEnvelopeOverhead)",
+				s.eventsMaxItemBytes, wantEvents)
 		}
 		if s.inboxMaxItems != ScopeMaxItems {
 			t.Errorf("inboxMaxItems=%d want %d", s.inboxMaxItems, ScopeMaxItems)
@@ -160,11 +240,11 @@ func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 		}
 	})
 
-	t.Run("custom MaxItemBytes propagates to logMaxItemBytes", func(t *testing.T) {
+	t.Run("custom MaxItemBytes propagates to eventsMaxItemBytes", func(t *testing.T) {
 		s := NewStore(Config{MaxItemBytes: 256 << 10})
-		want := int64(256<<10) + LogItemEnvelopeOverhead
-		if s.logMaxItemBytes != want {
-			t.Errorf("logMaxItemBytes=%d want %d", s.logMaxItemBytes, want)
+		want := int64(256<<10) + EventsItemEnvelopeOverhead
+		if s.eventsMaxItemBytes != want {
+			t.Errorf("eventsMaxItemBytes=%d want %d", s.eventsMaxItemBytes, want)
 		}
 	})
 
@@ -210,7 +290,7 @@ func TestNewAPI_DerivesMaxResponseBytesFromStore(t *testing.T) {
 // against totalBytes, so 1M empty scopes consumed ~1 GiB while
 // approx_store_mb stayed at 0. This test anchors the bound.
 func TestStore_EmptyScopeSpam_HitsByteCap(t *testing.T) {
-	// Cap big enough for reserved scopes (_log, _inbox) + ~10 attacker
+	// Cap big enough for reserved scopes (_events, _inbox) + ~10 attacker
 	// scopes' worth of overhead, no item room.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead)*10
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
@@ -252,7 +332,7 @@ func TestStore_EmptyScopeSpam_HitsByteCap(t *testing.T) {
 // delete, repeat) would slowly leak overhead and eventually 507 even
 // when the store looks empty.
 func TestStore_DeleteScope_ReleasesOverhead(t *testing.T) {
-	// Cap fits reserved scopes (_log, _inbox) + 5 attacker scopes.
+	// Cap fits reserved scopes (_events, _inbox) + 5 attacker scopes.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead)*5
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
 
@@ -417,7 +497,7 @@ func bigPayload(n int) json.RawMessage {
 }
 
 func TestStore_appendOne_RollsBackEmptyScopeOnFailure(t *testing.T) {
-	// Cap = reserved-scope overhead (NewStore pre-creates _log/_inbox)
+	// Cap = reserved-scope overhead (NewStore pre-creates _events/_inbox)
 	// + 1 user-scope overhead + 50 bytes. appendOne reserves overhead
 	// first, then the item-bytes reservation overflows — scope must be
 	// rolled back so the overhead is released.
@@ -505,7 +585,7 @@ func TestStore_appendOne_DoSPathStaysClean(t *testing.T) {
 		scopeCount += len(s.shards[shIdx].scopes)
 		s.shards[shIdx].mu.RUnlock()
 	}
-	// Reserved scopes (_log, _inbox) are pre-created and stay around;
+	// Reserved scopes (_events, _inbox) are pre-created and stay around;
 	// only "attempt_*" scopes must have been rolled back.
 	if scopeCount != len(reservedScopeNames) {
 		t.Errorf("after 1000 failed appendOne calls, scopeCount=%d want %d (reserved baseline)", scopeCount, len(reservedScopeNames))
@@ -594,7 +674,7 @@ func TestStore_appendOne_ConcurrentSuccessSurvivesCleanup(t *testing.T) {
 // other race-window tests in bulk_test.go.
 func TestStore_appendOne_DetachRaceErrorContract(t *testing.T) {
 	const iterations = 5000
-	// Cap fits reserved scopes (_log, _inbox) + 1 user-scope overhead + slack.
+	// Cap fits reserved scopes (_events, _inbox) + 1 user-scope overhead + slack.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + 1000
 
 	var caseACommit, caseBDetached, unexpected int
@@ -850,7 +930,7 @@ func TestScopeBuffer_DeletesDetectDetached(t *testing.T) {
 // the per-scope ScopeFullError.
 func TestStore_Append_RejectsAtByteCap(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	// Cap fits reserved scopes (_log, _inbox) + 1 user-scope overhead + 3 items.
+	// Cap fits reserved scopes (_events, _inbox) + 1 user-scope overhead + 3 items.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
 	s := NewStore(Config{ScopeMaxItems: 100, MaxStoreBytes: capBytes, MaxItemBytes: 1 << 20})
@@ -1275,7 +1355,7 @@ func TestStore_StatsCounters_Invariant_DoSCleanup(t *testing.T) {
 	// fill the store cap with overhead first, then try one more append.
 	s := NewStore(Config{
 		ScopeMaxItems: 10,
-		// Cap fits reserved scopes (_log, _inbox) + one user scope + a tiny item.
+		// Cap fits reserved scopes (_events, _inbox) + one user scope + a tiny item.
 		MaxStoreBytes: reservedScopesOverhead + int64(scopeBufferOverhead) + 100,
 		MaxItemBytes:  1 << 20,
 	})
@@ -1394,13 +1474,13 @@ func TestNewStore_PreCreatesReservedScopes_NonReserved(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
 	for _, name := range []string{
-		"thread:42",   // ordinary user scope
-		"events",      // ordinary user scope
-		"_tokens",     // addon-convention prefix; NOT reserved by core
-		"_counters_x", // same
-		"_log_extra",  // close to reserved name but not exactly
-		"_inbox2",     // same
-		"_",           // underscore alone
+		"thread:42",     // ordinary user scope
+		"events",        // ordinary user scope
+		"_tokens",       // addon-convention prefix; NOT reserved by core
+		"_counters_x",   // same
+		"_events_extra", // close to reserved name but not exactly
+		"_inbox2",       // same
+		"_",             // underscore alone
 	} {
 		if _, ok := s.getScope(name); ok {
 			t.Errorf("scope %q exists on fresh store; only the reserved names should be pre-created", name)

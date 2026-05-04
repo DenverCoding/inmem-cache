@@ -141,7 +141,7 @@ func assertBytesInvariant(t *testing.T, s *Store, iter int, label string) {
 func TestStore_Wipe_EmptyStore(t *testing.T) {
 	s := NewStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
-	// "Empty" still has the reserved scopes _log and _inbox pre-created
+	// "Empty" still has the reserved scopes _events and _inbox pre-created
 	// at boot. /wipe drops those (counted in the return) and immediately
 	// re-creates them under the same lock — so the cache lands back at
 	// its boot baseline of 2 reserved scopes / 0 items / reservedOverhead.
@@ -165,7 +165,7 @@ func TestStore_Wipe_RemovesEveryScopeAndCountsItems(t *testing.T) {
 	}
 
 	scopes, items, freed := s.wipe()
-	// 3 user scopes + 2 reserved scopes (_log, _inbox) all dropped by wipe.
+	// 3 user scopes + 2 reserved scopes (_events, _inbox) all dropped by wipe.
 	wantScopes := 3 + len(reservedScopeNames)
 	if scopes != wantScopes || items != 12 {
 		t.Fatalf("wipe: scopes=%d items=%d want %d,12", scopes, items, wantScopes)
@@ -210,12 +210,12 @@ func TestStore_Wipe_ResetsTotalBytes(t *testing.T) {
 
 // After /wipe the next /append must succeed even when the pre-wipe store
 // was at its byte cap — the cap budget has been fully released. The cap
-// must include the reserved-scope overhead because /wipe re-creates _log
+// must include the reserved-scope overhead because /wipe re-creates _events
 // and _inbox before returning.
 func TestStore_Wipe_FreesHeadroomForNextAppend(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
 	// Cap room for: reserved-scope overhead (NewStore + post-wipe init
-	// re-creates _log and _inbox) + per-scope overhead for "s" + 3 items.
+	// re-creates _events and _inbox) + per-scope overhead for "s" + 3 items.
 	// The fourth item then exceeds the cap.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*3
 
@@ -484,7 +484,7 @@ func TestStore_RebuildAll_RejectsDuplicateIDs(t *testing.T) {
 // whole with StoreFullError, and no scope is applied.
 func TestStore_ReplaceScopes_RejectsAtByteCap(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	// Reserved-scope overhead (NewStore pre-creates _log + _inbox) +
+	// Reserved-scope overhead (NewStore pre-creates _events + _inbox) +
 	// one scope-buffer overhead (for the pre-seed) + 3 items worth.
 	// The /warm batch needs 2 new scopes (overhead × 2) + 4 items, so
 	// expected post-batch usage = 5 overheads + 5 items, well past
@@ -627,10 +627,10 @@ func TestStore_ReplaceScopes_StrictCapAgainstConcurrentAppends(t *testing.T) {
 // rebuild aborts and the prior store is left intact.
 func TestStore_RebuildAll_RejectsAtByteCap(t *testing.T) {
 	itemSize := approxItemSize(newItem("s", "", nil))
-	// Cap fits the reserved-scope overhead (NewStore pre-creates _log
+	// Cap fits the reserved-scope overhead (NewStore pre-creates _events
 	// and _inbox) + 1 user-scope-overhead + 2 items. The /rebuild target
 	// tries 1 user-scope-overhead + 3 items + reserved-scope-overhead
-	// (post-rebuild init re-creates _log and _inbox) — should fail by
+	// (post-rebuild init re-creates _events and _inbox) — should fail by
 	// 1 itemSize.
 	capBytes := reservedScopesOverhead + int64(scopeBufferOverhead) + itemSize*2
 
@@ -681,7 +681,7 @@ func TestStore_RebuildAll_ResetsByteCounter(t *testing.T) {
 	}
 
 	// 1 new scope (overhead) + 2 items + reserved-scope overhead
-	// (post-rebuild init re-creates _log and _inbox).
+	// (post-rebuild init re-creates _events and _inbox).
 	expected := int64(scopeBufferOverhead) + approxItemSize(newItem("new", "n1", nil)) + approxItemSize(newItem("new", "n2", nil)) + reservedScopesOverhead
 	if got := s.totalBytes.Load(); got != expected {
 		t.Fatalf("totalBytes=%d want %d (counter must be reset to new total)", got, expected)

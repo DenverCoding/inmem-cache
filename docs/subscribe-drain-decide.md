@@ -1,4 +1,4 @@
-# Subscribe + log-scope drain architecture — decide-doc
+# Subscribe + events-scope drain architecture — decide-doc
 
 Working document. Captures the in-flight design for scopecache's
 write-event subscription primitive and the operational shape that
@@ -36,7 +36,7 @@ cron, PHP workers) do everything else.
 
 ```
 write to scope X      →  buffer X (live state, for reads)
-                      →  buffer _log (append-only, with payload)
+                      →  buffer _events (append-only, with payload)
                                    │
                                    │ (single-slot coalescing notify via Subscribe)
                                    ▼
@@ -78,7 +78,7 @@ must be possible" feature beyond that is operator-side.
 | Audit-trail | Files ARE the audit log, append-only, timestamped |
 | Decoupling | Consumers can be any language, any process, OS-event-driven |
 | Recovery | Drainer crash → restart from `lastSeq`, no state-loss |
-| Pressure relief | `_log` / `_inbox` get drained continuously, never accumulate |
+| Pressure relief | `_events` / `_inbox` get drained continuously, never accumulate |
 | Backup/replication | Standard tooling — rsync, cp, S3 sync — works on files |
 
 ## Cache-side primitives
@@ -108,10 +108,10 @@ func (s *Store) Subscribe(scope string) (<-chan struct{}, func())
   external callers must not touch. Subscribe is the opposite: a
   contract surface.
 
-### `_log` scope (auto-populated)
+### `_events` scope (auto-populated)
 
-The cache writes a log entry to `_log` on every successful mutation
-to any scope (other than `_log` itself, to prevent recursion).
+The cache writes a log entry to `_events` on every successful mutation
+to any scope (other than `_events` itself, to prevent recursion).
 
 ```jsonl
 {"scope":"thread:42","id":"msg-99","seq":17,"ts":1746367932123456,"op":"append","payload":{...}}
@@ -120,7 +120,7 @@ to any scope (other than `_log` itself, to prevent recursion).
 {"scope":"_admin","seq":0,"ts":1746367932200000,"op":"wipe"}
 ```
 
-Per Op, in `_log`:
+Per Op, in `_events`:
 
 | Op | Trigger | Per-item or summary | Payload? |
 |---|---|---|---|
@@ -143,7 +143,7 @@ the source-of-truth; they do not replay individual replaced items.
 Just a regular scope, pre-created at boot via `ensureScope("_inbox")`
 so Subscribe works immediately without a "scope-doesn't-exist-yet"
 race. Apps write to it; a drainer addon drains it the same way as
-`_log`. The cache never auto-writes here.
+`_events`. The cache never auto-writes here.
 
 ## Drainer pattern
 
@@ -222,28 +222,28 @@ weaker substitute.
 
 | Failure | What happens | Recovery |
 |---|---|---|
-| Drainer crash | `_log` accumulates, eventually 507s on writes | Restart drainer, resume from cursor |
+| Drainer crash | `_events` accumulates, eventually 507s on writes | Restart drainer, resume from cursor |
 | Disk full | Drainer can't write file, can't `DeleteUpTo`, log fills | External monitoring (TODO operational) |
-| Drainer slow | `_log` accumulates, eventually the global `MaxStoreBytes` fires and 507s start; for the auto-populate path that's a silent drop (when wired), for external `/append` it's a real 507 | Bump `MaxStoreBytes`, tune drain cadence, fix drainer |
-| Cache crash | In-memory `_log` lost; whatever wasn't drained is gone | Source-of-truth (DB) replay via `/rebuild` |
+| Drainer slow | `_events` accumulates, eventually the global `MaxStoreBytes` fires and 507s start; for the auto-populate path that's a silent drop (when wired), for external `/append` it's a real 507 | Bump `MaxStoreBytes`, tune drain cadence, fix drainer |
+| Cache crash | In-memory `_events` lost; whatever wasn't drained is gone | Source-of-truth (DB) replay via `/rebuild` |
 
 ## Decisions made so far (lock-in candidates)
 
 These should NOT need re-litigation in the implementation phase:
 
 1. **Single-slot coalescing channel** — not deep-buffered. `select { case ch <- struct{}{}: default: }`.
-2. **Per-scope subscribe** — not global. The Subscribe primitive takes a scope arg; in practice subscribers only call it for `_log` and `_inbox`, but the primitive itself is general.
-3. **`_log` is auto-populated by core** — not by an addon-side hook registry.
-4. **`_log` includes payload** — required for the file-drain pattern to be useful (files must be self-contained).
+2. **Per-scope subscribe** — not global. The Subscribe primitive takes a scope arg; in practice subscribers only call it for `_events` and `_inbox`, but the primitive itself is general.
+3. **`_events` is auto-populated by core** — not by an addon-side hook registry.
+4. **`_events` includes payload** — required for the file-drain pattern to be useful (files must be self-contained).
 5. **Bulk operations emit summaries, not per-item events** — `/warm` and `/rebuild` produce 1 log entry each.
-6. **Admin events are Op-types in `_log`** — `wipe`, `scope_detached`, `rebuild`, `warm`. No separate `_admin_log` scope.
+6. **Admin events are Op-types in `_events`** — `wipe`, `scope_detached`, `rebuild`, `warm`. No separate `_admin_events` scope.
 7. **No `_notification` scope.** Health/capacity alerting is external (see CLAUDE.md "Pre-1.0 TODO operational").
 8. **The cache stops at three primitives: Subscribe, Tail, DeleteUpTo.** Drainer shape (file format, sink type, batching cadence, fsync policy) is operator-side, not cache-side. The cache does not pick winners between JSONL / SQLite / external DB / Kafka / webhook sinks.
 9. **Subscribe is a public Store method** — capitalised, the deliberate exception to "all *Store methods are lowercase".
-10. **Basic boot-time init: cache pre-creates `_log` and `_inbox` unconditionally at boot.** Hardcoded in `NewStore` via `s.initReservedScopes()`. Subscribers can attach to either scope before any writes have happened (no "scope-doesn't-exist-yet" race). `_tokens` and other addon-convention scopes are NOT pre-created by core. Extensibility (config-driven scope list, boot-time hooks for external rebuild-scripts) is parked as a future-work TODO. **Implemented.**
+10. **Basic boot-time init: cache pre-creates `_events` and `_inbox` unconditionally at boot.** Hardcoded in `NewStore` via `s.initReservedScopes()`. Subscribers can attach to either scope before any writes have happened (no "scope-doesn't-exist-yet" race). `_tokens` and other addon-convention scopes are NOT pre-created by core. Extensibility (config-driven scope list, boot-time hooks for external rebuild-scripts) is parked as a future-work TODO. **Implemented.**
 
-11. **Two reserved scope names: `_log` and `_inbox`, with append-only drain-stream semantics.** The cache allows operations that fit the drain pattern and rejects the ones that don't:
-    - **Allowed**: `/append` (apps → `_inbox`; cache auto → `_log`), `/delete` and `/delete_up_to` (drainer cleanup), `/get`/`/head`/`/tail`/`/render` (reads), `/stats`/`/scopelist` (observability).
+11. **Two reserved scope names: `_events` and `_inbox`, with append-only drain-stream semantics.** The cache allows operations that fit the drain pattern and rejects the ones that don't:
+    - **Allowed**: `/append` (apps → `_inbox`; cache auto → `_events`), `/delete` and `/delete_up_to` (drainer cleanup), `/get`/`/head`/`/tail`/`/render` (reads), `/stats`/`/scopelist` (observability).
     - **Rejected (400)**: `/upsert`, `/update`, `/counter_add` (no in-place mutation on a drain-stream — items are either still in buffer or already drained), `/delete_scope`, `/warm` (target reserved), `/rebuild` (input contains reserved).
     - **Atomic re-init**: `/wipe` drops everything and immediately re-creates the reserved scopes under the same all-shard write lock so subscribers don't see a gap; `/rebuild` does the same after the swap.
 
@@ -254,34 +254,56 @@ These should NOT need re-litigation in the implementation phase:
 13. **Per-reserved-scope capacity knobs decoupled from globals only where it buys something.** Resolves Q4-Q7. Final shape:
 
     - `_inbox` is operator-tunable on **two axes**: `Inbox.MaxItems` (default = global `ScopeMaxItems`, env `SCOPECACHE_INBOX_MAX_ITEMS`) and `Inbox.MaxItemBytes` (default 64 KiB, env `SCOPECACHE_INBOX_MAX_ITEM_KB`). Apps writing fan-in events typically need a much smaller per-item cap than user-scopes, and the item-count cap is independently tunable for high-throughput inboxes.
-    - `_log` is **fully derived**, no knobs. Per-item cap = `MaxItemBytes + 1 KiB envelope slack` so a log entry always fits the user-write that produced it (operators tune `MaxItemBytes`; `_log` follows). Item-count cap = unbounded (`_log` is best-effort observability gated only by the global byte budget; an arbitrary count cap on a drain-stream is meaningless).
-    - **No separate byte budget** for either reserved scope. Both share the global `MaxStoreBytes`. A separate budget was considered but adds complexity (two budgets to size, two cap-fire failure modes for operators to reason about) without buying anything: operators who want to give `_log`/`_inbox` more headroom bump `MaxStoreBytes` globally, and the scheduler-addon (TODO operational) covers proactive monitoring.
+    - `_events` is **fully derived**, no knobs. Per-item cap = `MaxItemBytes + 1 KiB envelope slack` so a log entry always fits the user-write that produced it (operators tune `MaxItemBytes`; `_events` follows). Item-count cap = unbounded (`_events` is best-effort observability gated only by the global byte budget; an arbitrary count cap on a drain-stream is meaningless).
+    - **No separate byte budget** for either reserved scope. Both share the global `MaxStoreBytes`. A separate budget was considered but adds complexity (two budgets to size, two cap-fire failure modes for operators to reason about) without buying anything: operators who want to give `_events`/`_inbox` more headroom bump `MaxStoreBytes` globally, and the scheduler-addon (TODO operational) covers proactive monitoring.
 
     Implementation locus: `Store.maxItemBytesFor(scope)` and `Store.maxItemsFor(scope)` in [store.go](../store.go); enforcement at `handleAppend` and inside `appendItem` (sentinel `b.maxItems == 0`). **Implemented.**
 
 14. **HTTP response cap derived, not configured.** Per-response byte cap on `/head`, `/tail`, `/render` equals `MaxStoreBytes` so any single-scope read fits in one response by construction. No separate `MaxResponseBytes` knob — a value below `MaxStoreBytes` is just a misconfiguration that makes drainers flaky on full scopes; a value above is meaningless (no scope can hold more than the store). Resolved in `NewAPI` rather than `APIConfig.WithDefaults` because the derivation crosses structs. **Implemented.**
 
-15. **External `/append` to reserved scopes is allowed (`_log` and `_inbox`).** Resolves Q15. The cache imposes shape rules on items targeting reserved scopes (per-item byte cap from §13, plus item-count cap on `_inbox`) but does not gate writes on caller identity — anyone with mux access can write. The cache itself never recurses (a future cache-internal write to `_log` triggered by an external write to `_log` would loop), so the auto-populate path will explicitly skip when the target scope IS `_log`. External writes to `_log` are unusual but harmless; external writes to `_inbox` are the **expected** path (apps populate `_inbox`; a drainer drains it). Cap-overflow on either reserved scope returns 507 — same hard-fail semantics as user-scopes for *external* writes. The "best-effort drop on overflow" semantics applies only to the future cache-internal auto-populate path (when it lands), and is a per-write-path policy, not a per-scope policy. **Implemented for the external path; auto-populate-side is open until that wires in.**
+15. **External `/append` to reserved scopes is allowed (`_events` and `_inbox`).** Resolves Q15. The cache imposes shape rules on items targeting reserved scopes (per-item byte cap from §13, plus item-count cap on `_inbox`) but does not gate writes on caller identity — anyone with mux access can write. The cache itself never recurses (a future cache-internal write to `_events` triggered by an external write to `_events` would loop), so the auto-populate path will explicitly skip when the target scope IS `_events`. External writes to `_events` are unusual but harmless; external writes to `_inbox` are the **expected** path (apps populate `_inbox`; a drainer drains it). Cap-overflow on either reserved scope returns 507 — same hard-fail semantics as user-scopes for *external* writes. The "best-effort drop on overflow" semantics applies only to the future cache-internal auto-populate path (when it lands), and is a per-write-path policy, not a per-scope policy. **Implemented for the external path; auto-populate-side is open until that wires in.**
+
+16. **Reserved scope renamed: `_log` → `_events`.** The `_log` name was overloaded (Caddy logs, app logs, OS logs all compete for the term) and asymmetric with `_inbox`. `_events` describes what the scope contains (drainer events) without committing to a transport direction (which `_outbox` would have done — we considered it but the email-flavor connotation made the name promise "leaves the system" semantics that are not actually required). Pre-1.0 breaking change applied to constants (`EventsScopeName`, `EventsItemEnvelopeOverhead`), Store fields (`eventsMaxItemBytes`), Config (`Events EventsConfig`), tests, RFC §2.6, and this document. **Implemented in step 5a.**
+
+17. **Tri-state `EventMode` enum, default `Off`.** Resolves Q1 + Q2 with one knob instead of two. Values: `EventModeOff` (default — no auto-populate, zero overhead on the write path; opt-in when an operator has a drainer ready), `EventModeNotify` (events without payload — addressing only: op, scope, id?, seq, ts), `EventModeFull` (events with action-payload). Adapter strings: `off`/`notify`/`full`; env `SCOPECACHE_EVENT_MODE`; Caddyfile `event_mode notify`. Default = `Off` because the cost (extra write per operation) is paid 24/7 even without a drainer; the benefit only materialises when a drainer is consuming. **Config-shape implemented in step 5a; auto-populate behaviour wires in step 5b+.**
+
+18. **Action-logging, not result-logging.** Resolves Q11 + Q12. Each event entry contains the inputs the caller sent plus the addressing the cache assigned (seq for newly-created or resolved-from-id paths). Never the result-side data: not "created vs replaced", not the new counter value, not deletion counts. Per endpoint, the `Full`-mode envelope is:
+
+    | Endpoint | Envelope (Full mode) |
+    |---|---|
+    | `/append` | `{op, scope, id?, seq, ts, payload}` |
+    | `/upsert` | `{op, scope, id, seq, ts, payload}` |
+    | `/update by id` | `{op, scope, id, seq, ts, payload}` |
+    | `/update by seq` | `{op, scope, seq, ts, payload}` |
+    | `/counter_add` | `{op, scope, id, seq, by, ts}` *(no `value`)* |
+    | `/delete by id` | `{op, scope, id, seq, ts}` |
+    | `/delete by seq` | `{op, scope, seq, ts}` |
+    | `/delete_up_to` | `{op, scope, max_seq, ts}` *(no `count`)* |
+    | `/delete_scope` | `{op, scope, ts}` |
+    | `/warm` | `{op, ts}` *(no scope-list, no count)* |
+    | `/rebuild` | `{op, ts}` |
+    | `/wipe` | `{op, ts}` |
+
+    `Notify`-mode envelope is identical minus the `payload` field. Rationale: replay-able, matches WAL discipline downstream sinks expect, no waiting on the underlying op's result before emitting. Resolves Q13 (no separate `scope_detached` Op type — `/delete_scope` is itself the action-event). **Wires in step 5b+.**
+
+19. **Reserved scope names hardcoded.** Resolves Q14. `_events` and `_inbox` are compile-time constants; not exposed as adapter knobs. Operators concerned about collision with their own scope-namespacing prefix their own scopes (e.g., `acme:posts:42`). An `EventsScopeName` / `InboxScopeName` operator-tunable knob would not solve the collision problem (third-party addons that also reference the constants would diverge per deployment). **Implemented.**
 
 ## Open design decisions
 
-### Auto-populate semantics (deferred until auto-populate lands)
-
-- **Q1 — Log policy on/off.** Should there be a master switch
-  `EnableLogScope` to disable `_log` auto-populate entirely? Some
-  workloads (pure read-cache) don't need `_log`, and skipping the
-  hook removes write-path overhead. Default presumably `true` (the
-  feature only earns its keep if it's on by default).
-
-- **Q2 — `_log` payload toggle.** We've decided "with payload" is
-  required for the drain-to-file architecture. Should there still
-  be a `LogScopeIncludePayload` knob for operators who want only
-  metadata (different use case: cheap audit-trail without persistence)?
-  Or is the simpler "always with payload" the v1.0 commitment?
+### Auto-populate semantics (still open)
 
 - **Q3 — Drain coalescing delay.** Drainer sleeps before tailing to
   let bursts coalesce. Default 0.5 s? Hardcoded or per-drainer-instance
-  config? Per-scope config (different cadence for `_log` vs `_inbox`)?
+  config? Per-scope config (different cadence for `_events` vs `_inbox`)?
+
+- **Event-emit ordering.** Decided: capture-under-lock, emit-outside-lock
+  (option 1 of three considered). Same pattern as Subscribe's wake-up
+  fanout (settled #9). Two parallel writes can land in `_events` in
+  different `_events.seq` order than the underlying ops happened;
+  drainers that need strict per-scope replay sort by `(payload.scope,
+  payload.seq)` within a batch, which they have to do anyway to
+  handle interleaved events from different scopes. Documented as a
+  known characteristic of the stream rather than a bug.
 
 ### File handling
 
@@ -295,30 +317,6 @@ If a reference drainer ships (`addons/drainer-jsonl/` etc.), its
 own README/docs cover layout, persistence, and fsync — not this
 document.
 
-### Event shapes
-
-- **Q11 — Counter_add event payload.** When `/counter_add` produces a
-  log entry, does the payload contain (a) the new value as JSON
-  number, (b) the new value AND the delta `{value, by}`, or (c) just
-  the delta? Affects replicator design.
-
-- **Q12 — Delete-event metadata.** The delete log entry has no
-  payload, but does it carry the pre-delete metadata (last-state's
-  ts, last seq)? Useful for audit; tiny extra cost. Probably yes.
-
-- **Q13 — `scope_detached` trigger.** When does this fire — only on
-  `/delete_scope`, or also on `/wipe` (per scope) and `/rebuild`
-  (per dropped scope)? Probably only `/delete_scope`; the bulk events
-  cover wipe/rebuild themselves.
-
-### Naming and scope-management
-
-- **Q14 — `_log` and `_inbox` names hardcoded or configurable?**
-  Proposal: hardcoded names, simpler. Operators concerned about
-  collision with their own scope-namespacing prefix the cache with
-  their own scheme. Or: `LogScopeName` / `InboxScopeName` config
-  knobs defaulting to `_log` / `_inbox`?
-
 ### Subscribe semantics
 
 - **Q16 — Subscribe-on-not-yet-existent scope.** Should
@@ -326,7 +324,7 @@ document.
   created yet? If yes, the cache must auto-create the (empty) scope
   buffer on Subscribe — same overhead reservation as `ensureScope`.
   In the new architecture the only realistic Subscribe targets are
-  `_log` and `_inbox`, both pre-created — so this question matters
+  `_events` and `_inbox`, both pre-created — so this question matters
   less, but the primitive is generic.
 
 - **Q17 — Scope-deleted-while-subscribed.** When `/delete_scope`
@@ -334,7 +332,7 @@ document.
   cleanly. Sentinel "scope detached" event before close, or silent
   close? Under coalescing-channel-of-struct{} this question reduces:
   there's no payload to carry the sentinel. Silent close + the
-  `scope_detached` entry in `_log` is probably enough — subscribers
+  `scope_detached` entry in `_events` is probably enough — subscribers
   who care can see that entry in their next drain.
 
 - **Q18 — Lock order between `subsMu` and `b.mu`.** Subscribe pins a
@@ -356,40 +354,47 @@ document.
 
 Already shipped (foundation):
 
-- ✅ Boot-time + post-wipe + post-rebuild pre-creation of `_log` and
+- ✅ Boot-time + post-wipe + post-rebuild pre-creation of `_events` and
   `_inbox` (settled decisions 10, 11, 12).
 - ✅ Reservation contract: scope-level destructive ops on reserved
   scopes return 400; in-place mutation (`/upsert`, `/update`,
   `/counter_add`) returns 400; item-level ops + reads work normally.
 - ✅ Per-reserved-scope cap shape (settled decision 13): `Inbox.MaxItems`
-  + `Inbox.MaxItemBytes` operator-tunable; `_log` derived
+  + `Inbox.MaxItemBytes` operator-tunable; `_events` derived
   (`MaxItemBytes + 1 KiB`) + exempt from item-count cap.
 - ✅ HTTP response cap derived from `MaxStoreBytes` (settled 14).
 - ✅ External `/append` to reserved scopes allowed with normal
   hard-fail-on-cap semantics (settled 15).
+- ✅ Step 5a: rename `_log` → `_events` (settled 16); `EventMode`
+  tri-state config (settled 17); action-logging envelope shape
+  (settled 18); hardcoded reserved-scope names (settled 19).
+  No auto-populate behaviour wired yet — `Mode` stored on Store
+  but consulted by no write path.
 
-Remaining for Subscribe + auto-populate, once Q1-Q3, Q11-Q14, Q16-Q19
-are answered:
+Remaining for Subscribe + auto-populate (Q3 + Q16-Q19 outstanding):
 
-1. **`subscribe.go`** in core (~120 lines): `Subscribe` method,
-   `subscriber` struct, per-scope subscriber list with `subsMu`.
-2. **Hooks in 5 write paths** (~30 lines total): `appendItem`,
-   `upsertByID`, `updateByID`, `deleteByID`, `counterAdd`. Plus
-   the bulk paths (`replaceScopes`, `wipe`, `rebuildAll`) and
-   scope-delete (`deleteScope`).
-3. **`_log` auto-populate** (~50 lines): a `logEvent` helper
-   called from each write path that constructs and appends a log
-   entry to the `_log` buffer (with recursion-guard for `_log`
-   itself, and best-effort drop-on-overflow + `log_drops_total`
-   counter exposed on `/stats`).
-4. **Tests** (~250 lines): race detector, coalescing semantics,
-   crash-safety, scope-detached-during-fanout, recursion-guard,
-   drop-on-overflow.
-5. **`addons/drainer/`** (~200 lines): drainer addon + integration
-   tests.
+1. **Step 5b** — `_events` auto-populate skeleton on `appendItem`
+   only, with recursion guard. ~40 lines + tests.
+2. **Step 5c** — auto-populate hooks on remaining single-item write
+   paths (`upsertByID`, `updateByID`, `updateBySeq`, `counterAdd`,
+   `deleteByID`, `deleteBySeq`, `deleteUpToSeq`). ~60 lines + tests.
+3. **Step 5d** — bulk-path hooks (`wipe`, `rebuildAll`,
+   `replaceScopes`, `deleteScope`) emitting `{op, ts}` events.
+   ~30 lines + tests.
+4. **Step 5e** — best-effort drop-on-overflow + `event_drops_total`
+   atomic counter; surface on `/stats` (one-line addition to the
+   /stats enrichment TODO). ~20 lines + tests.
+5. **Step 6** — `Subscribe` primitive in core (~120 lines):
+   `Store.Subscribe(scope) (<-chan struct{}, func())`, per-scope
+   subscriber list with `subsMu`, capture-under-lock + emit-outside-
+   lock fanout from each write path. Resolves Q16-Q19.
+6. **Step 7** — `addons/drainer-*` reference implementations
+   (~200 lines): drainer addon + integration tests demonstrating
+   the JSONL / SQLite / webhook sinks.
 
-Total remaining: ~600 lines of code, ~250 lines of tests, ~1 day
-for core Subscribe + auto-populate and ~1 day for the drainer.
+Total remaining: ~470 lines of code, ~250 lines of tests, ~1 day
+for the auto-populate sub-steps + Subscribe primitive, ~1 day for
+the reference drainer.
 
 ## Pointers
 

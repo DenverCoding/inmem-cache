@@ -397,7 +397,7 @@ func TestGroupItemsByScope(t *testing.T) {
 }
 
 // TestReservedScopes_RejectsScopeLevelAndMutationOps pins the
-// reservation contract for `_log` and `_inbox`:
+// reservation contract for `_events` and `_inbox`:
 //
 //   - Scope-level destructive ops (/delete_scope, /warm-target,
 //     /rebuild-input) reject the reserved names — handled in bulk.go
@@ -433,7 +433,7 @@ func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
 			}
 
 			// /append on reserved must still succeed at the validator level —
-			// apps write to _inbox, the cache later auto-populates _log.
+			// apps write to _inbox, the cache later auto-populates _events.
 			if err := validateWriteItem(Item{Scope: scope, Payload: payload}, "/append", maxItem); err != nil {
 				t.Errorf("validateWriteItem on %q: append must be allowed, got %v", scope, err)
 			}

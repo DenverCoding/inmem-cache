@@ -64,7 +64,7 @@ type scopeBuffer struct {
 	// maxItems caps the number of items this scope may hold; writes
 	// past it produce *ScopeFullError. The unboundedScopeMaxItems
 	// sentinel (= 0) means "no count cap" — the write paths skip the
-	// check entirely. Only the reserved `_log` scope is created with
+	// check entirely. Only the reserved `_events` scope is created with
 	// the sentinel (best-effort observability gated by the global byte
 	// budget alone); every other scope, including `_inbox`, gets a
 	// concrete positive cap installed at create time. See

@@ -41,7 +41,7 @@ func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 	}
 
 	// maxItems == 0 is the unboundedScopeMaxItems sentinel — only the
-	// reserved `_log` scope is created with it; every user scope gets a
+	// reserved `_events` scope is created with it; every user scope gets a
 	// positive cap installed at create time. See buffer.go's maxItems
 	// comment for the rationale.
 	if b.maxItems > 0 && len(b.items) >= b.maxItems {
