@@ -371,7 +371,7 @@ func TestBulkRequestBytesFor_ScalesWithStoreCap(t *testing.T) {
 		if got <= storeBytes {
 			t.Errorf("storeBytes=%d: bulk cap %d is not greater than store cap", storeBytes, got)
 		}
-		want := storeBytes + storeBytes/10 + BulkRequestBytesOverhead
+		want := storeBytes + storeBytes/10 + bulkRequestBytesOverhead
 		if got != want {
 			t.Errorf("storeBytes=%d: got %d want %d", storeBytes, got, want)
 		}

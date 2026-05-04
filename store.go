@@ -47,7 +47,7 @@ type store struct {
 	// for the shape rationale (why `_events` has no item-count knob
 	// and `_inbox` has both item-count and item-byte knobs).
 	//
-	//   - eventsMaxItemBytes: MaxItemBytes + EventsItemEnvelopeOverhead.
+	//   - eventsMaxItemBytes: MaxItemBytes + eventsItemEnvelopeOverhead.
 	//                         Derived, not a knob — an event entry must
 	//                         always fit the user-write that produced it.
 	//   - inboxMaxItems:      Inbox.MaxItems (default = ScopeMaxItems).
@@ -245,7 +245,7 @@ func isReservedScope(scope string) bool {
 // against scope. The reserved scopes have caps decoupled from the
 // global one (see types.go EventsConfig / InboxConfig and RFC §2.6):
 //
-//   - `_events` uses eventsMaxItemBytes (= MaxItemBytes + EventsItemEnvelopeOverhead)
+//   - `_events` uses eventsMaxItemBytes (= MaxItemBytes + eventsItemEnvelopeOverhead)
 //   - `_inbox`  uses inboxMaxItemBytes  (operator-tunable, default 64 KiB)
 //   - everything else uses maxItemBytes (the global Config.MaxItemBytes)
 //
@@ -364,7 +364,7 @@ func newStore(c Config) *store {
 		defaultMaxItems:    c.ScopeMaxItems,
 		maxStoreBytes:      c.MaxStoreBytes,
 		maxItemBytes:       c.MaxItemBytes,
-		eventsMaxItemBytes: c.MaxItemBytes + EventsItemEnvelopeOverhead,
+		eventsMaxItemBytes: c.MaxItemBytes + eventsItemEnvelopeOverhead,
 		inboxMaxItems:      c.Inbox.MaxItems,
 		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
 		eventsMode:         c.Events.Mode,

@@ -23,7 +23,7 @@ const (
 	// SCOPECACHE_INBOX_MAX_ITEM_KB (integer KiB).
 	InboxMaxItemBytes = 64 << 10
 
-	// EventsItemEnvelopeOverhead is the slack added to the user-facing
+	// eventsItemEnvelopeOverhead is the slack added to the user-facing
 	// MaxItemBytes to derive the `_events` scope's per-item cap. An
 	// event entry wraps the user payload in a JSON envelope (op,
 	// scope, id?, seq, ts, plus framing); 1 KiB is generous over the
@@ -31,12 +31,12 @@ const (
 	// a knob bump.
 	//
 	// `_events`'s per-item cap is derived (`MaxItemBytes +
-	// EventsItemEnvelopeOverhead`), not exposed as a knob: an event
+	// eventsItemEnvelopeOverhead`), not exposed as a knob: an event
 	// entry must always be at least as wide as the user-write that
 	// produced it, otherwise large user-writes would 507 on the
 	// auto-populate path. Operators tune `MaxItemBytes`; `_events`
 	// follows.
-	EventsItemEnvelopeOverhead = 1024
+	eventsItemEnvelopeOverhead = 1024
 
 	// EventsScopeName is the well-known scope name for the
 	// auto-populated write-event stream (Phase A "Subscribe + event
@@ -56,20 +56,20 @@ const (
 	// to it.
 	InboxScopeName = "_inbox"
 
-	// SingleRequestBytesOverhead is the headroom added on top of the configured
+	// singleRequestBytesOverhead is the headroom added on top of the configured
 	// per-item cap to produce the request body cap for single-item endpoints
 	// (/append, /update, /upsert, /delete, /delete_scope, /delete_up_to,
 	// /counter_add). Covers JSON framing — keys ("scope","id","payload"),
 	// quotes, colons, braces — on top of the item payload. The scope and id
 	// bytes themselves are already counted inside approxItemSize, so the
 	// framing overhead is tiny and constant. 4 KiB leaves generous slack.
-	SingleRequestBytesOverhead = 4096
+	singleRequestBytesOverhead = 4096
 
-	// BulkRequestBytesOverhead is the headroom added on top of the configured
+	// bulkRequestBytesOverhead is the headroom added on top of the configured
 	// store cap to produce the per-request cap for /warm and /rebuild. See
 	// bulkRequestBytesFor: a full cache must fit into a single bulk request,
 	// plus JSON framing (keys, quotes, separators, wrapper object).
-	BulkRequestBytesOverhead = 16 << 20 // 16 MiB
+	bulkRequestBytesOverhead = 16 << 20 // 16 MiB
 
 	// MaxCounterValue is the largest absolute value a /counter_add operation
 	// may observe or produce. Matches the JavaScript safe-integer range
@@ -96,7 +96,7 @@ const (
 //     bytes-cap on MaxStoreBytes is the only real begrenzer there).
 //   - MaxStoreBytes: aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
 //   - MaxItemBytes:  per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
-//     Applies to user-scopes; `_events` derives `MaxItemBytes + EventsItemEnvelopeOverhead`,
+//     Applies to user-scopes; `_events` derives `MaxItemBytes + eventsItemEnvelopeOverhead`,
 //     `_inbox` uses the operator-tunable Inbox.MaxItemBytes instead.
 //   - Events:        reserved-scope settings for `_events` (write-event
 //     auto-populate mode; cap is derived, not configurable).
@@ -188,7 +188,7 @@ func ParseEventsMode(s string) (EventsMode, error) {
 // they're derived from `Config.MaxItemBytes` (+ envelope slack) and
 // fully exempt respectively, because per-event cap arithmetic must
 // stay coupled to the user-write that produced the event. See
-// EventsItemEnvelopeOverhead for the rationale.
+// eventsItemEnvelopeOverhead for the rationale.
 type EventsConfig struct {
 	Mode EventsMode
 }
@@ -533,11 +533,11 @@ func estimateMultiItemResponseBytes(items []Item) int64 {
 
 // bulkRequestBytesFor returns the per-request body cap for /warm and
 // /rebuild, derived from the configured store cap. A full store must always
-// fit into a single bulk request; the extra 10% plus BulkRequestBytesOverhead
+// fit into a single bulk request; the extra 10% plus bulkRequestBytesOverhead
 // covers JSON framing (keys, quotes, array separators, wrapper object) and
 // provides a sane floor for very small store caps.
 func bulkRequestBytesFor(maxStoreBytes int64) int64 {
-	return maxStoreBytes + maxStoreBytes/10 + BulkRequestBytesOverhead
+	return maxStoreBytes + maxStoreBytes/10 + bulkRequestBytesOverhead
 }
 
 // singleRequestBytesFor returns the per-request body cap for single-item
@@ -548,5 +548,5 @@ func bulkRequestBytesFor(maxStoreBytes int64) int64 {
 // item bytes — scope and id are already counted inside approxItemSize, so the
 // framing is tiny and constant.
 func singleRequestBytesFor(maxItemBytes int64) int64 {
-	return maxItemBytes + SingleRequestBytesOverhead
+	return maxItemBytes + singleRequestBytesOverhead
 }

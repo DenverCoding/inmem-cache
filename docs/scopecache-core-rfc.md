@@ -427,7 +427,7 @@ accepted by config but consulted by no write path.
 
 **Implementation locus.** Constants `EventsScopeName` and
 `InboxScopeName` live in `types.go`, alongside `InboxMaxItemBytes`
-(default 64 KiB) and `EventsItemEnvelopeOverhead` (1 KiB derivation
+(default 64 KiB) and `eventsItemEnvelopeOverhead` (1 KiB derivation
 slack). The `reservedScopeNames` array, the
 `reservedScopesOverhead` constant, the `isReservedScope(scope)`
 helper, and the `initReservedScopes` / `initReservedScopesLocked`
