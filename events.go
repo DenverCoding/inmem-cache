@@ -52,16 +52,22 @@ import "encoding/json"
 //
 // Field shape per op:
 //
-//	append      — scope, id?, seq, ts, payload?
-//	upsert      — scope, id, seq, ts, payload?
-//	update      — scope, id|seq, payload?      (no ts; updateByID/Seq don't return it)
-//	counter_add — scope, id, by                (no payload, no ts)
+//	append       — scope, id?, seq, ts, payload?
+//	upsert       — scope, id, seq, ts, payload?
+//	update       — scope, id|seq, payload?      (no ts; updateByID/Seq don't return it)
+//	counter_add  — scope, id, by                (no payload, no ts)
+//	delete       — scope, id|seq                (no payload, no ts)
+//	delete_up_to — scope, max_seq               (no id, no per-item seq, no payload, no ts)
 //
 // Optional fields use `omitempty`: a zero Seq is absent (so /update
-// by-id envelopes don't carry seq:0), a nil Payload is absent (Notify
-// mode strips it), a zero Ts is absent. By is *int64 so by:0 is
-// representable (a literal "increment-by-zero" action) while leaving
-// the field absent for non-counter ops.
+// by-id and /delete by-id envelopes don't carry seq:0), a nil Payload
+// is absent (Notify mode strips it), a zero Ts is absent. By is
+// *int64 so by:0 is representable (a literal "increment-by-zero"
+// action) while leaving the field absent for non-counter ops. MaxSeq
+// is uint64 with omitempty — collisions with a literal max_seq=0
+// don't matter because /delete_up_to with max_seq=0 is a no-op
+// (nothing has seq <= 0 since assignments start at 1) and we skip
+// emitting on count=0 anyway.
 type writeEvent struct {
 	Op      string          `json:"op"`
 	Scope   string          `json:"scope"`
@@ -70,6 +76,7 @@ type writeEvent struct {
 	Ts      int64           `json:"ts,omitempty"`
 	Payload json.RawMessage `json:"payload,omitempty"`
 	By      *int64          `json:"by,omitempty"`
+	MaxSeq  uint64          `json:"max_seq,omitempty"`
 }
 
 // emitEvent is the shared fan-out for every per-op emit helper. It
@@ -156,5 +163,35 @@ func (s *Store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMe
 func (s *Store) emitCounterAddEvent(scope, id string, by int64) {
 	s.emitEvent(writeEvent{
 		Op: "counter_add", Scope: scope, ID: id, By: &by,
+	})
+}
+
+// emitDeleteEvent — addressed by id OR seq, whichever the user
+// supplied. id == "" means "addressed by seq"; the validator already
+// enforced id-xor-seq at the request layer. No payload (delete carries
+// none) and no ts (deleteByID/Seq return only the deleted-count, not
+// the deleted item's stored ts — and the action-vector is fully
+// captured by scope+address anyway).
+//
+// Caller (Store.deleteOne) emits only on hit (count > 0); a miss is a
+// no-op against cache state and replay reconstructs the same final
+// state without it.
+func (s *Store) emitDeleteEvent(scope, id string, seq uint64) {
+	s.emitEvent(writeEvent{
+		Op: "delete", Scope: scope, ID: id, Seq: seq,
+	})
+}
+
+// emitDeleteUpToEvent — bulk-delete with the cursor as action-vector.
+// MaxSeq is the only meaningful field beyond scope; per-item seqs are
+// not enumerated (drainers replaying against a populated cache walk
+// b.items and apply the same delete-everything-<=N rule).
+//
+// Caller (Store.deleteUpTo) emits only on hit (count > 0); a no-op
+// /delete_up_to (no items at or below the cursor) does not change
+// cache state and is not emitted.
+func (s *Store) emitDeleteUpToEvent(scope string, maxSeq uint64) {
+	s.emitEvent(writeEvent{
+		Op: "delete_up_to", Scope: scope, MaxSeq: maxSeq,
 	})
 }

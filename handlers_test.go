@@ -2955,3 +2955,134 @@ func TestEvents_AutoPopulate_CounterAdd(t *testing.T) {
 		}
 	}
 }
+
+// /delete auto-populate: three branches.
+// (1) delete by-id (envelope carries id, no seq)
+// (2) delete by-seq (envelope carries seq, no id)
+// (3) delete miss (id absent in scope) — no emit
+func TestEvents_AutoPopulate_Delete(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Seed: two items so we can delete one by id, one by seq.
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"posts","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("seed by-id: code=%d body=%s", code, raw)
+	}
+	if code, _, raw := doRequest(t, h, "POST", "/append",
+		`{"scope":"posts","payload":{"v":2}}`); code != 200 {
+		t.Fatalf("seed by-seq: code=%d body=%s", code, raw)
+	}
+	baseline, _ := eventsTailCount(t, h)
+	if baseline != 2 {
+		t.Fatalf("after seed: _events count=%d want 2", baseline)
+	}
+
+	// (1) delete by-id.
+	if code, _, raw := doRequest(t, h, "POST", "/delete",
+		`{"scope":"posts","id":"a"}`); code != 200 {
+		t.Fatalf("/delete by-id: code=%d body=%s", code, raw)
+	}
+	// (2) delete by-seq (the second seeded item is at seq=2).
+	if code, _, raw := doRequest(t, h, "POST", "/delete",
+		`{"scope":"posts","seq":2}`); code != 200 {
+		t.Fatalf("/delete by-seq: code=%d body=%s", code, raw)
+	}
+	// (3) delete miss — must NOT emit.
+	if code, _, _ := doRequest(t, h, "POST", "/delete",
+		`{"scope":"posts","id":"nope"}`); code != 200 {
+		t.Fatalf("/delete miss: code=%d want 200 (miss is not an error)", code)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 4 { // 2 seeds + 2 deletes (miss skipped)
+		t.Fatalf("after deletes: _events count=%d want 4 (2 seeds + 2 deletes, miss must not emit)", count)
+	}
+
+	byID, _ := items[2]["payload"].(map[string]interface{})
+	if byID["op"] != "delete" || byID["id"] != "a" {
+		t.Errorf("by-id delete envelope wrong: %v", byID)
+	}
+	if _, hasSeq := byID["seq"]; hasSeq {
+		t.Errorf("by-id delete envelope must omit seq (omitempty); got %v", byID["seq"])
+	}
+	if _, hasPayload := byID["payload"]; hasPayload {
+		t.Errorf("delete envelope must not carry payload; got %v", byID["payload"])
+	}
+	bySeq, _ := items[3]["payload"].(map[string]interface{})
+	if bySeq["op"] != "delete" {
+		t.Errorf("by-seq delete op=%v want delete", bySeq["op"])
+	}
+	if bySeq["seq"] != float64(2) {
+		t.Errorf("by-seq delete seq=%v want 2", bySeq["seq"])
+	}
+	if _, hasID := bySeq["id"]; hasID {
+		t.Errorf("by-seq delete envelope must omit id (omitempty); got %v", bySeq["id"])
+	}
+}
+
+// /delete_up_to auto-populate: envelope carries scope + max_seq.
+// Hit emits one event; a no-op cursor (max_seq below any stored item)
+// does NOT emit.
+func TestEvents_AutoPopulate_DeleteUpTo(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Seed 5 items in "posts" — they get seq 1..5.
+	for i := 0; i < 5; i++ {
+		body := fmt.Sprintf(`{"scope":"posts","payload":{"v":%d}}`, i)
+		if code, _, raw := doRequest(t, h, "POST", "/append", body); code != 200 {
+			t.Fatalf("seed #%d: code=%d body=%s", i, code, raw)
+		}
+	}
+	baseline, _ := eventsTailCount(t, h)
+	if baseline != 5 {
+		t.Fatalf("after seed: _events count=%d want 5", baseline)
+	}
+
+	// Hit: delete_up_to=3 removes seq 1..3 → 3 items deleted, 1 emit.
+	if code, _, raw := doRequest(t, h, "POST", "/delete_up_to",
+		`{"scope":"posts","max_seq":3}`); code != 200 {
+		t.Fatalf("/delete_up_to hit: code=%d body=%s", code, raw)
+	}
+
+	// No-op: delete_up_to=2 again — items <= 2 are already gone, so 0
+	// deleted; must NOT emit.
+	if code, _, _ := doRequest(t, h, "POST", "/delete_up_to",
+		`{"scope":"posts","max_seq":2}`); code != 200 {
+		t.Fatalf("/delete_up_to no-op: code=%d want 200", code)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 6 { // 5 seeds + 1 effective delete_up_to (no-op skipped)
+		t.Fatalf("after delete_up_to: _events count=%d want 6 (5 seeds + 1 hit, no-op skipped)", count)
+	}
+
+	envelope, _ := items[5]["payload"].(map[string]interface{})
+	if envelope["op"] != "delete_up_to" {
+		t.Errorf("op=%v want delete_up_to", envelope["op"])
+	}
+	if envelope["scope"] != "posts" {
+		t.Errorf("scope=%v want posts", envelope["scope"])
+	}
+	if envelope["max_seq"] != float64(3) {
+		t.Errorf("max_seq=%v want 3 (the cursor, not the count)", envelope["max_seq"])
+	}
+	if _, hasID := envelope["id"]; hasID {
+		t.Errorf("delete_up_to envelope must omit id, got %v", envelope["id"])
+	}
+	if _, hasSeq := envelope["seq"]; hasSeq {
+		t.Errorf("delete_up_to envelope must omit seq (per-item seq is not in scope), got %v", envelope["seq"])
+	}
+	if _, hasPayload := envelope["payload"]; hasPayload {
+		t.Errorf("delete_up_to envelope must not carry payload, got %v", envelope["payload"])
+	}
+}

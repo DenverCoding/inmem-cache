@@ -715,25 +715,49 @@ func (s *Store) updateOne(item Item) (int, error) {
 // deleteOne removes a single item by scope+id or scope+seq. Returns
 // (deleted_count, err); missing scope reports (0, nil) — same miss
 // shape as updateOne. Validator-enforced id-xor-seq invariant.
+//
+// Emits a delete event on hit (count > 0); see updateOne for the
+// action-logging-on-effective-change rationale.
 func (s *Store) deleteOne(scope, id string, seq uint64) (int, error) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return 0, nil
 	}
+	var (
+		deleted int
+		err     error
+	)
 	if id != "" {
-		return buf.deleteByID(id)
+		deleted, err = buf.deleteByID(id)
+	} else {
+		deleted, err = buf.deleteBySeq(seq)
 	}
-	return buf.deleteBySeq(seq)
+	if err != nil {
+		return deleted, err
+	}
+	if deleted > 0 {
+		s.emitDeleteEvent(scope, id, seq)
+	}
+	return deleted, nil
 }
 
 // deleteUpTo removes every item in the scope with seq <= maxSeq.
-// Returns (deleted_count, err); missing scope reports (0, nil).
+// Returns (deleted_count, err); missing scope reports (0, nil). Emits
+// a delete_up_to event on hit (count > 0); a cursor that selects no
+// items is a no-op against cache state and is not emitted.
 func (s *Store) deleteUpTo(scope string, maxSeq uint64) (int, error) {
 	buf, ok := s.getScope(scope)
 	if !ok {
 		return 0, nil
 	}
-	return buf.deleteUpToSeq(maxSeq)
+	deleted, err := buf.deleteUpToSeq(maxSeq)
+	if err != nil {
+		return deleted, err
+	}
+	if deleted > 0 {
+		s.emitDeleteUpToEvent(scope, maxSeq)
+	}
+	return deleted, nil
 }
 
 // head returns up to `limit` oldest items in the scope with seq >
