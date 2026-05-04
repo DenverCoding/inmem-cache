@@ -44,11 +44,23 @@ import (
 
 // StartSubscriber spawns a subscriber goroutine that subscribes to
 // scope, then invokes command + waits for it to exit on every
-// wake-up. Returns a stop function that closes the subscription
-// (which closes the wake-up channel, which exits the goroutine's
-// `for range` loop) — call it during shutdown to tear down the
-// subscriber gracefully. Any in-flight command run finishes before
-// the goroutine returns; stop is graceful, not abortive.
+// wake-up. Returns a stop function that:
+//
+//  1. closes the subscription (which closes the wake-up channel,
+//     which exits the goroutine's `for range` loop), and
+//  2. blocks until the goroutine has fully exited — including any
+//     in-flight `cmd.Run` for the currently-executing command.
+//
+// Step 2 matters for adapter shutdown: a running drain command may
+// still be doing HTTP roundtrips against the cache, so the caller
+// must wait for those to settle before tearing down the server. With
+// the blocking stop the standalone binary can call `stopSubscribers()`
+// before `server.Shutdown` and be sure no orphan curl is left
+// banging on a closed socket.
+//
+// stop is idempotent (Subscribe's unsub is, and reading from a
+// closed `done` channel returns immediately) so it's safe to wire
+// both into a signal-handler AND a `defer` backstop.
 //
 // Errors at start-up:
 //   - empty scope or command -> validation error
@@ -78,6 +90,7 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 		return nil, fmt.Errorf("scopecache: StartSubscriber: subscribe %s: %w", scope, err)
 	}
 
+	done := make(chan struct{})
 	go func() {
 		// No initial pre-subscribe drain: the command handles all reads
 		// itself, and on first wake-up will see whatever has accumulated
@@ -87,12 +100,17 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 		// wake-up, the command won't run until something writes — that's
 		// a deliberate choice: the bridge never reads, never decides,
 		// only forwards.
+		defer close(done)
 		for range ch {
 			runSubscriberCommand(scope, command)
 		}
 	}()
 
-	return unsub, nil
+	stop = func() {
+		unsub()
+		<-done
+	}
+	return stop, nil
 }
 
 // runSubscriberCommand executes the configured command once, blocking

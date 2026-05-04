@@ -300,6 +300,14 @@ func main() {
 	go func() {
 		<-signalCtx.Done()
 		log.Print("scopecache shutting down")
+		// Stop subscribers FIRST, while the HTTP server is still up.
+		// stopSubscribers blocks until each goroutine has finished its
+		// current cmd.Run, so any in-flight drain command completes its
+		// curl roundtrips against a still-listening cache — no orphan
+		// curl ever hits a torn-down socket. unsubscribe is idempotent
+		// (subscribe.go), so the deferred stopSubscribers() at the
+		// outer scope is a safe no-op backstop.
+		stopSubscribers()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
