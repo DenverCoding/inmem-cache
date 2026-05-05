@@ -85,7 +85,13 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 		return nil, errors.New("scopecache: StartSubscriber: command is required")
 	}
 
-	ch, unsub, err := gw.Subscribe(scope)
+	// In-package caller — go directly to *store.Subscribe instead of
+	// the Gateway passthrough. Keeps the rule clean: external callers
+	// reach the cache through *Gateway, internal code reaches *store
+	// directly. Subscribe carries no payload bytes (returns a wake-up
+	// channel), so this bypass also makes explicit that the
+	// gateway_clone.go discipline is by design unrelated to this path.
+	ch, unsub, err := gw.store.Subscribe(scope)
 	if err != nil {
 		return nil, fmt.Errorf("scopecache: StartSubscriber: subscribe %s: %w", scope, err)
 	}
