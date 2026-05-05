@@ -284,6 +284,23 @@ func TestNewStore_DerivesReservedScopeCaps(t *testing.T) {
 			t.Errorf("inboxMaxItemBytes=%d want %d", s.inboxMaxItemBytes, 8<<10)
 		}
 	})
+
+	// When Inbox.MaxItemBytes exceeds MaxItemBytes, eventsMaxItemBytes
+	// must be sized from the inbox cap. Otherwise a successful _inbox
+	// append in EventsModeFull would commit but its event would silently
+	// drop on the events-scope size check — breaking the "every
+	// successful write becomes an event" contract.
+	t.Run("Inbox.MaxItemBytes larger than MaxItemBytes drives eventsMaxItemBytes", func(t *testing.T) {
+		s := newStore(Config{
+			MaxItemBytes: 1 << 10,
+			Inbox:        InboxConfig{MaxItemBytes: 32 << 10},
+		})
+		want := int64(32<<10) + eventsItemEnvelopeOverhead
+		if s.eventsMaxItemBytes != want {
+			t.Errorf("eventsMaxItemBytes=%d want %d (= max(MaxItemBytes, Inbox.MaxItemBytes) + eventsItemEnvelopeOverhead)",
+				s.eventsMaxItemBytes, want)
+		}
+	})
 }
 
 // NewAPI derives the response cap from the store's byte cap rather

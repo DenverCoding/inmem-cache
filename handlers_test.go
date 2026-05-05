@@ -2691,6 +2691,60 @@ func TestReservedScopes_InboxRespectsCustomItemBytes(t *testing.T) {
 	}
 }
 
+// When Inbox.MaxItemBytes is configured LARGER than the global
+// MaxItemBytes — the natural shape for a fan-in scope on top of strict
+// user-scope budgets — the HTTP body cap on /append must not reject a
+// payload that's within the inbox cap before the scope is even known.
+//
+// Pre-fix the body cap was sized from gw.store.maxItemBytes alone, so
+// a 10 KiB POST to _inbox with MaxItemBytes=4 KiB returned 400 at
+// decodeBody even though the validator would accept it (inbox cap =
+// 16 KiB). The Go API path (Gateway.Append) was unaffected — wire-vs-
+// API asymmetry. Post-fix the cap derives from maxItemBytesAnyScope so
+// the largest reserved-scope cap dictates the HTTP guardrail; per-scope
+// rejection still happens in the validator.
+func TestReservedScopes_InboxLargerThanGlobalNotRejectedAtBodyCap(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 1000,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 10,                                             // 1 KiB global
+		Inbox:         InboxConfig{MaxItems: 1000, MaxItemBytes: 32 << 10}, // 32 KiB inbox
+	})
+
+	// 6 KiB string payload. Through approxItemSize this becomes
+	// ~12 KiB stored-bytes (Payload bytes + renderBytes for the JSON
+	// string), so it sits comfortably between the 1 KiB user cap and
+	// the 32 KiB inbox cap.
+	//
+	// At the HTTP body layer the JSON envelope is ~6.1 KiB, which
+	// exceeds singleRequestBytesFor(1 KiB) = 5 KiB pre-fix and fits
+	// within singleRequestBytesFor(32 KiB) = 36 KiB post-fix.
+	bigPayload := strings.Repeat("a", 6<<10)
+
+	// Accept on _inbox: body cap is sized from the largest per-item cap
+	// (the inbox's), validator uses maxItemBytesFor(_inbox) = 32 KiB.
+	body := fmt.Sprintf(`{"scope":"_inbox","id":"big","payload":"%s"}`, bigPayload)
+	code, _, raw := doRequest(t, h, "POST", "/append", body)
+	if code != 200 {
+		t.Fatalf("/append _inbox with 6 KiB payload: code=%d body=%s want 200 (under inbox cap, body-decode must not reject before validator)",
+			code, raw)
+	}
+
+	// Reject on a user scope: body still fits the cap (sized for the
+	// inbox), but the validator's checkItemSize against
+	// maxItemBytesFor(user) = 1 KiB rejects with 400. Confirms the HTTP
+	// guardrail relaxation does NOT bypass the per-scope semantic limit.
+	body = fmt.Sprintf(`{"scope":"user","id":"big","payload":"%s"}`, bigPayload)
+	code, out, raw := doRequest(t, h, "POST", "/append", body)
+	if code != 400 {
+		t.Fatalf("/append user with 6 KiB payload: code=%d body=%s want 400 (over user-scope cap; validator must still gate)",
+			code, raw)
+	}
+	if errMsg, _ := out["error"].(string); !strings.Contains(errMsg, "size") {
+		t.Errorf("expected size-related error, got %q", errMsg)
+	}
+}
+
 // _inbox enforces an operator-tunable per-scope item-count cap that
 // defaults to ScopeMaxItems but can be tuned independently. With a
 // custom small Inbox.MaxItems, /append to _inbox 507s past the cap
@@ -2740,10 +2794,18 @@ func TestReservedScopes_InboxRespectsCustomItemCount(t *testing.T) {
 // sees.
 func TestReservedScopes_EventsDerivedItemBytesCap(t *testing.T) {
 	const globalCap = 8 << 10 // 8 KiB; _events derives globalCap + 1 KiB.
+	// Inbox.MaxItemBytes set BELOW globalCap so the events derivation
+	// max(MaxItemBytes, Inbox.MaxItemBytes) collapses to MaxItemBytes —
+	// otherwise the default 64 KiB inbox cap would dominate and
+	// `_events` would accept much larger payloads than this test
+	// expects. The "Inbox larger than global drives events" case is
+	// covered separately in TestNewStore_DerivesReservedScopeCaps and
+	// TestEvents_AutoPopulate_FullModeNoDropOnLargeInboxWrite.
 	h, _ := newReservedScopesTestHandler(t, Config{
 		ScopeMaxItems: 1000,
 		MaxStoreBytes: 100 << 20,
 		MaxItemBytes:  globalCap,
+		Inbox:         InboxConfig{MaxItemBytes: 1 << 10},
 	})
 
 	// Object payload: `{"d":"<filler>"}` — 8 bytes of JSON framing
@@ -3001,6 +3063,61 @@ func TestEvents_AutoPopulate_Full_Many(t *testing.T) {
 			continue
 		}
 		t.Logf("envelope #%d:\n%s", i, pretty)
+	}
+}
+
+// In EventsModeFull, a successful /append into _inbox with a payload
+// that's larger than the global MaxItemBytes (but within
+// Inbox.MaxItemBytes) must produce a corresponding event in _events
+// — not silently drop it. Pre-fix eventsMaxItemBytes was sized from
+// MaxItemBytes alone, so the event item exceeded eventsMaxItemBytes
+// on its size check, the recursive /append to _events failed, and
+// emitEvent silently bumped eventsDropsTotal. The user's _inbox
+// write committed but downstream drainers never saw it — breaking
+// the "every successful write becomes an event" contract.
+//
+// Repro: MaxItemBytes=1KiB, Inbox.MaxItemBytes=32KiB, ~6KiB string
+// payload. Pre-fix: append commits, eventsDropsTotal=1, _events tail
+// is empty. Post-fix: append commits, eventsDropsTotal=0, _events
+// has the expected envelope.
+func TestEvents_AutoPopulate_FullModeNoDropOnLargeInboxWrite(t *testing.T) {
+	h, api := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 1000,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 10,                                             // 1 KiB global
+		Inbox:         InboxConfig{MaxItems: 1000, MaxItemBytes: 32 << 10}, // 32 KiB inbox
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// 6 KiB payload — same shape as the body-cap test, sized so the
+	// approxItemSize is well within the 32 KiB inbox cap and the
+	// derived events cap.
+	bigPayload := strings.Repeat("a", 6<<10)
+
+	body := fmt.Sprintf(`{"scope":"_inbox","id":"big","payload":"%s"}`, bigPayload)
+	code, _, raw := doRequest(t, h, "POST", "/append", body)
+	if code != 200 {
+		t.Fatalf("/append _inbox with 6 KiB payload: code=%d body=%s want 200", code, raw)
+	}
+
+	if drops := api.store.eventsDropsTotal.Load(); drops != 0 {
+		t.Errorf("eventsDropsTotal=%d want 0 (event for valid _inbox write must not drop)", drops)
+	}
+
+	count, items := eventsTailCount(t, h)
+	if count != 1 {
+		t.Fatalf("_events count=%d want 1 (large _inbox write must produce its event in Full mode)", count)
+	}
+	evtPayload, ok := items[0]["payload"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("event[0].payload not an object: %v", items[0]["payload"])
+	}
+	if evtScope, _ := evtPayload["scope"].(string); evtScope != "_inbox" {
+		t.Errorf("event scope=%q want _inbox", evtScope)
+	}
+	if evtUserPayload, _ := evtPayload["payload"].(string); len(evtUserPayload) != len(bigPayload) {
+		t.Errorf("event nested payload length=%d want %d (must carry the original payload bytes verbatim)",
+			len(evtUserPayload), len(bigPayload))
 	}
 }
 

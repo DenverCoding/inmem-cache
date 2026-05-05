@@ -150,17 +150,24 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 // both reserved scopes and branch on which one fired.
 //
 // ctx is the per-subscriber context owned by StartSubscriber.
-// Cancellation makes exec.CommandContext SIGKILL the running
-// process; cmd.Run returns with a "signal: killed" error. The error
-// is logged like any other failure, then the goroutine sees the
-// closed wake-up channel and exits — bounded by OS kill latency
-// instead of the command's voluntary exit.
+// Cancellation makes the kernel SIGKILL the entire process group
+// (configureProcessGroup wires Setpgid + an override on cmd.Cancel
+// that targets -pid instead of pid) so a script that backgrounds
+// children — `curl ... & wait`, etc. — does not leak orphan
+// descendants when stop() fires. cmd.Run returns with a
+// "signal: killed" or context-cancelled error; the error is logged
+// like any other failure, then the goroutine sees the closed
+// wake-up channel and exits — bounded by OS kill latency instead
+// of the command's voluntary exit. See subscriber_command_unix.go
+// for the rationale; the _other.go fallback degrades to direct-
+// child kill on non-Unix builds.
 func runSubscriberCommand(ctx context.Context, scope, command string) {
 	cmd := exec.CommandContext(ctx, command)
 	cmd.Env = append(os.Environ(), "SCOPECACHE_SCOPE="+scope)
 	cmd.Stdin = nil
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	configureProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {
 		// A non-zero exit, missing executable, signal-kill, or
 		// context-cancel all land here. Log + move on — the next

@@ -34,9 +34,14 @@ type API struct {
 	maxBulkBytes int64
 	// maxSingleBytes is the per-request body cap for single-item
 	// endpoints (/append, /update, /upsert, /delete, /delete_scope,
-	// /delete_up_to, /counter_add). Derived from store.maxItemBytes via
-	// singleRequestBytesFor so the HTTP guardrail sits just above the
-	// semantic item-size limit enforced in the validator.
+	// /delete_up_to, /counter_add). Derived from the store's largest
+	// per-item cap (maxItemBytesAnyScope) via singleRequestBytesFor so
+	// the HTTP guardrail sits just above the semantic item-size limit
+	// enforced in the validator. Using the largest cap (not just the
+	// user-scope one) keeps reserved-scope writes wire-symmetric with
+	// the Go API: an _inbox configured with Inbox.MaxItemBytes >
+	// MaxItemBytes must not be HTTP-rejected at decodeBody for a
+	// payload its semantic validator would have accepted.
 	maxSingleBytes int64
 
 	// maxResponseBytes is the per-response byte cap for /head, /tail —
@@ -69,7 +74,7 @@ func NewAPI(gw *Gateway, _ APIConfig) *API {
 	return &API{
 		store:            gw.store,
 		maxBulkBytes:     bulkRequestBytesFor(gw.store.maxStoreBytes),
-		maxSingleBytes:   singleRequestBytesFor(gw.store.maxItemBytes),
+		maxSingleBytes:   singleRequestBytesFor(gw.store.maxItemBytesAnyScope()),
 		maxResponseBytes: gw.store.maxStoreBytes,
 	}
 }

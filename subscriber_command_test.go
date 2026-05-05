@@ -12,8 +12,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -371,4 +373,112 @@ func TestStartSubscriber_StopReturnsPromptlyOnHungCommand(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("stop() did not return after 5s — context cancellation is not unblocking in-flight cmd.Run")
 	}
+}
+
+// stop() must reap the entire process group, not just the direct child.
+// Pre-fix exec.CommandContext SIGKILL'd only the script that
+// runSubscriberCommand spawned; a script that backgrounds a long-lived
+// child (`sleep 60 & wait`) would have its shell wrapper killed but the
+// sleep would orphan onto PID 1 and keep running indefinitely. The fix
+// (configureProcessGroup) makes Setpgid wrap every subscriber invocation
+// in its own process group and overrides cmd.Cancel so the SIGKILL
+// targets -pid (the whole group).
+//
+// Repro: shell that starts `sleep 60` in the background, writes its PID
+// to a file, then waits. After stop(), assert that file's PID is no
+// longer a live process (kill -0 returns ESRCH). Pre-fix the assertion
+// would fail because the orphan sleep is still running.
+func TestStartSubscriber_StopReapsBackgroundedChildren(t *testing.T) {
+	dir := t.TempDir()
+	cmdPath := filepath.Join(dir, "fork.sh")
+	pidFile := filepath.Join(dir, "child.pid")
+	body := "#!/bin/sh\n" +
+		"sleep 60 &\n" +
+		"echo $! > " + pidFile + "\n" +
+		"wait\n"
+	if err := os.WriteFile(cmdPath, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fork command: %v", err)
+	}
+
+	gw := NewGateway(Config{Events: EventsConfig{Mode: EventsModeFull}})
+	stop, err := gw.StartSubscriber(EventsScopeName, cmdPath)
+	if err != nil {
+		t.Fatalf("StartSubscriber: %v", err)
+	}
+
+	if _, err := gw.Append(Item{Scope: "trigger", Payload: []byte(`"x"`)}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Wait until the script has had time to fork the child and write
+	// its PID. waitFor polls; the file appears within milliseconds in
+	// practice but CI hosts vary.
+	if !waitForSubscriberCommand(2*time.Second, func() bool {
+		data, err := os.ReadFile(pidFile)
+		return err == nil && len(strings.TrimSpace(string(data))) > 0
+	}) {
+		stop()
+		t.Fatal("child PID file never appeared — script did not fork the background process within 2s")
+	}
+
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read pid file: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		t.Fatalf("parse pid %q: %v", string(pidBytes), err)
+	}
+
+	// Sanity: the child must be alive right now. If it isn't, the
+	// orphan-children scenario isn't actually being exercised.
+	if !pidIsRunning(pid) {
+		t.Fatalf("backgrounded child pid=%d not running before stop() — test setup did not reproduce the orphan scenario", pid)
+	}
+
+	stop()
+
+	// After stop(), the group kill should have hit the sleep too. Allow
+	// a short grace window — the kernel needs a moment to deliver the
+	// signal. Killed children become zombies until reparented and
+	// reaped, so the assertion checks /proc state (not kill(pid,0),
+	// which returns success for zombies and would falsely flag the
+	// fix as broken).
+	if !waitForSubscriberCommand(2*time.Second, func() bool {
+		return !pidIsRunning(pid)
+	}) {
+		// Best-effort cleanup so a regressed test run doesn't leave a
+		// 60-second sleep hogging a CI runner.
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Errorf("backgrounded child pid=%d still running 2s after stop() — process group not reaped (orphan-child regression)", pid)
+	}
+}
+
+// pidIsRunning returns true iff /proc/<pid>/status reports a live
+// (non-zombie) process. kill(pid, 0) is unsuitable: the kernel keeps
+// the PID slot until reaping, so an unreaped zombie still answers
+// "alive" via that path even though the process is functionally
+// dead. The orphan-children regression test specifically needs to
+// distinguish "running" from "zombie" because the group-kill fix
+// leaves children as zombies — they are killed but not reaped (PID 1
+// in a Docker container without a tini-style reaper picks them up
+// only on container teardown).
+func pidIsRunning(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		// /proc entry gone -> process fully exited and reaped.
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "State:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[1] == "Z" {
+				return false
+			}
+			return true
+		}
+	}
+	// No State line — be conservative and treat as not-running. In
+	// practice every live /proc/<pid>/status has a State line.
+	return false
 }

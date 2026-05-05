@@ -48,9 +48,18 @@ type store struct {
 	// for the shape rationale (why `_events` has no item-count knob
 	// and `_inbox` has both item-count and item-byte knobs).
 	//
-	//   - eventsMaxItemBytes: MaxItemBytes + eventsItemEnvelopeOverhead.
-	//                         Derived, not a knob — an event entry must
-	//                         always fit the user-write that produced it.
+	//   - eventsMaxItemBytes: max(MaxItemBytes, Inbox.MaxItemBytes) +
+	//                         eventsItemEnvelopeOverhead. Derived, not a
+	//                         knob — an event entry must always fit the
+	//                         user-write that produced it, and `_inbox`
+	//                         can legitimately accept items larger than
+	//                         the global MaxItemBytes (Inbox.MaxItemBytes
+	//                         is independent). Without taking the max,
+	//                         a valid `_inbox` write in EventsModeFull
+	//                         would commit successfully but its event
+	//                         would silently drop on the size check —
+	//                         breaking the "every successful write becomes
+	//                         an event" contract drainers rely on.
 	//   - inboxMaxItems:      Inbox.MaxItems (default = ScopeMaxItems).
 	//                         Operator-tunable independently of the global.
 	//   - inboxMaxItemBytes:  Inbox.MaxItemBytes (default = InboxMaxItemBytes,
@@ -264,6 +273,25 @@ func (s *store) maxItemBytesFor(scope string) int64 {
 	}
 }
 
+// maxItemBytesAnyScope returns the largest per-item cap any scope on
+// this store can accept. Used by NewAPI to size the HTTP single-item
+// body cap so the wire-level guardrail is permissive enough for every
+// destination scope; the scope-aware semantic check (maxItemBytesFor +
+// validator) still catches actual overruns. Without this, an inbox
+// configured with Inbox.MaxItemBytes > MaxItemBytes would produce
+// asymmetric behaviour: Gateway.Append accepts the payload, POST
+// /append rejects it at decodeBody before the scope is even known.
+func (s *store) maxItemBytesAnyScope() int64 {
+	biggest := s.maxItemBytes
+	if s.eventsMaxItemBytes > biggest {
+		biggest = s.eventsMaxItemBytes
+	}
+	if s.inboxMaxItemBytes > biggest {
+		biggest = s.inboxMaxItemBytes
+	}
+	return biggest
+}
+
 // maxItemsFor returns the per-scope item-count cap to install on a
 // freshly-created buffer for scope. Mirrors maxItemBytesFor's
 // per-reserved-scope dispatch, with one extra wrinkle: `_events`
@@ -366,12 +394,22 @@ func (s *store) initReservedScopesLocked() {
 
 func newStore(c Config) *store {
 	c = c.WithDefaults()
+	// The events scope must accommodate any event the cache might emit,
+	// so its per-item cap is sized from the LARGEST upstream cap (user
+	// scopes vs `_inbox`) plus the envelope slack. Default config has
+	// MaxItemBytes (1 MiB) ≥ Inbox.MaxItemBytes (64 KiB) so the max is
+	// usually MaxItemBytes; the inbox branch only matters when an
+	// operator tuned _inbox larger than the global cap.
+	biggestUserCap := c.MaxItemBytes
+	if c.Inbox.MaxItemBytes > biggestUserCap {
+		biggestUserCap = c.Inbox.MaxItemBytes
+	}
 	s := &store{
 		hashSeed:           maphash.MakeSeed(),
 		defaultMaxItems:    c.ScopeMaxItems,
 		maxStoreBytes:      c.MaxStoreBytes,
 		maxItemBytes:       c.MaxItemBytes,
-		eventsMaxItemBytes: addClampedInt64(c.MaxItemBytes, eventsItemEnvelopeOverhead),
+		eventsMaxItemBytes: addClampedInt64(biggestUserCap, eventsItemEnvelopeOverhead),
 		inboxMaxItems:      c.Inbox.MaxItems,
 		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
 		eventsMode:         c.Events.Mode,
