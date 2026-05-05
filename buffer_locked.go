@@ -61,6 +61,26 @@ func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int64) (int64, 
 	return delta, nil
 }
 
+// itemCapExceeded reports whether holding `proposed` items in this
+// scope would violate the per-scope item-count cap. The unbounded
+// sentinel (b.maxItems == 0, set by maxItemsFor for `_events`)
+// disables the check entirely so callers cannot accidentally trip
+// it on scopes whose contract is "no count limit, byte budget only".
+//
+// Centralises the sentinel handling so single-item write paths
+// (appendItem, upsert-create, counter-create) and bulk paths
+// (replaceAll) cannot drift from each other. Single-item callers
+// pass len(b.items) + 1; bulk callers pass the proposed batch size.
+//
+// Lock-agnostic: read of b.maxItems is safe without b.mu because
+// maxItems is set once at buffer construction (newscopeBuffer or
+// initReservedScopes(Locked)) and never reassigned. Callers that
+// also read len(b.items) are still expected to hold b.mu so the
+// (proposed, len) pair is consistent.
+func (b *scopeBuffer) itemCapExceeded(proposed int) bool {
+	return b.maxItems > 0 && proposed > b.maxItems
+}
+
 // payloadAndRenderBytes returns the byte cost approxItemSize attributes
 // to an item's payload-related fields. For a counter item that's the
 // fixed counterCellOverhead (cell heap + worst-case int64 string); for

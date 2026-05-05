@@ -640,6 +640,160 @@ func TestDeleteByID_DoesNotRollbackLastSeq(t *testing.T) {
 	}
 }
 
+// Drain-to-empty via single-item deletes must release the high-
+// watermark backing storage. Pre-fix the items slice's reslice kept
+// cap pinned at the historical max, and Go maps never shrink their
+// bucket arrays on delete() — a write-buffer scope that drained 1k
+// items down to 0 leaked ~100 KiB of capacity until appendItem
+// re-grew it. resetIfEmptyLocked nil's items + maps when len drops
+// to zero so the GC can reclaim everything.
+//
+// Asserts the post-conditions resetIfEmptyLocked promises:
+//   - items slice is nil (cap == 0; no backing array retained)
+//   - bySeq / byID maps are nil
+//   - lastSeq is preserved (monotonic across drain/refill cycles)
+//   - subsequent appendItem still works (lazy-init verified)
+//
+// All four buffer-level cap checks (appendItem, upsertByID create,
+// counterAdd create, replaceAll) must honour the unbounded sentinel
+// (maxItems == 0). Pre-fix only appendItem honoured it; upsert,
+// counter create, and replaceAll all returned *ScopeFullError on a
+// fresh maxItems==0 buffer because their `len(...) >= b.maxItems`
+// check resolved to `0 >= 0` (true) on the very first write.
+//
+// The contract pin matters: `_events` is the production scope created
+// with the sentinel, so the validator currently shields the buggy
+// paths from real traffic (no /upsert /counter_add /warm /rebuild
+// allowed on reserved scopes). Future addons that create their own
+// unbounded scopes — or any code path that drops the validator gate
+// — would have hit a silent ScopeFullError on the first write.
+func TestUnboundedScopeMaxItems_AllWritePathsRespectSentinel(t *testing.T) {
+	t.Run("appendItem", func(t *testing.T) {
+		buf := newscopeBuffer(unboundedScopeMaxItems)
+		for i := 0; i < 10; i++ {
+			if _, err := buf.appendItem(newItem("s", fmt.Sprintf("a-%d", i), nil)); err != nil {
+				t.Fatalf("append #%d on unbounded scope: %v", i, err)
+			}
+		}
+	})
+
+	t.Run("upsertByID create", func(t *testing.T) {
+		buf := newscopeBuffer(unboundedScopeMaxItems)
+		// Fresh buffer + upsert on a brand-new id triggers the
+		// create branch in upsertByID (the path the codex repro hit).
+		_, created, err := buf.upsertByID(newItem("s", "new-id", nil))
+		if err != nil {
+			t.Fatalf("upsert create on unbounded scope: %v", err)
+		}
+		if !created {
+			t.Errorf("upsert created=false, want true (fresh id on empty buffer)")
+		}
+	})
+
+	t.Run("counterAdd create", func(t *testing.T) {
+		buf := newscopeBuffer(unboundedScopeMaxItems)
+		// counterAdd's create branch also runs the cap check before
+		// allocating the cell.
+		_, created, err := buf.counterAdd("s", "ctr-1", 5)
+		if err != nil {
+			t.Fatalf("counterAdd create on unbounded scope: %v", err)
+		}
+		if !created {
+			t.Errorf("counterAdd created=false, want true")
+		}
+	})
+
+	t.Run("replaceAll", func(t *testing.T) {
+		buf := newscopeBuffer(unboundedScopeMaxItems)
+		// Any non-trivial batch must be accepted on an unbounded
+		// scope. A 50-item replace on a fresh maxItems==0 buffer
+		// pre-fix returned ScopeFullError because `50 > 0` was true.
+		batch := make([]Item, 50)
+		for i := range batch {
+			batch[i] = newItem("s", fmt.Sprintf("r-%d", i), nil)
+		}
+		if _, err := buf.replaceAll(batch); err != nil {
+			t.Fatalf("replaceAll on unbounded scope: %v", err)
+		}
+		if got := len(buf.items); got != 50 {
+			t.Errorf("after replaceAll: items=%d want 50", got)
+		}
+	})
+}
+
+func TestDeleteByID_DrainToEmptyReleasesBacking(t *testing.T) {
+	buf := newscopeBuffer(10_000)
+	const N = 1000
+	for i := 0; i < N; i++ {
+		_, _ = buf.appendItem(newItem("s", fmt.Sprintf("id-%d", i), nil))
+	}
+	if cap(buf.items) < N {
+		t.Fatalf("setup: cap(items)=%d expected at least %d", cap(buf.items), N)
+	}
+	preDrainLastSeq := buf.lastSeq
+
+	for i := 0; i < N; i++ {
+		if n, _ := buf.deleteByID(fmt.Sprintf("id-%d", i)); n != 1 {
+			t.Fatalf("delete id-%d: n=%d want 1", i, n)
+		}
+	}
+
+	if cap(buf.items) != 0 {
+		t.Errorf("cap(items)=%d after drain-to-empty, want 0 (backing array not released)", cap(buf.items))
+	}
+	if buf.items != nil {
+		t.Errorf("items slice = %v, want nil", buf.items)
+	}
+	if buf.bySeq != nil {
+		t.Errorf("bySeq = %v, want nil (map buckets not released)", buf.bySeq)
+	}
+	if buf.byID != nil {
+		t.Errorf("byID = %v, want nil (map buckets not released)", buf.byID)
+	}
+	if buf.lastSeq != preDrainLastSeq {
+		t.Errorf("lastSeq=%d, want %d (cursor must not regress on drain)", buf.lastSeq, preDrainLastSeq)
+	}
+	if buf.idKeyBytes != 0 {
+		t.Errorf("idKeyBytes=%d after drain, want 0", buf.idKeyBytes)
+	}
+
+	// appendItem must lazy-init the slice and maps after a reset.
+	next, err := buf.appendItem(newItem("s", "after-drain", nil))
+	if err != nil {
+		t.Fatalf("appendItem after drain: %v", err)
+	}
+	if next.Seq <= preDrainLastSeq {
+		t.Errorf("post-drain append seq=%d, want > %d (cursor regressed)", next.Seq, preDrainLastSeq)
+	}
+}
+
+// deleteUpToSeq draining everything must also nil the maps. The items
+// slice is already replaced by `rest := make(...)` in the existing
+// code; the map-side leak is what resetIfEmptyLocked closes here.
+func TestDeleteUpToSeq_DrainToEmptyReleasesBacking(t *testing.T) {
+	buf := newscopeBuffer(10_000)
+	const N = 1000
+	var lastSeq uint64
+	for i := 0; i < N; i++ {
+		it, _ := buf.appendItem(newItem("s", fmt.Sprintf("id-%d", i), nil))
+		lastSeq = it.Seq
+	}
+
+	if n, _ := buf.deleteUpToSeq(lastSeq); n != N {
+		t.Fatalf("deleteUpToSeq: n=%d want %d", n, N)
+	}
+
+	if cap(buf.items) != 0 {
+		t.Errorf("cap(items)=%d after drain, want 0", cap(buf.items))
+	}
+	if buf.bySeq != nil {
+		t.Errorf("bySeq = %v, want nil", buf.bySeq)
+	}
+	if buf.byID != nil {
+		t.Errorf("byID = %v, want nil", buf.byID)
+	}
+}
+
 // --- scopeBuffer.deleteBySeq --------------------------------------------------
 
 func TestDeleteBySeq_Hit(t *testing.T) {

@@ -215,7 +215,9 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 }
 
 func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
-	if len(items) > b.maxItems {
+	// Sentinel-aware (maxItems == 0 disables the check); see
+	// itemCapExceeded in buffer_locked.go.
+	if b.itemCapExceeded(len(items)) {
 		return nil, &ScopeFullError{Count: len(items), Cap: b.maxItems}
 	}
 	r, err := buildReplacementState(items)

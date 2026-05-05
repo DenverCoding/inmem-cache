@@ -221,8 +221,9 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 		return newValue, false, nil
 	}
 
-	// Create: brand-new counter item.
-	if len(b.items) >= b.maxItems {
+	// Create: brand-new counter item. Sentinel-aware (maxItems == 0
+	// disables the check); see itemCapExceeded in buffer_locked.go.
+	if b.itemCapExceeded(len(b.items) + 1) {
 		return 0, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
 

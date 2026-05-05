@@ -62,6 +62,43 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 		b.store.bumpLastWriteTS(now)
 	}
 	b.lastWriteTS = now
+	b.resetIfEmptyLocked()
+}
+
+// resetIfEmptyLocked drops the high-watermark backing storage when a
+// scope has just been drained to zero items. The reslice in
+// deleteIndexLocked (b.items = b.items[:len-1]) reduces len but not
+// cap, so a scope that briefly held N items keeps the N-element
+// backing array alive after every item has been deleted. The same
+// goes for b.bySeq and b.byID: Go maps don't shrink their bucket
+// arrays on delete().
+//
+// In the write-buffer pattern (drain-and-refill on a long-lived
+// scope) the wasted capacity sits idle between bursts. At ~104 bytes
+// per Item slot plus map-bucket overhead, a 1k-item scope that
+// drains to empty leaks ~100 KiB until appendItem grows it again.
+//
+// nil-ing is safe because appendItem (buffer_write.go) lazy-inits
+// both maps on first write after a reset, and append() on a nil
+// slice grows naturally. b.lastSeq is intentionally NOT reset —
+// the seq cursor must remain monotonic across drain/refill cycles
+// so downstream consumers tracking the cursor cannot see a regression
+// and a fresh /append after the reset still produces a strictly-
+// greater seq than anything observers may have remembered.
+//
+// PRECONDITION: caller holds b.mu and the delete that produced the
+// empty state has already updated b.bytes / counters.
+func (b *scopeBuffer) resetIfEmptyLocked() {
+	if len(b.items) != 0 {
+		return
+	}
+	b.items = nil
+	b.bySeq = nil
+	b.byID = nil
+	// b.idKeyBytes is already zero — every removed item subtracted its
+	// id length on delete; an explicit assignment here is belt-and-
+	// braces against future delete-paths that forget the subtract.
+	b.idKeyBytes = 0
 }
 
 func (b *scopeBuffer) deleteByID(id string) (int, error) {
@@ -158,5 +195,11 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 		b.store.bumpLastWriteTS(now)
 	}
 	b.lastWriteTS = now
+	// `rest` already replaced b.items with a fresh backing array, so
+	// the items-slice high-watermark is freed regardless of len. The
+	// reset still matters for the maps: their bucket arrays do not
+	// shrink on delete(), and resetIfEmptyLocked nil's them when this
+	// drain emptied the scope.
+	b.resetIfEmptyLocked()
 	return idx, nil
 }

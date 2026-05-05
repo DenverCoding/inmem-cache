@@ -42,10 +42,10 @@ func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 	}
 
 	// maxItems == 0 is the unboundedScopeMaxItems sentinel — only the
-	// reserved `_events` scope is created with it; every user scope gets a
-	// positive cap installed at create time. See buffer.go's maxItems
-	// comment for the rationale.
-	if b.maxItems > 0 && len(b.items) >= b.maxItems {
+	// reserved `_events` scope is created with it; every user scope
+	// gets a positive cap installed at create time. itemCapExceeded
+	// honours the sentinel; see buffer_locked.go for the rationale.
+	if b.itemCapExceeded(len(b.items) + 1) {
 		return Item{}, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
 
@@ -119,7 +119,9 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		return updated, false, nil
 	}
 
-	if len(b.items) >= b.maxItems {
+	// Sentinel-aware (maxItems == 0 disables the check); see
+	// itemCapExceeded.
+	if b.itemCapExceeded(len(b.items) + 1) {
 		return Item{}, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
 
