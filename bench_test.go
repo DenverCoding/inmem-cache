@@ -193,7 +193,7 @@ func benchAppendWithEventsMode(b *testing.B, mode EventsMode) {
 // totalBytes, *scopeBuffer alloc + map header alloc, and fmt formatting.
 func BenchmarkStore_AppendUniqueScope_Sequential(b *testing.B) {
 	store := newStore(Config{
-		ScopeMaxItems: 50_000,    // matches phase4 Caddyfile setting
+		ScopeMaxItems: 50_000,    // matches harness Caddyfile setting
 		MaxStoreBytes: 128 << 30, // 128 GiB; b.N is open-ended so don't risk a 507 mid-bench
 		MaxItemBytes:  1 << 20,
 	})
