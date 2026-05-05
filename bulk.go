@@ -2,66 +2,7 @@ package scopecache
 
 import (
 	"fmt"
-	"strings"
 )
-
-// deleteGuardedTenant removes every scope under the prefix
-// `_guarded:<capabilityID>:` and releases the bytes those scopes occupy
-// (per-item bytes plus the per-scope overhead reserved at create time).
-// Mirrors deleteScope's detach-then-account discipline so a concurrent
-// in-flight write reaching a stale buf pointer either commits before
-// detach (bytes counted in scopeBytes) or wakes up after and returns
-// *ScopeDetachedError. Locks every shard for the whole sweep — same
-// lock discipline as wipe(); revocation is rare, traffic is hot, and
-// the alternative (per-shard locking with separate sweeps) would let a
-// concurrent /append create a fresh tenant scope on a shard the sweep
-// has already passed, leaving the tenant partially deleted.
-//
-// The capabilityID is treated as an opaque string (the handler enforces
-// the 64-hex-char shape upstream); the store concatenates the literal
-// prefix and matches with strings.HasPrefix. No validation here.
-func (s *store) deleteGuardedTenant(capabilityID string) (int, int, int64) {
-	prefix := "_guarded:" + capabilityID + ":"
-
-	s.lockAllShards()
-	defer s.unlockAllShards()
-
-	var (
-		deletedScopes int
-		deletedItems  int
-		freedBytes    int64
-	)
-
-	for i := range s.shards {
-		sh := &s.shards[i]
-		for scope, buf := range sh.scopes {
-			if !strings.HasPrefix(scope, prefix) {
-				continue
-			}
-			buf.mu.Lock()
-			itemCount := len(buf.items)
-			deletedItems += itemCount
-			scopeBytes := buf.bytes
-			delete(sh.scopes, scope)
-			// Combined into one Add so observers never see a transient state
-			// with one released and the other still charged. Same shape as
-			// deleteScope: item bytes + per-scope overhead, in lockstep.
-			s.totalBytes.Add(-(scopeBytes + scopeBufferOverhead))
-			s.totalItems.Add(-int64(itemCount))
-			freedBytes += scopeBytes + scopeBufferOverhead
-			buf.detached = true
-			buf.store = nil
-			buf.mu.Unlock()
-			deletedScopes++
-		}
-	}
-
-	s.scopeCount.Add(-int64(deletedScopes))
-	if deletedScopes > 0 {
-		s.bumpLastWriteTS(nowUnixMicro())
-	}
-	return deletedScopes, deletedItems, freedBytes
-}
 
 // wipe removes every scope from the store and resets the byte counter to
 // zero in one atomic step. Each scope buffer is detached under its own

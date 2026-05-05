@@ -451,10 +451,6 @@ func nowUnixMicro() int64 {
 	return time.Now().UnixMicro()
 }
 
-func unixDay(tsMicro int64) int64 {
-	return tsMicro / 86400000000
-}
-
 func approxItemSize(item Item) int64 {
 	var n int64
 	n += 32

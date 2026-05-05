@@ -19,9 +19,9 @@ import (
 //     scopeBuffer method may touch with b.mu held is the atomic
 //     counter (b.store.totalBytes.Add / b.store.reserveBytes); those
 //     take no locks. Reverse-direction locking (buf → shard) would
-//     deadlock against deleteScope, replaceScopes, wipe, rebuildAll
-//     and deleteGuardedTenant, all of which take shard.mu first and
-//     then individual buf.mu's.
+//     deadlock against deleteScope, replaceScopes, wipe and
+//     rebuildAll, all of which take shard.mu first and then
+//     individual buf.mu's.
 //
 //  3. Read-path bookkeeping (recordRead) runs without taking b.mu —
 //     it bumps the readCountTotal and lastAccessTS atomics directly.
