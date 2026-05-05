@@ -1,22 +1,27 @@
 name: Sync caddymodule tag with root tag
 
-# When a root tag (e.g. v0.7.2) is pushed, mirror it to a matching
-# caddymodule/v0.7.2 tag whose go.mod pins the new core version. That
-# way `xcaddy --with .../caddymodule@latest` always resolves to a
-# caddymodule release that ships the latest core.
+# Recovery-path workflow. The normal release flow lives in
+# scripts/release.sh, which does the caddymodule bump + dual-tag
+# atomically from the developer's machine. That script eliminated
+# the previous "auto-trigger on push tag → bot lands a commit on
+# origin → local main goes one commit behind → next push needs
+# pull --rebase" friction loop.
 #
-# Two trigger modes:
-#   - Automatic on every `v*` tag push (the normal release flow).
-#   - Manual via `workflow_dispatch` with a `tag` input — recovery
-#     path when the automatic run failed (proxy race, transient
-#     runner issue) and the user wants to re-run without re-pushing
-#     the tag. Go to Actions tab → "Sync caddymodule tag with root
-#     tag" → "Run workflow" → enter e.g. v0.8.2.
+# This workflow is therefore workflow_dispatch only: it fires only
+# when an operator explicitly runs it from the Actions tab. Use
+# it when:
+#   - Someone (or some automation) pushed a root vX.Y.Z tag
+#     without using scripts/release.sh and the caddymodule never
+#     got bumped, leaving xcaddy --with @latest resolving to a
+#     caddymodule that pins a stale core.
+#   - The release script failed midway after pushing the root tag
+#     but before pushing the caddymodule tag, and you want a
+#     remote re-attempt instead of re-running the script locally.
+#
+# To trigger: Actions tab → "Sync caddymodule tag with root tag" →
+# "Run workflow" → enter e.g. v0.8.2.
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -27,11 +32,10 @@ on:
 permissions:
   contents: write
 
-# Resolve the effective tag name once at job level so both the
-# auto-run path (github.ref_name) and the manual-dispatch path
-# (inputs.tag) use the same variable downstream.
+# Always sourced from the manual-dispatch input now that auto-run on
+# push has been removed.
 env:
-  TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+  TAG_NAME: ${{ github.event.inputs.tag }}
 
 jobs:
   sync:
