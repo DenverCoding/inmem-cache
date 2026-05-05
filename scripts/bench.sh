@@ -8,23 +8,56 @@
 # the median across runs.
 #
 # Quickstart:
-#   ./bench.sh v0.7.10 append-unique
+#   ./bench.sh                                  # main, all 6 tests
+#   ./bench.sh v0.8.0                           # v0.8.0, all 6 tests
+#   ./bench.sh main get-seq                     # single test
+#   ./bench.sh main append-same e-full          # single test, events full
 #
 # Modes:
-#   get             GET /get cycling through ids (item-1..item-50000)
-#                   in a 50k-item scope. Hits b.byID map.
-#   get-seq         GET /get on a RANDOM seq in 1..50000 in the same
-#                   50k-item scope. Hits b.bySeq map. Diff against
-#                   `get` shows whether id-vs-seq lookup costs differ
-#                   on the host's cache hierarchy.
-#   append-unique   POST /append with a fresh unique scope per request.
-#                   Stresses scope-create + lazy-init paths.
-#   append-same     POST /append all into one scope ("single"). Stresses
-#                   the per-scope buf.mu under high write concurrency.
+#   all                  Default if no mode given. Runs the 6-test sweep:
+#                        get-seq, get, append-unique, append-same,
+#                        append-same-e-not, append-same-e-full. Single
+#                        combined summary table at the end.
+#   get                  GET /get cycling through ids (item-1..item-50000)
+#                        in a 50k-item scope. Hits b.byID map.
+#   get-seq              GET /get on a RANDOM seq in 1..50000 in the same
+#                        50k-item scope. Hits b.bySeq map. Diff against
+#                        `get` shows whether id-vs-seq lookup costs differ
+#                        on the host's cache hierarchy.
+#   append-unique        POST /append with a fresh unique scope per request.
+#                        Stresses scope-create + lazy-init paths.
+#   append-same          POST /append all into one scope ("single"). Stresses
+#                        the per-scope buf.mu under high write concurrency.
+#   append-same-e-not    Like append-same, but with events_mode=notify
+#                        baked in. Measures the wakeup-only events overhead
+#                        on the most contended write path.
+#   append-same-e-full   Like append-same, but with events_mode=full baked
+#                        in. Measures the full _events auto-populate cost
+#                        on the same write path.
 #
-# Each run uses:
-#   wrk    -t2 -c32 -d3s --latency --timeout 2s, cpuset 0-3
-#   server caddyscope, cpuset 4-31
+# wrk load (hardcoded; saturation regime matched to the VPS-shaped server):
+#   -t50 -c1000 -d3s --latency --timeout 2s
+#   Per-knob env-var overrides exist for one-off experiments:
+#   WRK_THREADS, WRK_CONNECTIONS, WRK_DURATION, RUNS.
+#
+# Events (optional last arg; e-off if omitted):
+#   e-off     events_mode off    (Events.Mode zero-value)
+#   e-not     events_mode notify (wakeup-only)
+#   e-full    events_mode full   (auto-populate _events with envelopes)
+#   The events arg is IGNORED for *-e-not / *-e-full modes — those carry
+#   their own events_mode in the mode name.
+#
+# Version resolution:
+#   <version> can be any git ref (tag, branch, sha). For directory
+#   names the script resolves it to the closest reachable tag, so
+#   `main` becomes `v0.8.0` (or whatever the latest tag is) — the
+#   filename always identifies the actual release, not the branch.
+#
+# Server runs on cpuset 4-12 (~9 cores), wrk on cpuset 0-3,
+# server memory capped at 16 GiB. Hardcoded; this combo gave the
+# best throughput on the dev host (Windows + WSL2 + Docker Desktop)
+# during pre-v1.0 hardening. Adjust SERVER_CPUSET below if your
+# host has different topology.
 #
 # CPU pinning rationale: putting wrk and the server on disjoint cores
 # avoids the load generator stealing cycles from the system under
@@ -42,9 +75,17 @@
 # Output:
 #   - Per-run line: rps, p50, p99, non-2xx count, timeout count, and
 #     a breakdown of any non-200 status codes (from a Lua hook).
-#   - Median rps/p50/p99 across the 5 runs.
-#   - Totals for non-2xx, timeouts, and socket errors across all runs.
-#   - CSV at bench-results/<version>-<mode>-<timestamp>/results.csv
+#   - Per-test summary row in markdown-table shape with the columns:
+#         | Mode | RPS | p50 | p99 | Timeouts | Errors |
+#     RPS / p50 / p99 are medians across the 5 runs. Timeouts is the
+#     total count over all runs (each is a wrk request that exceeded
+#     the 2s timeout). Errors is the total non-2xx responses + wrk
+#     socket-errors (connect / read / write) over all runs. The row
+#     is paste-ready into _phase4/CLAUDE.md per-version notes.
+#   - In `all` mode: each of the 6 sub-runs prints its own summary,
+#     followed by a single combined 6-row table at the end.
+#   - CSV per sub-run at
+#     bench-results/<resolved-version>-<mode>[-<events>]-<ts>/results.csv
 #
 # Requirements:
 #   - bash, git, curl, awk, sed
@@ -60,54 +101,146 @@
 
 set -uo pipefail
 
-VERSION="${1:-}"
-MODE="${2:-}"
+# --- arg parsing ---
+case "${1:-}" in
+    -h|--help)
+        cat <<USAGE
+usage: $0 [version] [mode] [events]
+  [version]   git tag/branch (default: main)
+  [mode]      all | get | get-seq | append-unique | append-same
+              | append-same-e-not | append-same-e-full
+              (default: all = sweep of 6 tests in one shot)
+  [events]    e-off | e-not | e-full (default: e-off; ignored for
+              *-e-not / *-e-full modes which carry their own)
 
-if [[ -z "$VERSION" || -z "$MODE" ]]; then
-    cat <<USAGE
-usage: $0 <version> <mode>
-  <version>  git tag/branch (e.g. v0.7.10)
-  <mode>     get | get-seq | append-unique | append-same
+  wrk load is hardcoded to -t50 -c1000 -d3s (saturation regime,
+  matched to the VPS-shaped server cpuset 4-12). Per-knob env-var
+  overrides still work: WRK_THREADS, WRK_CONNECTIONS, WRK_DURATION,
+  RUNS.
+
+  Examples:
+    $0                                    # main, all 6 tests
+    $0 v0.8.0                             # v0.8.0, all 6 tests
+    $0 main get-seq                       # single test
+    $0 main append-same e-full            # single test, events full
 USAGE
-    exit 2
-fi
+        exit 0
+        ;;
+esac
+
+VERSION="${1:-main}"
+shift || true
+
+# Mode defaults to "all" (the 6-test sweep).
+MODE="${1:-all}"
+shift || true
+
+# Optional events arg (e-off | e-not | e-full). Default e-off.
+EVENTS_ARG="${1:-e-off}"
 
 case "$MODE" in
-    get|get-seq|append-unique|append-same) ;;
-    *) echo "invalid mode: $MODE (expected: get | get-seq | append-unique | append-same)"; exit 2 ;;
+    all|get|get-seq|append-unique|append-same|append-same-e-not|append-same-e-full) ;;
+    *) echo "invalid mode: $MODE"; exit 2 ;;
 esac
+
+# For modes with events suffix, force EVENTS_MODE/EVENTS_ARG and
+# strip the suffix into BASE_MODE for the Lua/URL picker. For plain
+# modes, BASE_MODE == MODE and events stays from the positional arg.
+case "$MODE" in
+    *-e-not)
+        EVENTS_MODE="notify"
+        EVENTS_ARG="e-not"
+        BASE_MODE="${MODE%-e-not}"
+        ;;
+    *-e-full)
+        EVENTS_MODE="full"
+        EVENTS_ARG="e-full"
+        BASE_MODE="${MODE%-e-full}"
+        ;;
+    *)
+        BASE_MODE="$MODE"
+        # Translate events arg to canonical Caddyfile value.
+        case "$EVENTS_ARG" in
+            e-off)  EVENTS_MODE="off" ;;
+            e-not)  EVENTS_MODE="notify" ;;
+            e-full) EVENTS_MODE="full" ;;
+            *) echo "invalid events arg: $EVENTS_ARG (expected: e-off | e-not | e-full)"; exit 2 ;;
+        esac
+        ;;
+esac
+
+# wrk load is hardcoded to saturate the VPS-shaped server (cpuset
+# 4-12, ~9 cores). Per-knob env-var overrides still win
+# (RUNS / WRK_THREADS / WRK_CONNECTIONS / WRK_DURATION).
+PRESET_THREADS=50
+PRESET_CONNECTIONS=1000
+PRESET_DURATION=3s
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TS="$(date +%Y%m%d-%H%M%S)"
 
-# Optional: inject an events_mode line into the Caddyfile's
-# scopecache block. Empty (default) leaves Events.Mode at its
-# Off zero-value, matching pre-v0.7.24 behaviour. Used to A/B
-# the auto-populate hot path against the same workload with
-# events disabled. Defined before RESULTS_DIR so the dir-name
-# encoding can read it under set -u.
-EVENTS_MODE="${EVENTS_MODE:-}"
-case "$EVENTS_MODE" in
-    ""|off|notify|full) ;;
-    *) echo "invalid EVENTS_MODE: $EVENTS_MODE (expected: off | notify | full | empty)"; exit 2 ;;
-esac
+# Resolve <version> to the closest reachable git tag so dir names
+# always identify the actual release ("main" → "v0.8.0", etc.).
+# Fallback to the input string if no tag is reachable (e.g. detached
+# branch with no ancestor tag).
+TARGET_SHA="$(git -C "$REPO_ROOT" rev-parse "$VERSION" 2>/dev/null || true)"
+if [[ -n "$TARGET_SHA" ]]; then
+    RESOLVED_VERSION="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 "$TARGET_SHA" 2>/dev/null || echo "$VERSION")"
+else
+    RESOLVED_VERSION="$VERSION"
+fi
 
-# Encode EVENTS_MODE in the results dir name so A/B runs don't
-# clobber each other and you can grep results back later.
-EVENTS_TAG=""
-[[ -n "$EVENTS_MODE" ]] && EVENTS_TAG="-events-$EVENTS_MODE"
-RESULTS_DIR="$REPO_ROOT/bench-results/$VERSION-$MODE$EVENTS_TAG-$TS"
+# --- all-sweep handler ---
+# When MODE=all, sub-invoke this script for each of the 6 canonical
+# tests, collect summary rows via a shared file, then print one
+# combined table. Sub-invocations also stream their own per-run
+# output so progress is visible.
+if [[ "$MODE" == "all" ]]; then
+    SWEEP_MODES=(get-seq get append-unique append-same append-same-e-not append-same-e-full)
+    SWEEP_TMP="$(mktemp -d)"
+    SWEEP_FILE="$SWEEP_TMP/summary.txt"
+    : > "$SWEEP_FILE"
+
+    for m in "${SWEEP_MODES[@]}"; do
+        ALL_SWEEP_SUMMARY="$SWEEP_FILE" bash "$0" "$VERSION" "$m"
+    done
+
+    echo
+    echo "================ combined sweep summary ================"
+    printf '  | %-19s | %-8s | %-8s | %-8s | %-8s | %-6s |\n' \
+        "Mode" "RPS" "p50" "p99" "Timeouts" "Errors"
+    printf '  |%s|%s|%s|%s|%s|%s|\n' \
+        "---------------------" "----------" "----------" "----------" "----------" "--------"
+    cat "$SWEEP_FILE"
+    echo
+    echo "  version: $RESOLVED_VERSION (input: $VERSION)"
+    echo "  config:  wrk -t50 -c1000 -d3s, server cpuset 4-12, --memory=16g"
+    rm -rf "$SWEEP_TMP"
+    exit 0
+fi
+
+# Mode segment in dir name (events bakes in via -e-not/-e-full
+# suffixed modes; for plain modes append events arg only when
+# non-default to avoid noisy dir names).
+case "$MODE" in
+    *-e-not|*-e-full) DIR_EVENTS="" ;;
+    *)
+        if [[ "$EVENTS_ARG" == "e-off" ]]; then DIR_EVENTS="";
+        else DIR_EVENTS="-$EVENTS_ARG"; fi
+        ;;
+esac
+RESULTS_DIR="$REPO_ROOT/bench-results/$RESOLVED_VERSION-$MODE$DIR_EVENTS-$TS"
 mkdir -p "$RESULTS_DIR"
 
 CONTAINER="scopecache-bench"
 NETWORK="scopecache-bench"
 PORT=8084
 WRK_CPUSET="0-3"
-SERVER_CPUSET="4-31"
+SERVER_CPUSET="4-12"
 RUNS="${RUNS:-5}"
-WRK_THREADS="${WRK_THREADS:-2}"
-WRK_CONNECTIONS="${WRK_CONNECTIONS:-32}"
-WRK_DURATION="${WRK_DURATION:-3s}"
+WRK_THREADS="${WRK_THREADS:-$PRESET_THREADS}"
+WRK_CONNECTIONS="${WRK_CONNECTIONS:-$PRESET_CONNECTIONS}"
+WRK_DURATION="${WRK_DURATION:-$PRESET_DURATION}"
 
 # --- ensure dedicated docker network exists ---
 docker network inspect "$NETWORK" >/dev/null 2>&1 \
@@ -148,11 +281,10 @@ CADDYFILE_BACKUP="${CADDYFILE_PATH}.bench-backup"
 [[ ! -f "$CADDYFILE_BACKUP" ]] && \
     cp "$CADDYFILE_PATH" "$CADDYFILE_BACKUP"
 
-# events_mode is injected only when EVENTS_MODE is set, otherwise
-# the line is omitted entirely so the Caddyfile is byte-identical
-# to the pre-EVENTS_MODE shape and A/B baseline runs are honest.
-EVENTS_LINE=""
-[[ -n "$EVENTS_MODE" ]] && EVENTS_LINE="        events_mode     $EVENTS_MODE"
+# EVENTS_MODE is always set (off | notify | full) — write the line
+# unconditionally. `off` is Events.Mode's zero-value so this is
+# functionally identical to omitting the line.
+EVENTS_LINE="        events_mode     $EVENTS_MODE"
 
 cat > "$CADDYFILE_PATH" <<CADDYFILE
 {
@@ -190,6 +322,8 @@ MSYS_NO_PATHCONV=1 docker run -d \
     --name "$CONTAINER" \
     --network "$NETWORK" \
     --cpuset-cpus="$SERVER_CPUSET" \
+    --memory=16g \
+    --memory-swap=16g \
     -p "$PORT:8080" \
     -v "$CADDYFILE_PATH:/etc/caddy/Caddyfile:ro" \
     -e SCOPECACHE_SERVER_SECRET=test-secret \
@@ -395,7 +529,9 @@ median_int() {
 }
 
 # --- pick mode ---
-case "$MODE" in
+# Lua/URL pick uses BASE_MODE so events-suffixed modes
+# (append-same-e-not / -e-full) reuse the plain Lua script.
+case "$BASE_MODE" in
     get)            URLPATH=get;    LUA="$RESULTS_DIR/get.lua" ;;
     get-seq)        URLPATH=get;    LUA="$RESULTS_DIR/get-seq.lua" ;;
     append-unique)  URLPATH=append; LUA="$RESULTS_DIR/append-unique.lua" ;;
@@ -404,14 +540,18 @@ esac
 URL="http://$CONTAINER:8080/$URLPATH"
 
 # --- header ---
+VERSION_DISPLAY="$RESOLVED_VERSION"
+[[ "$RESOLVED_VERSION" != "$VERSION" ]] && VERSION_DISPLAY="$RESOLVED_VERSION (input: $VERSION)"
+
 echo
 echo "================================================================"
 echo "  scopecache bench"
-echo "  version: $VERSION"
+echo "  version: $VERSION_DISPLAY"
 echo "  mode:    $MODE"
+echo "  events:  $EVENTS_ARG ($EVENTS_MODE)"
 echo "  wrk:     -t$WRK_THREADS -c$WRK_CONNECTIONS -d$WRK_DURATION --latency --timeout 2s, cpuset $WRK_CPUSET"
-echo "  server:  caddyscope, cpuset $SERVER_CPUSET"
-echo "  config:  scope_max_items=10M, max_store_mb=8192, max_item_mb=16, events_mode=${EVENTS_MODE:-<unset/off>}"
+echo "  server:  caddyscope, cpuset $SERVER_CPUSET, --memory=16g"
+echo "  config:  scope_max_items=10M, max_store_mb=8192, max_item_mb=16"
 echo "================================================================"
 echo
 
@@ -431,14 +571,14 @@ printf '%s\n' "  ----+----------+----------+-----------+---------+----------+---
 # between runs (a wipe would erase the items we just read). For
 # append-* modes the /wipe-per-run pattern stays — those measure
 # scope-create + write throughput from a clean state.
-if [[ "$MODE" == "get" || "$MODE" == "get-seq" ]]; then
+if [[ "$BASE_MODE" == "get" || "$BASE_MODE" == "get-seq" ]]; then
     wipe
     sleep 1
     seed_for_get
 fi
 
 for run in $(seq 1 "$RUNS"); do
-    if [[ "$MODE" != "get" && "$MODE" != "get-seq" ]]; then
+    if [[ "$BASE_MODE" != "get" && "$BASE_MODE" != "get-seq" ]]; then
         wipe
         sleep 1
     fi
@@ -485,20 +625,32 @@ for run in $(seq 1 "$RUNS"); do
     echo "$run,$rps,$p50_us,$p99_us,$non2xx,$timeouts,\"$bad_detail\"" >> "$RESULTS_CSV"
 done
 
-# --- median + totals ---
+# --- summary row ---
+# Single tabular line in `Preset RPS p50 p99 Timeouts Errors` shape,
+# paste-ready into _phase4/CLAUDE.md. Errors = non-2xx + socket
+# errors combined (timeouts is its own column).
 median_pos=$(( (RUNS + 1) / 2 ))
 median_rps_int=$(printf '%s\n' "${rps_arr[@]}" | awk '{print int($1+0)}' \
     | sort -n | awk -v pos="$median_pos" 'NR==pos{print}')
 median_p50=$(median_int "${p50_arr[@]}")
 median_p99=$(median_int "${p99_arr[@]}")
+total_errors=$(( total_non2xx + total_socket_errors ))
+
+SUMMARY_ROW=$(printf '  | %-19s | %-8s | %-8s | %-8s | %-8s | %-6s |' \
+    "$MODE" "$median_rps_int" "$(fmt_us "$median_p50")" "$(fmt_us "$median_p99")" \
+    "$total_timeouts" "$total_errors")
 
 echo
-printf '  median: rps=%-8s  p50=%-10s  p99=%-10s\n' \
-    "$median_rps_int" "$(fmt_us "$median_p50")" "$(fmt_us "$median_p99")"
-echo
-printf '  totals over %s runs: non-2xx=%s timeouts=%s socket-errors=%s\n' \
-    "$RUNS" \
-    "$total_non2xx" "$total_timeouts" "$total_socket_errors"
+printf '  | %-19s | %-8s | %-8s | %-8s | %-8s | %-6s |\n' \
+    "Mode" "RPS" "p50" "p99" "Timeouts" "Errors"
+printf '  |%s|%s|%s|%s|%s|%s|\n' \
+    "---------------------" "----------" "----------" "----------" "----------" "--------"
+echo "$SUMMARY_ROW"
+
+# When called as part of an all-sweep (parent sets ALL_SWEEP_SUMMARY),
+# also append this row to the shared file so the parent can build the
+# combined table after all 6 sub-runs finish.
+[[ -n "${ALL_SWEEP_SUMMARY:-}" ]] && echo "$SUMMARY_ROW" >> "$ALL_SWEEP_SUMMARY"
 
 echo
 echo "  results: $RESULTS_CSV"
