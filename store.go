@@ -297,6 +297,14 @@ const unboundedScopeMaxItems = 0
 // instead — calling this version under those locks would deadlock on
 // the per-shard write lock acquisition.
 //
+// The byte-budget reservation is unconditional (matching
+// initReservedScopesLocked): Config.WithDefaults clamps MaxStoreBytes
+// to at least reservedScopesOverhead so the reserved scopes always
+// fit. Pre-clamp the conditional reserveBytes gate here silently
+// skipped scope creation when the cap was too small while the post-
+// wipe path bypassed the cap, leaving the two init paths with
+// asymmetric invariants.
+//
 // Boot-time pre-creation is NOT counted as cache activity:
 // s.lastWriteTS is NOT bumped, and the per-scope buf.lastWriteTS is
 // reset to 0. A polling client that uses lastWriteTS as a "have I
@@ -309,16 +317,15 @@ func (s *store) initReservedScopes() {
 		sh := s.shardFor(name)
 		sh.mu.Lock()
 		if _, exists := sh.scopes[name]; !exists {
-			if ok, _, _ := s.reserveBytes(scopeBufferOverhead); ok {
-				buf := s.newscopeBuffer()
-				// Per-scope cap dispatch: _events gets the unbounded
-				// sentinel, _inbox gets the operator-tunable cap.
-				// See maxItemsFor for the rationale.
-				buf.maxItems = s.maxItemsFor(name)
-				buf.lastWriteTS = 0 // bootstrap: no writes yet
-				sh.scopes[name] = buf
-				s.scopeCount.Add(1)
-			}
+			buf := s.newscopeBuffer()
+			// Per-scope cap dispatch: _events gets the unbounded
+			// sentinel, _inbox gets the operator-tunable cap.
+			// See maxItemsFor for the rationale.
+			buf.maxItems = s.maxItemsFor(name)
+			buf.lastWriteTS = 0 // bootstrap: no writes yet
+			sh.scopes[name] = buf
+			s.totalBytes.Add(scopeBufferOverhead)
+			s.scopeCount.Add(1)
 		}
 		sh.mu.Unlock()
 	}

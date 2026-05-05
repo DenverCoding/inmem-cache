@@ -18,9 +18,19 @@ import "encoding/json"
 // body. *API dispatches through *store directly (NewAPI extracts
 // gw.store), so HTTP traffic never pays the cloning cost levied here.
 //
-// Unexported Item fields (renderBytes, counter) do NOT need cloning:
-// outside-package callers cannot reach them, so a shared reference
-// produces no observable hazard.
+// Unexported Item fields (renderBytes, counter) ALSO need clearing at
+// the boundary, despite being unreachable to outside-package callers
+// directly. The hazard is round-tripping: a caller does
+//   item, _ := gw.Get("scope", "id", 0)   // counter item — pointer rides on the Item
+//   item.Scope = "other"; item.Payload = newBytes
+//   _, _ = gw.Append(item)                // counter pointer rides through Append
+// without the clearing, the cache treats the new item as a counter,
+// approxItemSize charges counterCellOverhead instead of len(payload)
+// (under-counting MaxItemBytes), and the next read materialises from
+// the cell — silently returning the original counter value instead of
+// the supplied payload. Output-side clearing alone closes the hazard
+// (callers can never have set these fields themselves), but we clear
+// on input too as belt-and-braces.
 
 // clonePayload returns a fresh copy of p with a newly allocated
 // backing array. nil input → nil output (preserves the "no payload"
@@ -36,10 +46,19 @@ func clonePayload(p json.RawMessage) json.RawMessage {
 }
 
 // cloneItemPayload returns a copy of item with item.Payload replaced
-// by a fresh allocation. Other fields are value types (string, uint64,
-// int64) and don't alias caller-side state.
+// by a fresh allocation and the unexported renderBytes + counter fields
+// cleared. Other exported fields are value types (string, uint64, int64)
+// and don't alias caller-side state.
+//
+// The unexported-field clearing is what prevents the
+// "counter pointer rides on a returned Item back into Append" hazard
+// described in the package-level header above. Cheap (two assignments
+// to nil) and applied in both directions (input + output) so the
+// boundary is symmetric.
 func cloneItemPayload(item Item) Item {
 	item.Payload = clonePayload(item.Payload)
+	item.renderBytes = nil
+	item.counter = nil
 	return item
 }
 
@@ -65,12 +84,15 @@ func cloneGroupedItemPayloads(grouped map[string][]Item) map[string][]Item {
 }
 
 // cloneItemsPayloads rewrites every Item.Payload in items with a fresh
-// allocation. Operates in place — the caller owns items (read paths
-// already return a fresh slice header, so this never mutates cache
-// storage). Returns the same slice for ergonomic chaining.
+// allocation and clears the unexported renderBytes + counter fields.
+// Operates in place — the caller owns items (read paths already return
+// a fresh slice header, so this never mutates cache storage). Returns
+// the same slice for ergonomic chaining.
 func cloneItemsPayloads(items []Item) []Item {
 	for i := range items {
 		items[i].Payload = clonePayload(items[i].Payload)
+		items[i].renderBytes = nil
+		items[i].counter = nil
 	}
 	return items
 }

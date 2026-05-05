@@ -88,9 +88,13 @@ func TestConfig_WithDefaults(t *testing.T) {
 	})
 
 	t.Run("positive fields preserved", func(t *testing.T) {
+		// MaxStoreBytes must be ≥ reservedScopesOverhead, otherwise
+		// WithDefaults' floor clamps upward (covered by the dedicated
+		// floor test below). Pick a value above the floor so this test
+		// exercises only the "preserve positive" branch.
 		in := Config{
 			ScopeMaxItems: 5,
-			MaxStoreBytes: 7,
+			MaxStoreBytes: reservedScopesOverhead + 7,
 			MaxItemBytes:  11,
 			Inbox:         InboxConfig{MaxItems: 13, MaxItemBytes: 17},
 		}
@@ -101,6 +105,28 @@ func TestConfig_WithDefaults(t *testing.T) {
 			got.Inbox.MaxItems != in.Inbox.MaxItems ||
 			got.Inbox.MaxItemBytes != in.Inbox.MaxItemBytes {
 			t.Errorf("positive Config mutated: got %+v want %+v", got, in)
+		}
+	})
+
+	// MaxStoreBytes below reservedScopesOverhead is silently clamped
+	// upward to the overhead floor. Without this, post-wipe
+	// initReservedScopesLocked unconditionally adds reserved-scope
+	// overhead to totalBytes — pushing it past the configured cap and
+	// breaking the "totalBytes ≤ MaxStoreBytes" invariant. The clamp
+	// only fires for absurdly small caps; realistic MB/GB caps pass
+	// through unchanged.
+	t.Run("MaxStoreBytes clamped to reserved-scope floor", func(t *testing.T) {
+		for _, in := range []int64{1, 100, reservedScopesOverhead - 1} {
+			got := Config{MaxStoreBytes: in}.WithDefaults()
+			if got.MaxStoreBytes != reservedScopesOverhead {
+				t.Errorf("MaxStoreBytes=%d → got %d, want %d (floor)",
+					in, got.MaxStoreBytes, reservedScopesOverhead)
+			}
+		}
+		// At the floor: no clamp.
+		got := Config{MaxStoreBytes: reservedScopesOverhead}.WithDefaults()
+		if got.MaxStoreBytes != reservedScopesOverhead {
+			t.Errorf("at-floor MaxStoreBytes mutated: %d", got.MaxStoreBytes)
 		}
 	})
 
@@ -780,14 +806,18 @@ func TestStore_EnsureScope_ReservesOverheadAndRoundTrips(t *testing.T) {
 // silently on nil, so observability counters never block legitimate
 // /guarded calls.
 func TestStore_EnsureScope_NilOnCapExhausted(t *testing.T) {
-	// Cap = 100 bytes, well below scopeBufferOverhead (1024).
-	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
+	// Cap exactly at the reserved-scope floor: WithDefaults' clamp
+	// guarantees this is the smallest legal cap. Boot fills totalBytes
+	// to reservedScopesOverhead, leaving zero room for any user scope
+	// — ensureScope on a non-reserved name must reject without leaking.
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: reservedScopesOverhead, MaxItemBytes: 1 << 20})
 
 	if buf := s.ensureScope("_counters_count_calls"); buf != nil {
-		t.Errorf("ensureScope returned %p with cap below overhead; want nil", buf)
+		t.Errorf("ensureScope returned %p with cap exhausted by reserved scopes; want nil", buf)
 	}
-	if got := s.totalBytes.Load(); got != 0 {
-		t.Errorf("totalBytes=%d after failed ensureScope; want 0 (no leak)", got)
+	if got := s.totalBytes.Load(); got != reservedScopesOverhead {
+		t.Errorf("totalBytes=%d after failed ensureScope; want %d (reserved-scope baseline only, no leak)",
+			got, reservedScopesOverhead)
 	}
 	if _, ok := s.getScope("_counters_count_calls"); ok {
 		t.Errorf("ensureScope leaked the scope into s.scopes despite cap-fail")
@@ -1096,26 +1126,36 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 // reserveBytes is the atomic admission primitive. Positive deltas honor the
 // cap; negative deltas always succeed. A CAS loop isn't directly observable,
 // so this test just validates the return-value contract.
+//
+// The cap is sized as reservedScopesOverhead + 100 so that the test's
+// 100-byte budget for user reserves stays the same after WithDefaults'
+// floor clamp. baseline captures the post-init totalBytes (= reserved-
+// scope overhead) so the on-top arithmetic is independent of how
+// many reserved scopes the cache pre-creates.
 func TestStore_ReserveBytes_RejectsPositiveOverCap(t *testing.T) {
-	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100, MaxItemBytes: 1 << 20})
+	const userBudget int64 = 100
+	cap := reservedScopesOverhead + userBudget
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: cap, MaxItemBytes: 1 << 20})
+	baseline := s.totalBytes.Load()
+
 	if ok, _, _ := s.reserveBytes(80); !ok {
-		t.Fatal("reserve 80/100 should succeed")
+		t.Fatal("reserve 80 within user budget should succeed")
 	}
-	ok, current, cap := s.reserveBytes(30)
+	ok, current, gotCap := s.reserveBytes(30)
 	if ok {
-		t.Fatal("reserve 30 on top of 80 should fail (cap 100)")
+		t.Fatal("reserve 30 on top of 80 should fail (user budget = 100)")
 	}
-	if current != 80 {
-		t.Fatalf("current=%d want 80 (unchanged on failed reserve)", current)
+	if current != baseline+80 {
+		t.Fatalf("current=%d want %d (unchanged on failed reserve)", current, baseline+80)
 	}
-	if cap != 100 {
-		t.Fatalf("cap=%d want 100", cap)
+	if gotCap != cap {
+		t.Fatalf("cap=%d want %d", gotCap, cap)
 	}
 	if ok, _, _ := s.reserveBytes(-50); !ok {
 		t.Fatal("negative reserve (release) must always succeed")
 	}
-	if got := s.totalBytes.Load(); got != 30 {
-		t.Fatalf("totalBytes=%d want 30 after 80 + (-50)", got)
+	if got := s.totalBytes.Load(); got != baseline+30 {
+		t.Fatalf("totalBytes=%d want %d after 80 + (-50)", got, baseline+30)
 	}
 }
 
@@ -1491,6 +1531,60 @@ func TestNewStore_PreCreatesReservedScopes_NonReserved(t *testing.T) {
 		if _, ok := s.getScope(name); ok {
 			t.Errorf("scope %q exists on fresh store; only the reserved names should be pre-created", name)
 		}
+	}
+}
+
+// Boot and post-wipe init paths must agree on which reserved scopes
+// exist and on the resulting totalBytes — and totalBytes must never
+// exceed MaxStoreBytes. Pre-fix the two paths drifted: boot used
+// reserveBytes (silently skipping creation when cap < overhead),
+// while initReservedScopesLocked unconditionally added overhead,
+// pushing totalBytes past the cap. The WithDefaults floor + unified
+// init logic together close that gap.
+//
+// Drives the smallest legal cap (= reservedScopesOverhead, the
+// floor) so the invariants are tight: any drift is observable as a
+// cap violation rather than masked by extra headroom.
+func TestStore_ReservedScopes_BootAndWipeAgreeOnTinyCap(t *testing.T) {
+	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 1, MaxItemBytes: 1 << 20})
+
+	// Floor was applied: cap clamped to reservedScopesOverhead.
+	if s.maxStoreBytes != reservedScopesOverhead {
+		t.Fatalf("maxStoreBytes=%d want %d (clamped to floor)", s.maxStoreBytes, reservedScopesOverhead)
+	}
+
+	// Boot state: reserved scopes exist; totalBytes exactly at floor; no overflow.
+	for _, name := range reservedScopeNames {
+		if _, ok := s.getScope(name); !ok {
+			t.Errorf("reserved scope %q missing at boot under tiny cap", name)
+		}
+	}
+	bootBytes := s.totalBytes.Load()
+	if bootBytes != reservedScopesOverhead {
+		t.Fatalf("boot totalBytes=%d want %d", bootBytes, reservedScopesOverhead)
+	}
+	if bootBytes > s.maxStoreBytes {
+		t.Fatalf("boot totalBytes=%d > maxStoreBytes=%d (cap violated)", bootBytes, s.maxStoreBytes)
+	}
+
+	// Wipe and re-check: same invariants must hold after init via the
+	// post-wipe path (initReservedScopesLocked).
+	s.wipe()
+
+	for _, name := range reservedScopeNames {
+		if _, ok := s.getScope(name); !ok {
+			t.Errorf("reserved scope %q missing after wipe under tiny cap", name)
+		}
+	}
+	wipeBytes := s.totalBytes.Load()
+	if wipeBytes != reservedScopesOverhead {
+		t.Fatalf("post-wipe totalBytes=%d want %d", wipeBytes, reservedScopesOverhead)
+	}
+	if wipeBytes > s.maxStoreBytes {
+		t.Fatalf("post-wipe totalBytes=%d > maxStoreBytes=%d (cap violated)", wipeBytes, s.maxStoreBytes)
+	}
+	if wipeBytes != bootBytes {
+		t.Errorf("boot/wipe totalBytes drift: boot=%d wipe=%d", bootBytes, wipeBytes)
 	}
 }
 

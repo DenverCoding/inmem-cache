@@ -364,3 +364,165 @@ func TestClonePayload_DistinctBackingArray(t *testing.T) {
 		t.Errorf("mutation of clone reached input: in=%q", in)
 	}
 }
+
+// --- Counter-pointer round-trip hazard -------------------------------
+//
+// approxItemSize and the read path both consult the unexported
+// counter pointer on Item. If a counter Item retrieved via Gateway.Get
+// keeps that pointer set, the caller can swap exported fields and pass
+// it back through Append/Upsert/Warm/Rebuild — and the cache will
+// happily store a "counter-shaped" item in the new slot. Result:
+// MaxItemBytes is under-counted (counterCellOverhead replaces
+// len(Payload)) and reads return the original counter value instead
+// of the freshly-supplied payload bytes. Silent data corruption.
+//
+// The fix lives in two places:
+//   - Gateway clone helpers strip counter+renderBytes on every cross
+//     of the public boundary (input + output), so callers can never
+//     observe nor smuggle the unexported state.
+//   - Buffer write paths (insertNewItemLocked, buildReplacementState)
+//     defensively clear counter on entry, covering future internal
+//     callers that might bypass the Gateway clone.
+//
+// The tests below exercise both layers. Each one uses an actual
+// Gateway round-trip (Get → caller-mutate → write → Get) so the
+// observable contract is "caller sees what they wrote", not a more
+// brittle "internal field is zero" assertion.
+
+// Round-trip via Append: the counter pointer must not survive a
+// Get-then-Append cycle that swaps scope/id and replaces the payload.
+func TestGateway_CounterPointerDoesNotCrossBoundary_Append(t *testing.T) {
+	g := newGatewayForCloneTest(t)
+
+	if _, _, err := g.CounterAdd("counters", "c1", 42); err != nil {
+		t.Fatalf("CounterAdd seed: %v", err)
+	}
+
+	// Caller pulls the counter item, swaps it into a fresh
+	// (scope,id) and replaces the payload with a regular JSON object.
+	carrier, hit := g.Get("counters", "c1", 0)
+	if !hit {
+		t.Fatal("Get(counters/c1) miss")
+	}
+	carrier.Scope = "posts"
+	carrier.ID = ""
+	carrier.Seq = 0
+	carrier.Ts = 0
+	carrier.Payload = json.RawMessage(`{"title":"hello"}`)
+
+	committed, err := g.Append(carrier)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	got, hit := g.Get("posts", "", committed.Seq)
+	if !hit {
+		t.Fatal("readback miss")
+	}
+	if string(got.Payload) != `{"title":"hello"}` {
+		t.Errorf("readback payload=%q want {\"title\":\"hello\"}; counter pointer survived the boundary",
+			got.Payload)
+	}
+}
+
+// Round-trip via Upsert (miss-branch): same hazard shape, different
+// write entry. Upsert with no existing item at (scope,id) routes
+// through insertNewItemLocked, exercising the defensive clear there.
+func TestGateway_CounterPointerDoesNotCrossBoundary_Upsert(t *testing.T) {
+	g := newGatewayForCloneTest(t)
+
+	if _, _, err := g.CounterAdd("counters", "c1", 7); err != nil {
+		t.Fatalf("CounterAdd seed: %v", err)
+	}
+
+	carrier, hit := g.Get("counters", "c1", 0)
+	if !hit {
+		t.Fatal("Get miss")
+	}
+	carrier.Scope = "posts"
+	carrier.ID = "p-1"
+	carrier.Seq = 0
+	carrier.Ts = 0
+	carrier.Payload = json.RawMessage(`["a","b","c"]`)
+
+	if _, _, err := g.Upsert(carrier); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	got, hit := g.Get("posts", "p-1", 0)
+	if !hit {
+		t.Fatal("readback miss")
+	}
+	if string(got.Payload) != `["a","b","c"]` {
+		t.Errorf("readback payload=%q want [\"a\",\"b\",\"c\"]; counter pointer survived Upsert",
+			got.Payload)
+	}
+}
+
+// Round-trip via Warm: counter pointer must not survive going through
+// the bulk-replace pipeline either. buildReplacementState clears it
+// defensively, mirroring insertNewItemLocked.
+func TestGateway_CounterPointerDoesNotCrossBoundary_Warm(t *testing.T) {
+	g := newGatewayForCloneTest(t)
+
+	if _, _, err := g.CounterAdd("counters", "c1", 99); err != nil {
+		t.Fatalf("CounterAdd seed: %v", err)
+	}
+
+	carrier, hit := g.Get("counters", "c1", 0)
+	if !hit {
+		t.Fatal("Get miss")
+	}
+	carrier.Scope = "posts"
+	carrier.ID = "p-warmed"
+	carrier.Seq = 0 // /warm rejects client-supplied seq; mirror that here.
+	carrier.Ts = 0
+	carrier.Payload = json.RawMessage(`{"warm":true}`)
+
+	if _, err := g.Warm(map[string][]Item{"posts": {carrier}}); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+
+	got, hit := g.Get("posts", "p-warmed", 0)
+	if !hit {
+		t.Fatal("readback miss")
+	}
+	if string(got.Payload) != `{"warm":true}` {
+		t.Errorf("readback payload=%q want {\"warm\":true}; counter pointer survived Warm",
+			got.Payload)
+	}
+}
+
+// Direct buffer-level test for the defensive clear. Constructs an
+// Item with counter set (impossible from outside the package, but
+// inside-package code paths and future addons living within the
+// package would have access), passes it through insertNewItemLocked,
+// and asserts the stored item has counter cleared.
+func TestInsertNewItemLocked_ClearsStaleCounter(t *testing.T) {
+	buf := newscopeBuffer(10)
+
+	item := Item{
+		Scope:   "s",
+		ID:      "x",
+		Payload: json.RawMessage(`{"v":1}`),
+		counter: &counterCell{}, // stale pointer the caller smuggled in
+	}
+	stored, err := buf.appendItem(item)
+	if err != nil {
+		t.Fatalf("appendItem: %v", err)
+	}
+	if stored.counter != nil {
+		t.Error("stored item still carries the stale counter pointer")
+	}
+
+	indexed, hit := buf.getByID("x")
+	if !hit {
+		t.Fatal("indexed item missing")
+	}
+	if indexed.counter != nil {
+		t.Error("indexed item carries the stale counter pointer")
+	}
+	if string(indexed.Payload) != `{"v":1}` {
+		t.Errorf("indexed payload=%q want {\"v\":1}", indexed.Payload)
+	}
+}

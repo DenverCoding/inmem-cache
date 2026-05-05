@@ -316,3 +316,59 @@ func TestStartSubscriber_StressManyWrites(t *testing.T) {
 	}
 	t.Logf("stress: %d writes -> %d command invocations", atomic.LoadInt64(&written), hits)
 }
+
+// stop() must return promptly even when the subscriber is currently
+// inside cmd.Run for a hung command. Pre-fix the goroutine waited
+// for cmd.Run to exit voluntarily; a misbehaving command (network
+// tarpit, infinite loop, sleep-forever script) would block stop
+// indefinitely — which in turn blocked standalone shutdown before
+// its 5s grace period and Caddy reload via Cleanup. The fix wires
+// exec.CommandContext through StartSubscriber so stop() cancels the
+// per-subscriber context, SIGKILLing the in-flight process.
+//
+// The asserted bound is generous (3s) so the test cannot flake under
+// CI load while still being orders of magnitude below the
+// "infinitely-hanging command" failure mode the fix targets. A real
+// regression would block for the full sleep duration (here 60s) and
+// time out the test runner.
+func TestStartSubscriber_StopReturnsPromptlyOnHungCommand(t *testing.T) {
+	dir := t.TempDir()
+	cmdPath := filepath.Join(dir, "hang.sh")
+	body := "#!/bin/sh\nsleep 60\n"
+	if err := os.WriteFile(cmdPath, []byte(body), 0o755); err != nil {
+		t.Fatalf("write hang command: %v", err)
+	}
+
+	gw := NewGateway(Config{Events: EventsConfig{Mode: EventsModeFull}})
+	stop, err := gw.StartSubscriber(EventsScopeName, cmdPath)
+	if err != nil {
+		t.Fatalf("StartSubscriber: %v", err)
+	}
+
+	// Trigger a wake-up so the goroutine enters cmd.Run for hang.sh.
+	if _, err := gw.Append(Item{Scope: "trigger", Payload: []byte(`"x"`)}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Give the goroutine a beat to pick up the wake-up and start the
+	// command. waitForSubscriberCommand against a "process is running"
+	// signal is overkill here — a short sleep is fine because the
+	// stop()-bounds assertion below is what actually matters.
+	time.Sleep(100 * time.Millisecond)
+
+	t0 := time.Now()
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if elapsed := time.Since(t0); elapsed > 3*time.Second {
+			t.Errorf("stop() returned in %v; want < 3s", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop() did not return after 5s — context cancellation is not unblocking in-flight cmd.Run")
+	}
+}

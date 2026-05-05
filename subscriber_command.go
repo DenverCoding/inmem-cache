@@ -35,6 +35,7 @@
 package scopecache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -47,20 +48,35 @@ import (
 // wake-up. Returns a stop function that:
 //
 //  1. closes the subscription (which closes the wake-up channel,
-//     which exits the goroutine's `for range` loop), and
-//  2. blocks until the goroutine has fully exited — including any
-//     in-flight `cmd.Run` for the currently-executing command.
+//     which exits the goroutine's `for range` loop),
+//  2. cancels the per-subscriber context — the in-flight cmd.Run
+//     was started via exec.CommandContext, so cancellation
+//     SIGKILLs the running process and cmd.Run returns immediately,
+//     and
+//  3. blocks until the goroutine has fully exited.
 //
-// Step 2 matters for adapter shutdown: a running drain command may
-// still be doing HTTP roundtrips against the cache, so the caller
-// must wait for those to settle before tearing down the server. With
-// the blocking stop the standalone binary can call `stopSubscribers()`
-// before `server.Shutdown` and be sure no orphan curl is left
-// banging on a closed socket.
+// Step 2 is what bounds shutdown latency. Pre-step-2 the contract was
+// "stop blocks until the in-flight command finishes" — fine if the
+// command always finishes promptly, catastrophic if it doesn't. A
+// stuck curl, a tarpitted network endpoint, or a buggy script with
+// an infinite loop would block stop forever, blocking standalone
+// shutdown before its 5s grace period and stalling Caddy reload via
+// Cleanup. Cancel-on-stop trades graceful in-flight completion for
+// a hard upper bound: stop returns within OS-process-kill latency,
+// regardless of what the command was doing.
 //
-// stop is idempotent (Subscribe's unsub is, and reading from a
-// closed `done` channel returns immediately) so it's safe to wire
-// both into a signal-handler AND a `defer` backstop.
+// The HTTP-roundtrip-orphan concern that motivated the original
+// blocking stop is addressed differently: the standalone main()
+// still calls stopSubscribers() before server.Shutdown, so the
+// cache socket stays open while the goroutine tears down. A killed
+// curl mid-request just produces a "connection reset" client-side;
+// the cache sees a closed connection and handles gracefully — same
+// as any other client crash.
+//
+// stop is idempotent (Subscribe's unsub is, calling cancel on an
+// already-cancelled context is a no-op, and reading from a closed
+// `done` channel returns immediately) so it's safe to wire both
+// into a signal-handler AND a `defer` backstop.
 //
 // Errors at start-up:
 //   - empty scope or command -> validation error
@@ -96,6 +112,7 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 		return nil, fmt.Errorf("scopecache: StartSubscriber: subscribe %s: %w", scope, err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		// No initial pre-subscribe drain: the command handles all reads
@@ -108,11 +125,17 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 		// only forwards.
 		defer close(done)
 		for range ch {
-			runSubscriberCommand(scope, command)
+			runSubscriberCommand(ctx, scope, command)
 		}
 	}()
 
 	stop = func() {
+		// Cancel before unsub so an in-flight cmd.Run unblocks
+		// (exec.CommandContext SIGKILLs the process on cancel) before
+		// the goroutine even loops back to check the channel. unsub
+		// then closes ch so the for-range exits on the next iteration,
+		// and <-done blocks until the goroutine has actually returned.
+		cancel()
 		unsub()
 		<-done
 	}
@@ -120,22 +143,30 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 }
 
 // runSubscriberCommand executes the configured command once, blocking
-// on its exit. Stderr/stdout are inherited from the parent process so
-// operators can see the command's output in their normal log stream.
+// on its exit OR on cancellation of ctx (whichever fires first).
+// Stderr/stdout are inherited from the parent process so operators
+// can see the command's output in their normal log stream.
 // SCOPECACHE_SCOPE is passed via env so a single command can serve
 // both reserved scopes and branch on which one fired.
-func runSubscriberCommand(scope, command string) {
-	cmd := exec.Command(command)
+//
+// ctx is the per-subscriber context owned by StartSubscriber.
+// Cancellation makes exec.CommandContext SIGKILL the running
+// process; cmd.Run returns with a "signal: killed" error. The error
+// is logged like any other failure, then the goroutine sees the
+// closed wake-up channel and exits — bounded by OS kill latency
+// instead of the command's voluntary exit.
+func runSubscriberCommand(ctx context.Context, scope, command string) {
+	cmd := exec.CommandContext(ctx, command)
 	cmd.Env = append(os.Environ(), "SCOPECACHE_SCOPE="+scope)
 	cmd.Stdin = nil
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		// A non-zero exit, missing executable, or signal-kill all land
-		// here. Log + move on — the next wake-up will retry. Operators
-		// who want exponential backoff or alerting on repeated failures
-		// build that into their command (it's where the retry context
-		// lives anyway).
+		// A non-zero exit, missing executable, signal-kill, or
+		// context-cancel all land here. Log + move on — the next
+		// wake-up will retry. Operators who want exponential backoff
+		// or alerting on repeated failures build that into their
+		// command (it's where the retry context lives anyway).
 		log.Printf("scopecache subscriber: %s (scope=%s): %v", command, scope, err)
 	}
 }

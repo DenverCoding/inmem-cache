@@ -3498,6 +3498,32 @@ func TestEvents_AutoPopulate_Warm(t *testing.T) {
 	}
 }
 
+// Empty /warm input replaces zero scopes — no observable change to
+// any user state — and must NOT emit a `_events` envelope. Pre-fix
+// `replaceScopes` called `s.emitWarmEvent()` unconditionally, waking
+// every subscriber for a no-op and adding replay noise. Mirrors the
+// gate-on-success pattern every other write-event helper uses
+// (delete_scope, single-item paths).
+func TestEvents_AutoPopulate_Warm_EmptyInputDoesNotEmit(t *testing.T) {
+	h, _ := newReservedScopesTestHandler(t, Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: 100 << 20,
+		MaxItemBytes:  1 << 20,
+		Events:        EventsConfig{Mode: EventsModeFull},
+	})
+
+	// Empty input — no items, no scopes. The handler still accepts it
+	// (ItemsRequest with an empty slice is structurally valid).
+	if code, _, raw := doRequest(t, h, "POST", "/warm", `{"items":[]}`); code != 200 {
+		t.Fatalf("/warm empty: code=%d body=%s", code, raw)
+	}
+
+	count, _ := eventsTailCount(t, h)
+	if count != 0 {
+		t.Errorf("empty /warm: _events count=%d want 0 (no-op must not emit)", count)
+	}
+}
+
 // /delete_scope auto-populate: envelope is {op:"delete_scope", scope:X,
 // ts:N}. Tests the success path AND that emit is gated on the actual
 // deletion (calling /delete_scope on a non-existent scope must NOT emit).

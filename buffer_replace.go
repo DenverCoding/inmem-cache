@@ -89,6 +89,14 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 
 		lastSeq++
 		item := src
+		// Defensive clear of the cache-owned counter pointer. Same
+		// rationale as insertNewItemLocked: the Gateway clone already
+		// strips it on /warm and /rebuild input via
+		// cloneGroupedItemPayloads, but a counter pointer that smuggled
+		// through any other path would make approxItemSize charge
+		// counterCellOverhead instead of len(Payload), and post-warm
+		// reads would materialise from the orphaned cell.
+		item.counter = nil
 		item.Seq = lastSeq
 		item.Ts = nowUs
 		item.renderBytes = precomputeRenderBytes(item.Payload)

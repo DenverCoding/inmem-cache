@@ -264,6 +264,18 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 // b.bytes increment), so the caller can return the error without
 // rolling anything back.
 func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) {
+	// Defensive clear of the cache-owned counter pointer. The Gateway
+	// boundary already strips it via cloneItemPayload, and the HTTP
+	// path never sets it (json decode targets exported fields only).
+	// Clearing here is belt-and-braces against future internal callers
+	// (helpers, tests that construct Items directly) bypassing the
+	// Gateway clone — a non-nil counter pointer riding through this
+	// path would make approxItemSize charge counterCellOverhead
+	// instead of len(Payload), and reads would materialise from the
+	// orphaned cell instead of the freshly-installed payload bytes.
+	// renderBytes does not need a separate clear — precomputeRenderBytes
+	// reassigns it unconditionally on the next line.
+	item.counter = nil
 	item.Ts = nowUs
 	item.renderBytes = precomputeRenderBytes(item.Payload)
 

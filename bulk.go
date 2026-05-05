@@ -220,7 +220,16 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 	if err != nil {
 		return n, err
 	}
-	s.emitWarmEvent()
+	// Gate the emit on actual work. An empty input map produces n=0
+	// with no scope replacements; emitting `{op:"warm"}` then would
+	// wake every _events subscriber and add a no-op entry to the
+	// replay stream — pure noise. Mirrors the gate-on-success pattern
+	// every other write-event helper uses (emitDeleteScopeEvent only
+	// fires when the scope existed, single-item helpers only fire
+	// when their commit actually landed).
+	if n > 0 {
+		s.emitWarmEvent()
+	}
 	return n, nil
 }
 

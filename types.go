@@ -215,12 +215,25 @@ type InboxConfig struct {
 // (or `Config{}` for "all defaults") and still get a working Store —
 // without it, every cap would be zero and every positive write would
 // be rejected with 507.
+//
+// MaxStoreBytes also has a floor: it must be large enough to hold the
+// reserved scopes' overhead (reservedScopesOverhead). Without the
+// floor, a tiny configured cap silently skips reserved-scope creation
+// at boot (initReservedScopes' reserveBytes gate fails) but post-wipe
+// re-init bypasses the cap unconditionally — leaving totalBytes past
+// the configured ceiling and Subscribe on `_events` failing on a
+// fresh cache. The clamp only fires for absurdly small caps (under
+// 2 KiB on the default reserved-scope set); realistic MB/GB caps are
+// untouched.
 func (c Config) WithDefaults() Config {
 	if c.ScopeMaxItems <= 0 {
 		c.ScopeMaxItems = ScopeMaxItems
 	}
 	if c.MaxStoreBytes <= 0 {
 		c.MaxStoreBytes = int64(MaxStoreMiB) << 20
+	}
+	if c.MaxStoreBytes < reservedScopesOverhead {
+		c.MaxStoreBytes = reservedScopesOverhead
 	}
 	if c.MaxItemBytes <= 0 {
 		c.MaxItemBytes = int64(MaxItemBytes)
