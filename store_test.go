@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"testing"
@@ -1156,6 +1157,76 @@ func TestStore_ReserveBytes_RejectsPositiveOverCap(t *testing.T) {
 	}
 	if got := s.totalBytes.Load(); got != baseline+30 {
 		t.Fatalf("totalBytes=%d want %d after 80 + (-50)", got, baseline+30)
+	}
+}
+
+// reserveBytes must not fail OPEN when MaxStoreBytes is configured near
+// math.MaxInt64. The naive form `current + delta > maxStoreBytes` wraps
+// to negative on overflow, the comparison passes, and the cap-violating
+// reservation is admitted. The overflow-safe form
+// `delta > maxStoreBytes - current` rejects correctly.
+//
+// Repro: cap = MaxInt64, pre-load current near MaxInt64, then try to
+// reserve a delta whose sum overflows. Pre-fix this returns ok=true;
+// post-fix it must return ok=false.
+func TestStore_ReserveBytes_DoesNotFailOpenOnInt64Overflow(t *testing.T) {
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: math.MaxInt64, MaxItemBytes: 1 << 20})
+	// Drop totalBytes back to a known baseline so the math is exact —
+	// newStore pre-creates reserved scopes which moves it forward.
+	s.totalBytes.Store(math.MaxInt64 - 100)
+
+	ok, current, gotCap := s.reserveBytes(200)
+	if ok {
+		t.Fatalf("reserve 200 with current=MaxInt64-100 must fail (would overflow), got ok=true total=%d", current)
+	}
+	if current != math.MaxInt64-100 {
+		t.Fatalf("current=%d want %d (unchanged on failed reserve)", current, math.MaxInt64-100)
+	}
+	if gotCap != math.MaxInt64 {
+		t.Fatalf("cap=%d want MaxInt64", gotCap)
+	}
+	// Sanity: a delta that fits must still succeed at the boundary.
+	if ok, _, _ := s.reserveBytes(50); !ok {
+		t.Fatal("reserve 50 (fits in remaining 100) must succeed")
+	}
+}
+
+// addClampedInt64 saturates instead of wrapping. The eventsMaxItemBytes
+// derivation (`MaxItemBytes + eventsItemEnvelopeOverhead`) uses it so
+// pathological MaxItemBytes values can't produce a negative cap that
+// silently rejects every _events write.
+func TestAddClampedInt64(t *testing.T) {
+	cases := []struct {
+		a, b, want int64
+	}{
+		{0, 0, 0},
+		{1, 2, 3},
+		{-5, 3, -2},
+		{math.MaxInt64 - 10, 5, math.MaxInt64 - 5},
+		{math.MaxInt64 - 10, 100, math.MaxInt64}, // overflow → clamp
+		{math.MaxInt64, 1, math.MaxInt64},        // overflow → clamp
+		{math.MinInt64 + 10, -5, math.MinInt64 + 5},
+		{math.MinInt64 + 10, -100, math.MinInt64}, // underflow → clamp
+		{math.MinInt64, -1, math.MinInt64},        // underflow → clamp
+	}
+	for _, tc := range cases {
+		if got := addClampedInt64(tc.a, tc.b); got != tc.want {
+			t.Errorf("addClampedInt64(%d, %d) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+// newStore must not produce a negative eventsMaxItemBytes when MaxItemBytes
+// is set near MaxInt64. Pre-fix this overflowed; post-fix the value is
+// clamped to MaxInt64. A negative cap would make every _events write
+// fail with "too big" since size > maxItemBytes is true for any size > 0.
+func TestNewStore_EventsMaxItemBytesDoesNotOverflow(t *testing.T) {
+	s := newStore(Config{MaxItemBytes: math.MaxInt64})
+	if s.eventsMaxItemBytes < 0 {
+		t.Fatalf("eventsMaxItemBytes=%d (negative — overflow not clamped)", s.eventsMaxItemBytes)
+	}
+	if s.eventsMaxItemBytes != math.MaxInt64 {
+		t.Errorf("eventsMaxItemBytes=%d want MaxInt64 (saturated)", s.eventsMaxItemBytes)
 	}
 }
 

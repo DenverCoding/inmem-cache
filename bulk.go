@@ -95,9 +95,22 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 		// the original ItemsRequest) — slight cosmetic shift in the
 		// error string vs. pre-step-6.7, but the substring "scope X,
 		// item N" is searchable for the same operator-side debugging.
+		//
+		// item.Scope must match the map key. The HTTP path can't break
+		// this because groupItemsByScope groups on item.Scope, but a Go
+		// caller building the map by hand could pass `grouped["actual"]`
+		// containing Item{Scope:"wrong"} — the buffer would store under
+		// "actual" while item.Scope reads "wrong", silently breaking the
+		// scope-identity invariant for downstream reads, replays, and
+		// /events emit. Reject explicitly rather than normalising — a
+		// silent rewrite would mask a misconstructed map and let the
+		// real client bug ship.
 		for i, item := range items {
 			if err := validateWriteItem(item, "/warm", s.maxItemBytes); err != nil {
 				return 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
+			}
+			if item.Scope != scope {
+				return 0, fmt.Errorf("%w: scope '%s', item at index %d: item.scope %q does not match the map key", ErrInvalidInput, scope, i, item.Scope)
 			}
 		}
 		if len(items) > s.defaultMaxItems {
@@ -267,10 +280,14 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 			return 0, 0, fmt.Errorf("%w: scope '%s' is reserved and cannot appear in /rebuild input", ErrInvalidInput, scope)
 		}
 		// Per-item shape validation, same shape as /warm — see
-		// replaceScopes for the rationale on per-scope-slice indexing.
+		// replaceScopes for the rationale on per-scope-slice indexing
+		// AND on the map-key/item.Scope equality check.
 		for i, item := range items {
 			if err := validateWriteItem(item, "/rebuild", s.maxItemBytes); err != nil {
 				return 0, 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
+			}
+			if item.Scope != scope {
+				return 0, 0, fmt.Errorf("%w: scope '%s', item at index %d: item.scope %q does not match the map key", ErrInvalidInput, scope, i, item.Scope)
 			}
 		}
 		if len(items) > s.defaultMaxItems {

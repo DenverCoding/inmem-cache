@@ -336,6 +336,66 @@ func TestStore_ReplaceScopes_RejectsEmptyScope(t *testing.T) {
 	}
 }
 
+// /warm and /rebuild use the map key as the target scope, but each Item
+// also carries its own .Scope. The two must agree — otherwise a Go caller
+// who passed `grouped["actual"]={Item{Scope:"wrong"}}` would store items
+// under the buffer for "actual" while the items themselves report
+// .Scope="wrong" on read. That breaks the scope-identity invariant that
+// every other read/write path depends on (replays, /events emit,
+// downstream addons that key on item.Scope). The HTTP path can't trip
+// this because groupItemsByScope groups on item.Scope, but Go callers
+// can build the map manually.
+//
+// Pre-fix: replaceScopes accepts mismatched input and silently stores the
+// items under the map key with the wrong .Scope intact. Post-fix:
+// returns ErrInvalidInput at the per-item validation layer, before any
+// state mutation.
+func TestStore_ReplaceScopes_RejectsScopeKeyMismatch(t *testing.T) {
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	grouped := map[string][]Item{
+		"actual": {{Scope: "wrong", Payload: jsonRaw(`"x"`)}},
+	}
+	_, err := s.replaceScopes(grouped)
+	if err == nil {
+		t.Fatal("expected error for item.Scope/key mismatch, got nil")
+	}
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("err must wrap ErrInvalidInput, got: %v", err)
+	}
+	// Buffer for "actual" must not exist — the reject happens before
+	// any phase-2 commit.
+	sh := s.shardFor("actual")
+	sh.mu.RLock()
+	_, exists := sh.scopes["actual"]
+	sh.mu.RUnlock()
+	if exists {
+		t.Fatal("scope 'actual' must not have been created on a rejected /warm")
+	}
+}
+
+func TestStore_RebuildAll_RejectsScopeKeyMismatch(t *testing.T) {
+	s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+	grouped := map[string][]Item{
+		"actual": {{Scope: "wrong", Payload: jsonRaw(`"x"`)}},
+	}
+	_, _, err := s.rebuildAll(grouped)
+	if err == nil {
+		t.Fatal("expected error for item.Scope/key mismatch, got nil")
+	}
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("err must wrap ErrInvalidInput, got: %v", err)
+	}
+	// /rebuild aborts pre-mutation, so existing reserved scopes survive
+	// untouched. Spot-check that _events / _inbox are still present.
+	sh := s.shardFor(EventsScopeName)
+	sh.mu.RLock()
+	_, hasEvents := sh.scopes[EventsScopeName]
+	sh.mu.RUnlock()
+	if !hasEvents {
+		t.Fatal("reserved scope _events must survive a rejected /rebuild")
+	}
+}
+
 func TestStore_RebuildAll_WipesEverything(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 

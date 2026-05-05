@@ -3,6 +3,7 @@ package scopecache
 import (
 	"errors"
 	"hash/maphash"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -370,7 +371,7 @@ func newStore(c Config) *store {
 		defaultMaxItems:    c.ScopeMaxItems,
 		maxStoreBytes:      c.MaxStoreBytes,
 		maxItemBytes:       c.MaxItemBytes,
-		eventsMaxItemBytes: c.MaxItemBytes + eventsItemEnvelopeOverhead,
+		eventsMaxItemBytes: addClampedInt64(c.MaxItemBytes, eventsItemEnvelopeOverhead),
 		inboxMaxItems:      c.Inbox.MaxItems,
 		inboxMaxItemBytes:  c.Inbox.MaxItemBytes,
 		eventsMode:         c.Events.Mode,
@@ -468,6 +469,16 @@ func unlockShards(shards []*scopeShard) {
 // the cap for positive deltas. Negative deltas (releases) always succeed.
 // Returns (ok, totalAfterAttempt, cap). Positive deltas use a CAS loop so
 // concurrent /append writers never collectively over-commit the cap.
+//
+// The cap-check is written as `delta > maxStoreBytes-current` rather than
+// `current+delta > maxStoreBytes` to avoid signed-int64 overflow when an
+// operator configures MaxStoreBytes near math.MaxInt64. The naive form
+// fails OPEN: current+delta wraps to negative, the `> maxStoreBytes`
+// comparison passes, and a write that violates the cap is admitted.
+// The subtractive form is algebraically equivalent in the safe range and
+// stays correct at the boundary because maxStoreBytes-current can only
+// underflow if current is negative, which our admission control prevents
+// for positive-delta callers.
 func (s *store) reserveBytes(delta int64) (bool, int64, int64) {
 	if delta <= 0 {
 		n := s.totalBytes.Add(delta)
@@ -475,14 +486,28 @@ func (s *store) reserveBytes(delta int64) (bool, int64, int64) {
 	}
 	for {
 		current := s.totalBytes.Load()
-		next := current + delta
-		if next > s.maxStoreBytes {
+		if delta > s.maxStoreBytes-current {
 			return false, current, s.maxStoreBytes
 		}
+		next := current + delta
 		if s.totalBytes.CompareAndSwap(current, next) {
 			return true, next, s.maxStoreBytes
 		}
 	}
+}
+
+// addClampedInt64 returns a + b, saturating at math.MaxInt64 / math.MinInt64
+// instead of wrapping. Used to derive caps (eventsMaxItemBytes) from operator
+// inputs that could be near the int64 boundary without making the derived cap
+// silently negative. Callers stay correct under any pathological config.
+func addClampedInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
 }
 
 // scopeBufferOverhead is the byte-cost the cache charges per allocated
