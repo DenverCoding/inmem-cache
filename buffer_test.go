@@ -860,7 +860,11 @@ func TestSinceSeq_ReturnsItemsAfterCursor(t *testing.T) {
 		_, _ = buf.appendItem(newItem("s", "", nil))
 	}
 
-	got, _ := buf.sinceSeq(2, 0)
+	// Limit chosen above the available count to confirm "all matching"
+	// behaviour without relying on the historical limit=0 → unlimited
+	// semantics (tightened to limit ≤ 0 → empty for cross-method
+	// uniformity; see sinceSeq's doc-comment).
+	got, _ := buf.sinceSeq(2, 100)
 	if len(got) != 3 {
 		t.Fatalf("len=%d want 3", len(got))
 	}
@@ -885,9 +889,33 @@ func TestSinceSeq_EmptyWhenPastEnd(t *testing.T) {
 	buf := newscopeBuffer(10)
 	_, _ = buf.appendItem(newItem("s", "", nil))
 
-	got, _ := buf.sinceSeq(100, 0)
+	got, _ := buf.sinceSeq(100, 100)
 	if len(got) != 0 {
 		t.Fatalf("len=%d want 0", len(got))
+	}
+}
+
+// limit ≤ 0 returns an empty slice on every multi-item read
+// (sinceSeq, tailOffset, scopeList). Pre-fix sinceSeq treated 0 as
+// "no truncation" and returned every matching item — inconsistent
+// with the other two methods, surprising for Go-API callers that
+// passed an uninitialised int, and silently bypassing the
+// HTTP-layer's normalizeLimit gate. The guard makes "give me ≤ 0
+// items" answered uniformly with the empty result.
+func TestSinceSeq_NonPositiveLimitReturnsEmpty(t *testing.T) {
+	buf := newscopeBuffer(10)
+	for i := 1; i <= 5; i++ {
+		_, _ = buf.appendItem(newItem("s", "", nil))
+	}
+
+	for _, limit := range []int{0, -1, -1000} {
+		got, more := buf.sinceSeq(0, limit)
+		if len(got) != 0 {
+			t.Errorf("limit=%d: len=%d want 0", limit, len(got))
+		}
+		if more {
+			t.Errorf("limit=%d: more=true want false", limit)
+		}
 	}
 }
 

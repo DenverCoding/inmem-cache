@@ -134,11 +134,33 @@ func (o orderedFields) MarshalJSON() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// marshalFailureBody is the safe envelope written when a response payload
+// fails to marshal. Pre-encoded so the error path itself cannot fail.
+var marshalFailureBody = []byte(`{"ok":false,"error":"the response failed to marshal"}` + "\n")
+
 func writeJSONWithDuration(w http.ResponseWriter, code int, payload orderedFields, started time.Time) {
 	payload = append(payload, kv{"duration_us", time.Since(started).Microseconds()})
+	// Marshal BEFORE WriteHeader so a marshal failure can still emit a clean
+	// 500 — the streaming `json.NewEncoder(w).Encode(payload)` shape this
+	// replaces would commit `code` (typically 200), start writing, then
+	// silently truncate when it hit a bad value, producing "200 + empty
+	// body" instead of a real error response.
+	//
+	// In practice the only payload value that can fail today is a
+	// json.RawMessage holding malformed bytes; validatePayload now blocks
+	// that on the write paths (see validation.go), but the read path stays
+	// defensive in case a future addon, store-internal mutation, or
+	// reintroduced bug puts invalid bytes back into a stored Item.Payload.
+	body, err := json.Marshal(payload)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(marshalFailureBody)
+		return
+	}
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(payload)
+	_, _ = w.Write(body)
+	_, _ = w.Write([]byte("\n"))
 }
 
 // marshalWithApproxSize is the shared splice helper used by

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func newTestHandler(maxItems int) (http.Handler, *API) {
@@ -439,6 +440,69 @@ func TestUpdate_RejectsNeitherIDNorSeq(t *testing.T) {
 	}
 }
 
+// /update by seq must enforce the same per-item byte cap as /update
+// by id. The validator measures size on the request body, where seq
+// updates carry an empty ID — so a long-id scope can be addressed
+// either way and the validator's check undercounts by len(stored.ID)
+// in the seq case. Without the post-load size check in updateBySeq,
+// a payload that's rejected via id is silently committed via seq,
+// blowing past MaxItemBytes.
+//
+// Setup picks a payload size that fits under cap with id="" and
+// exceeds it with id="abcdefghij" (10 bytes), so the asymmetry is
+// the only thing under test.
+func TestUpdate_BySeq_EnforcesPerItemCap(t *testing.T) {
+	api := NewAPI(
+		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 100}),
+		APIConfig{},
+	)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// Seed: scope=1B, id=10B, payload=7B → approxItemSize = 48+1+10+7 = 66 ≤ 100
+	if code, _, _ := doRequest(t, mux, "POST", "/append",
+		`{"scope":"s","id":"abcdefghij","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("seed append: code=%d want 200", code)
+	}
+
+	// Build a payload that, with the stored id (10B), exceeds the cap:
+	// 48+1+10+45 = 104 > 100. Without the stored id, 48+1+0+45 = 94 ≤ 100,
+	// so the validator alone does not reject.
+	n := 45
+	buf := make([]byte, n)
+	buf[0] = '['
+	for i := 1; i < n-1; i++ {
+		if i%2 == 1 {
+			buf[i] = '1'
+		} else {
+			buf[i] = ','
+		}
+	}
+	buf[n-1] = ']'
+	bigPayload := string(buf)
+
+	// Sanity: update-by-id must reject (the validator catches it).
+	if code, _, _ := doRequest(t, mux, "POST", "/update",
+		`{"scope":"s","id":"abcdefghij","payload":`+bigPayload+`}`); code != 400 {
+		t.Fatalf("update-by-id: code=%d want 400", code)
+	}
+
+	// The fix: update-by-seq must also reject, with the post-load
+	// re-check inside updateBySeq.
+	if code, _, _ := doRequest(t, mux, "POST", "/update",
+		`{"scope":"s","seq":1,"payload":`+bigPayload+`}`); code != 400 {
+		t.Fatalf("update-by-seq: code=%d want 400 (regression: seq path bypassed cap)", code)
+	}
+
+	// Confirm the original payload is still in place — the rejected
+	// update must not have committed.
+	_, out, _ := doRequest(t, mux, "GET", "/get?scope=s&seq=1", "")
+	item := out["item"].(map[string]interface{})
+	if item["payload"].(map[string]interface{})["v"].(float64) != 1 {
+		t.Errorf("rejected /update mutated state; payload=%v", item["payload"])
+	}
+}
+
 // --- /upsert ------------------------------------------------------------------
 
 func TestUpsert_Creates(t *testing.T) {
@@ -622,6 +686,75 @@ func TestCounterAdd_BadRequestOnMissingID(t *testing.T) {
 	code, _, _ := doRequest(t, h, "POST", "/counter_add", `{"scope":"c","by":1}`)
 	if code != http.StatusBadRequest {
 		t.Fatalf("code=%d want 400", code)
+	}
+}
+
+// /counter_add must enforce the same per-item byte cap as /append.
+// Counter items pay counterCellOverhead (56 B) in place of len(Payload),
+// so the candidate counter shape's size is fully determined by
+// scope+id+overhead — checkable up-front. Without the validator gate,
+// counterAddSlow's create AND promote branches commit oversized items
+// against the store-byte cap only.
+//
+// Setup: cap=64, scope=1B, id=1B → counter candidate = 48+1+1+56 = 106B,
+// which is well over cap. /append at the same scope/id with any
+// payload fitting the cap stays under by construction (overhead is
+// only 48+scope+id+payload). The asymmetry the validator now closes
+// is "regular item fits, counter doesn't".
+func TestCounterAdd_EnforcesPerItemCap_Create(t *testing.T) {
+	api := NewAPI(
+		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 64}),
+		APIConfig{},
+	)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	code, _, raw := doRequest(t, mux, "POST", "/counter_add", `{"scope":"s","id":"x","by":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("create-path /counter_add: code=%d want 400 (body=%s)", code, raw)
+	}
+
+	// And the rejected counter must NOT have created an item.
+	_, out, _ := doRequest(t, mux, "GET", "/get?scope=s&id=x", "")
+	if mustBool(t, out, "hit") {
+		t.Errorf("rejected /counter_add still created an item: %+v", out)
+	}
+}
+
+// Promote path: a regular int item at (scope, id) gets converted to a
+// counter on first /counter_add. The pre-fix counter candidate could
+// exceed MaxItemBytes even when the predecessor regular item fit;
+// validateCounterAddRequest now rejects up-front. The original item
+// must remain untouched.
+func TestCounterAdd_EnforcesPerItemCap_Promote(t *testing.T) {
+	api := NewAPI(
+		NewGateway(Config{ScopeMaxItems: 10, MaxStoreBytes: 1 << 20, MaxItemBytes: 64}),
+		APIConfig{},
+	)
+	mux := http.NewServeMux()
+	api.RegisterRoutes(mux)
+
+	// Seed a small regular item: 48+1+1+1 = 51 ≤ 64.
+	if code, _, raw := doRequest(t, mux, "POST", "/append",
+		`{"scope":"t","id":"y","payload":5}`); code != 200 {
+		t.Fatalf("seed append: code=%d body=%s", code, raw)
+	}
+
+	// /counter_add at the same scope/id would promote to a counter
+	// shape (48+1+1+56 = 106 > 64). The validator must reject.
+	code, _, raw := doRequest(t, mux, "POST", "/counter_add", `{"scope":"t","id":"y","by":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("promote-path /counter_add: code=%d want 400 (body=%s)", code, raw)
+	}
+
+	// And the original `5` must still be there.
+	_, out, _ := doRequest(t, mux, "GET", "/get?scope=t&id=y", "")
+	if !mustBool(t, out, "hit") {
+		t.Fatal("seed item lost after rejected promote")
+	}
+	item := out["item"].(map[string]interface{})
+	if v, _ := item["payload"].(float64); v != 5 {
+		t.Errorf("rejected promote mutated payload: %v want 5", item["payload"])
 	}
 }
 
@@ -3599,5 +3732,117 @@ func TestEvents_AutoPopulate_DeleteUpTo(t *testing.T) {
 	}
 	if _, hasPayload := envelope["payload"]; hasPayload {
 		t.Errorf("delete_up_to envelope must not carry payload, got %v", envelope["payload"])
+	}
+}
+
+// --- response marshal-failure path --------------------------------------------
+
+// writeJSONWithDuration must NOT commit `code` (typically 200) and then
+// silently truncate when a payload value fails to marshal. Pre-fix, the
+// streaming `json.NewEncoder(w).Encode(payload)` shape committed the
+// header before any value was written and left the client with "200 +
+// empty body" when the encoder hit a malformed json.RawMessage. The
+// fix marshals first, only writing the success header on success and
+// emitting a clean 500 envelope on failure.
+//
+// The most likely real-world trigger is a stored Item.Payload holding
+// invalid JSON bytes. validatePayload now blocks that on every write
+// path, but this test exercises the helper directly so a future
+// addon, store-internal mutation, or reintroduced bug cannot regress
+// the read path's failure semantics without breaking this test first.
+func TestWriteJSONWithDuration_MarshalFailureReturns500(t *testing.T) {
+	rec := httptest.NewRecorder()
+	bad := json.RawMessage(`{"a":`) // truncated object — json.Marshal fails
+	payload := orderedFields{
+		{"ok", true},
+		{"item", Item{Scope: "s", Payload: bad}},
+	}
+	writeJSONWithDuration(rec, http.StatusOK, payload, time.Now())
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d want 500", rec.Code)
+	}
+	body := rec.Body.String()
+	if body == "" {
+		t.Fatal("body is empty; want a JSON error envelope")
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatalf("body is not valid JSON: %q (%v)", body, err)
+	}
+	if out["ok"] != false {
+		t.Errorf("ok=%v want false", out["ok"])
+	}
+	if _, has := out["error"]; !has {
+		t.Errorf("error key missing in body: %+v", out)
+	}
+}
+
+// writeJSONWithMeta and writeJSONWithMetaCap fall back to
+// writeJSONWithDuration when their own marshal-with-approx-size step
+// fails. With the writeJSONWithDuration fix in place that fallback now
+// correctly emits 500 — pin both paths so a future refactor can't
+// reintroduce the silent-truncation hazard.
+func TestWriteJSONWithMeta_MarshalFailureReturns500(t *testing.T) {
+	bad := json.RawMessage(`{"a":`)
+	payload := orderedFields{
+		{"ok", true},
+		{"item", Item{Scope: "s", Payload: bad}},
+	}
+
+	rec1 := httptest.NewRecorder()
+	writeJSONWithMeta(rec1, http.StatusOK, payload, time.Now())
+	if rec1.Code != http.StatusInternalServerError {
+		t.Errorf("writeJSONWithMeta: code=%d want 500", rec1.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	writeJSONWithMetaCap(rec2, http.StatusOK, payload, time.Now(), 1<<20)
+	if rec2.Code != http.StatusInternalServerError {
+		t.Errorf("writeJSONWithMetaCap: code=%d want 500", rec2.Code)
+	}
+}
+
+// End-to-end proof against the full /get pipeline: inject a malformed
+// payload directly into a scope buffer (bypassing the validator the
+// way a future buggy addon or internal-mutation regression would), then
+// hit /get over the public mux and verify the read path produces 500
+// instead of 200 + empty body.
+//
+// White-box access via api.store is intentional — there is no
+// non-internal way to construct this state (validatePayload now
+// blocks every write path), and the whole point of the test is to
+// prove the read path stays safe even when something upstream of it
+// has gone wrong. Items live in three places inside scopeBuffer
+// (items slice, byID map, bySeq map); all three must be patched in
+// lockstep because /get?id=a reads byID.
+func TestGet_CorruptStoredPayloadReturns500(t *testing.T) {
+	h, api := newTestHandler(10)
+
+	if code, _, _ := doRequest(t, h, "POST", "/append",
+		`{"scope":"s","id":"a","payload":{"v":1}}`); code != 200 {
+		t.Fatalf("seed append: code=%d want 200", code)
+	}
+
+	sh := api.store.shardFor("s")
+	sh.mu.RLock()
+	buf := sh.scopes["s"]
+	sh.mu.RUnlock()
+	if buf == nil {
+		t.Fatal("scope buffer for 's' missing after append")
+	}
+
+	buf.mu.Lock()
+	corrupt := buf.items[0]
+	corrupt.Payload = json.RawMessage(`{"a":`)
+	corrupt.renderBytes = nil
+	buf.items[0] = corrupt
+	buf.byID["a"] = corrupt
+	buf.bySeq[corrupt.Seq] = corrupt
+	buf.mu.Unlock()
+
+	rec := doRawRequest(t, h, "GET", "/get?scope=s&id=a")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("/get on corrupt payload: code=%d want 500 (body=%q)", rec.Code, rec.Body.String())
 	}
 }

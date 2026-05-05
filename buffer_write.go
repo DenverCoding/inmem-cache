@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -185,6 +186,35 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 
 	// See updateByID for the renderBytes-aware delta rationale.
 	newRender := precomputeRenderBytes(payload)
+
+	// Per-item cap re-check on the fully-materialized post-update item.
+	// The validator's checkItemSize ran on the request body, where ID
+	// is empty for seq-based updates — so its size measurement
+	// undercounts by len(existing.ID). Without this re-check a
+	// long-id scope can bypass MaxItemBytes by addressing the item
+	// via seq instead of id (validator-rejected). The counter field
+	// is intentionally omitted from the candidate: replaceItemAtIndexLocked
+	// clears any prior counter cell, so the post-update item is always
+	// a regular Payload-bytes item regardless of the predecessor.
+	//
+	// updateByID does not need this re-check: its validator path sees
+	// the same id that the buffer holds (the request *is* the address),
+	// so request-side and stored-side approxItemSize agree by
+	// construction.
+	if b.store != nil {
+		maxItemBytes := b.store.maxItemBytesFor(existing.Scope)
+		candidate := Item{
+			Scope:       existing.Scope,
+			ID:          existing.ID,
+			Payload:     payload,
+			renderBytes: newRender,
+		}
+		if size := approxItemSize(candidate); size > maxItemBytes {
+			return 0, fmt.Errorf("%w: the item's approximate size (%d bytes) exceeds the maximum of %d bytes",
+				ErrInvalidInput, size, maxItemBytes)
+		}
+	}
+
 	delta, err := b.reservePayloadDeltaLocked(
 		payloadAndRenderBytes(existing),
 		int64(len(payload)+len(newRender)),

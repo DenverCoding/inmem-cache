@@ -102,6 +102,9 @@ func FuzzValidateWriteItem(f *testing.F) {
 		if bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
 			t.Fatalf("accepted literal null payload: %q", payload)
 		}
+		if !json.Valid(payload) {
+			t.Fatalf("accepted malformed JSON payload: %q", payload)
+		}
 		if approxItemSize(item) > MaxItemBytes {
 			t.Fatalf("accepted item size=%d > cap=%d", approxItemSize(item), MaxItemBytes)
 		}
@@ -121,7 +124,10 @@ func FuzzValidateCounterAddRequest(f *testing.F) {
 	f.Add("s", "id", -MaxCounterValue-1)
 	f.Fuzz(func(t *testing.T, scope, id string, by int64) {
 		req := counterAddRequest{Scope: scope, ID: id, By: &by}
-		got, err := validateCounterAddRequest(req)
+		// 0 disables the per-item-cap check — fuzz the shape rules
+		// only; cap arithmetic is covered by FuzzValidateWriteItem
+		// and the dedicated cap-bypass regression tests.
+		got, err := validateCounterAddRequest(req, 0)
 		if err != nil {
 			return
 		}

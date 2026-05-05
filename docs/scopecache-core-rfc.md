@@ -591,7 +591,7 @@ Validation rules for the fields that appear across the API:
 |-------------|-----------------|----------------------------------------------------------|
 | `scope`     | string          | required; ≤ 256 bytes; no leading/trailing whitespace; no control characters (0x00–0x1F, 0x7F) |
 | `id`        | string          | optional or required (per endpoint); same shape as `scope` when present |
-| `payload`   | any JSON value  | required; literal `null` is rejected; bytes are opaque to the cache |
+| `payload`   | any JSON value  | required; must be syntactically valid JSON; literal `null` is rejected; bytes are opaque to the cache |
 | `seq`       | uint64          | cache-assigned; clients must omit on every write; reads accept it as an addressing key |
 | `ts`        | int64           | cache-assigned; clients must omit on every write |
 | `by`        | int64           | required for `/counter_add`; non-zero; within ±(2^53 − 1) |

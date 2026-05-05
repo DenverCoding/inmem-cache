@@ -134,9 +134,9 @@ type store struct {
 	//   - scope create paths: getOrCreateScopeTrackingCreated and
 	//     ensureScope do scopeCount.Add(+1) inside the shard-write-lock
 	//     critical section, alongside the map insert.
-	//   - scope delete paths: cleanupIfEmptyAndUnused, deleteScope and
-	//     deleteGuardedTenant do scopeCount.Add(-N) and totalItems
-	//     .Add(-itemCount) inside their shard-write-lock section.
+	//   - scope delete paths: cleanupIfEmptyAndUnused and deleteScope do
+	//     scopeCount.Add(-N) and totalItems.Add(-itemCount) inside their
+	//     shard-write-lock section.
 	//   - bulk reset paths: wipe does Store(0) on both; rebuildAll does
 	//     Store(totalItems) / Store(totalScopes) under all-shard write
 	//     lock, same shape as totalBytes.Store(totalNewBytes).
@@ -155,8 +155,8 @@ type store struct {
 	// against its previous value to skip a refetch when nothing has
 	// changed. Updated via bumpLastWriteTS (CAS-max) from every place
 	// that bumps per-scope b.lastWriteTS, plus the store-level
-	// destructive paths (deleteScope, wipe, deleteGuardedTenant,
-	// rebuildAll) that don't go through a per-scope bump.
+	// destructive paths (deleteScope, wipe, rebuildAll) that don't go
+	// through a per-scope bump.
 	//
 	// CAS-max (rather than naive Store) is required: two writes in
 	// different scopes can compute time.Now().UnixMicro() out of order
@@ -700,7 +700,7 @@ func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 	// (`by required`) is the HTTP-only concern (JSON missing-field
 	// detection) and stays in the handler — Go callers always pass an
 	// int64.
-	if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: id, By: &by}); err != nil {
+	if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: id, By: &by}, s.maxItemBytesFor(scope)); err != nil {
 		return 0, false, err
 	}
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(scope)
@@ -1161,6 +1161,19 @@ type scopeListEntry struct {
 // A scope deleted between the snapshot and stats() materialises its
 // last-known state — same advisory-snapshot caveat as /stats (§7.3).
 func (s *store) scopeList(prefix, after string, limit int) ([]scopeListEntry, bool) {
+	// Defensive guard: limit <= 0 returns empty without scanning the
+	// shards. The HTTP path's normalizeLimit rejects 0/negative with
+	// 400 before calling, but Gateway callers pass int through
+	// untouched — without this guard a negative limit reaches
+	// `refs[:limit]` below and triggers a slice-bounds panic.
+	// Uniform across every multi-item read on the public surface
+	// (tailOffset, sinceSeq, scopeList): "give me ≤ 0 items" is
+	// answered with the empty result, not "give me everything" and
+	// not a panic.
+	if limit <= 0 {
+		return []scopeListEntry{}, false
+	}
+
 	type ref struct {
 		name string
 		buf  *scopeBuffer

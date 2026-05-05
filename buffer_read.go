@@ -77,11 +77,22 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 	return materialiseCountersInPlace(append([]Item(nil), b.items[start:end]...)), hasMore
 }
 
-// sinceSeq returns items with seq > afterSeq, oldest-first, up to limit. The
-// bool is true when more matching items exist beyond the returned slice, which
-// lets the handler surface truncated=true without the client having to guess
-// from count == limit.
+// sinceSeq returns items with seq > afterSeq, oldest-first, up to limit.
+// limit must be a positive integer; limit ≤ 0 returns an empty slice
+// (matching tailOffset and scopeList — every multi-item read on the
+// public surface treats a non-positive limit as "give me 0 items"
+// rather than "no cap" or panic). The HTTP path's normalizeLimit
+// rejects 0/negative with 400 before reaching here; the guard exists
+// for direct Gateway callers.
+//
+// The bool is true when more matching items exist beyond the returned
+// slice, which lets the handler surface truncated=true without the
+// client having to guess from count == limit.
 func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
+	if limit <= 0 {
+		return []Item{}, false
+	}
+
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -100,7 +111,7 @@ func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	available := len(b.items) - idx
 	take := available
 	hasMore := false
-	if limit > 0 && available > limit {
+	if available > limit {
 		take = limit
 		hasMore = true
 	}

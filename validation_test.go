@@ -2,6 +2,7 @@ package scopecache
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -136,12 +137,89 @@ func TestValidateWriteItem_RejectsMissingAndNullPayload(t *testing.T) {
 	}
 }
 
-func TestValidateWriteItem_RejectsOversizedPayload(t *testing.T) {
-	// Build a raw payload that alone exceeds the per-item cap.
-	buf := make([]byte, MaxItemBytes+1)
-	for i := range buf {
-		buf[i] = 'x'
+// Direct Gateway callers (Append/Upsert/Update/Warm/Rebuild) hand
+// json.RawMessage in as-is, so the validator is the only place that
+// can catch malformed JSON before the bytes reach the store and
+// propagate to /get, /head, /tail, /render and `_events` envelopes.
+// The HTTP path's encoding/json decode would already fail these
+// shapes during the structural scan that fills RawMessage; the
+// validator's json.Valid check makes the same guarantee for direct
+// Go callers.
+func TestValidateWriteItem_RejectsInvalidJSON(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload json.RawMessage
+	}{
+		{"truncated object", json.RawMessage(`{"a":`)},
+		{"unbalanced brace", json.RawMessage(`{"a":1`)},
+		{"trailing comma in array", json.RawMessage(`[1,2,]`)},
+		{"unquoted key", json.RawMessage(`{a:1}`)},
+		{"random bytes", json.RawMessage("\xff\xfe\xfd")},
+		{"bare word", json.RawMessage(`undefined`)},
+		{"truncated string", json.RawMessage(`"abc`)},
 	}
+	for _, tc := range cases {
+		item := Item{Scope: "s", Payload: tc.payload}
+		err := validateWriteItem(item, "/append", MaxItemBytes)
+		if err == nil {
+			t.Errorf("%s: expected rejection", tc.name)
+			continue
+		}
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("%s: err=%v not wrapped with ErrInvalidInput", tc.name, err)
+		}
+	}
+}
+
+// Same rejection contract for the upsert path: malformed JSON via
+// Gateway.Upsert must fail at the validator, not silently store broken
+// bytes that future /get on (scope, id) returns to clients.
+func TestValidateUpsertItem_RejectsInvalidJSON(t *testing.T) {
+	item := Item{Scope: "s", ID: "x", Payload: json.RawMessage(`{"a":`)}
+	err := validateUpsertItem(item, MaxItemBytes)
+	if err == nil {
+		t.Fatal("expected rejection of malformed JSON payload")
+	}
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("err=%v not wrapped with ErrInvalidInput", err)
+	}
+}
+
+// Same rejection contract for the update path. Update overwrites
+// payload bytes in place; without the json.Valid check, a buggy
+// addon could replace a valid payload with malformed bytes and
+// break readers that previously worked.
+func TestValidateUpdateItem_RejectsInvalidJSON(t *testing.T) {
+	item := Item{Scope: "s", ID: "x", Payload: json.RawMessage(`{"a":`)}
+	err := validateUpdateItem(item, MaxItemBytes)
+	if err == nil {
+		t.Fatal("expected rejection of malformed JSON payload")
+	}
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("err=%v not wrapped with ErrInvalidInput", err)
+	}
+}
+
+func TestValidateWriteItem_RejectsOversizedPayload(t *testing.T) {
+	// Build a valid-JSON array payload that alone exceeds the per-item
+	// cap. Must be valid JSON so the json.Valid check in validatePayload
+	// passes — otherwise the rejection happens there (invalid-JSON) and
+	// this test stops asserting the size-cap path.
+	n := MaxItemBytes + 1
+	buf := make([]byte, n)
+	buf[0] = '['
+	for i := 1; i < n-1; i++ {
+		if i%2 == 1 {
+			buf[i] = '1'
+		} else {
+			buf[i] = ','
+		}
+	}
+	if buf[n-2] == ',' {
+		buf[n-2] = '1'
+	}
+	buf[n-1] = ']'
+
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
 	if err := validateWriteItem(item, "/append", MaxItemBytes); err == nil {
 		t.Error("expected oversized item to be rejected")
@@ -149,10 +227,25 @@ func TestValidateWriteItem_RejectsOversizedPayload(t *testing.T) {
 }
 
 func TestValidateWriteItem_AcceptsExactCapPayload(t *testing.T) {
-	buf := make([]byte, MaxItemBytes/2)
-	for i := range buf {
-		buf[i] = 'y'
+	// A valid-JSON array of `MaxItemBytes/2` raw bytes — well under cap.
+	// Shape `[1,1,...,1]` skips renderBytes inflation (only string payloads
+	// trigger that), so the size check tracks raw payload length plus the
+	// fixed approxItemSize overhead.
+	n := MaxItemBytes / 2
+	buf := make([]byte, n)
+	buf[0] = '['
+	for i := 1; i < n-1; i++ {
+		if i%2 == 1 {
+			buf[i] = '1'
+		} else {
+			buf[i] = ','
+		}
 	}
+	if buf[n-2] == ',' {
+		buf[n-2] = '1'
+	}
+	buf[n-1] = ']'
+
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
 	if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
 		t.Errorf("under-cap item rejected: %v", err)
@@ -319,6 +412,42 @@ func TestValidateUpdateItem(t *testing.T) {
 	}
 }
 
+// validateCounterAddRequest pre-checks the candidate counter item's
+// approximate size against maxItemBytes. The candidate carries no
+// Payload (counters store cell state, not payload bytes) and a non-nil
+// counter marker so approxItemSize charges counterCellOverhead in
+// place of len(Payload) + len(renderBytes). Without this gate, the
+// store's create + promote paths committed counter items past the
+// per-item cap whenever scope+id+56 exceeded it.
+func TestValidateCounterAddRequest_EnforcesPerItemCap(t *testing.T) {
+	by := int64(1)
+
+	// Fits: 48 + 1 + 1 + 56 = 106 ≤ 200.
+	if _, err := validateCounterAddRequest(
+		counterAddRequest{Scope: "s", ID: "x", By: &by},
+		200,
+	); err != nil {
+		t.Errorf("106 ≤ 200 rejected: %v", err)
+	}
+
+	// Exceeds: 106 > 64.
+	if _, err := validateCounterAddRequest(
+		counterAddRequest{Scope: "s", ID: "x", By: &by},
+		64,
+	); err == nil {
+		t.Error("106 > 64 accepted; expected per-item-cap rejection")
+	}
+
+	// Sentinel: maxItemBytes <= 0 disables the check (used by fuzz
+	// callers that exercise shape rules without a realistic budget).
+	if _, err := validateCounterAddRequest(
+		counterAddRequest{Scope: "s", ID: "x", By: &by},
+		0,
+	); err != nil {
+		t.Errorf("sentinel maxItemBytes=0 unexpectedly rejected: %v", err)
+	}
+}
+
 func TestValidateDeleteRequest(t *testing.T) {
 	if err := validateDeleteRequest(deleteRequest{Scope: "s", ID: "a"}); err != nil {
 		t.Errorf("valid (by id) rejected: %v", err)
@@ -425,7 +554,7 @@ func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
 				t.Errorf("validateUpdateItem on %q: expected reservation error, got nil", scope)
 			}
 			by := int64(1)
-			if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: "c", By: &by}); err == nil {
+			if _, err := validateCounterAddRequest(counterAddRequest{Scope: scope, ID: "c", By: &by}, maxItem); err == nil {
 				t.Errorf("validateCounterAddRequest on %q: expected reservation error, got nil", scope)
 			}
 			if err := validateDeleteScopeRequest(deleteScopeRequest{Scope: scope}); err == nil {

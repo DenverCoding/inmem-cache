@@ -3,6 +3,7 @@ package scopecache
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
 )
 
@@ -64,6 +65,40 @@ func TestGateway_Subscribe(t *testing.T) {
 		t.Errorf("Subscribe after unsub: %v", err)
 	}
 	unsub2()
+}
+
+// Direct Gateway callers can hand a json.RawMessage with arbitrary
+// bytes — encoding/json's structural-scan-during-Decode (which the
+// HTTP path relies on) does not run on the Go-API path. The
+// validator's json.Valid check is the one place this is caught
+// before the bytes reach the store and propagate to readers.
+//
+// All five write-path entry points share validateWriteItem /
+// validateUpsertItem / validateUpdateItem, so one test per path
+// proves the wiring is correct end-to-end.
+func TestGateway_RejectsInvalidJSONPayload(t *testing.T) {
+	g := newGatewayForTest(t)
+
+	bad := json.RawMessage(`{"a":`)
+
+	if _, err := g.Append(Item{Scope: "s", Payload: bad}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Append: err=%v want ErrInvalidInput", err)
+	}
+	if _, _, err := g.Upsert(Item{Scope: "s", ID: "x", Payload: bad}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Upsert: err=%v want ErrInvalidInput", err)
+	}
+	if _, err := g.Update(Item{Scope: "s", ID: "x", Payload: bad}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Update: err=%v want ErrInvalidInput", err)
+	}
+	// Warm/Rebuild validate every item via validateWriteItem; one bad
+	// item in the grouped map must reject the whole batch (no partial
+	// apply).
+	if _, err := g.Warm(map[string][]Item{"s": {{Scope: "s", Payload: bad}}}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Warm: err=%v want ErrInvalidInput", err)
+	}
+	if _, _, err := g.Rebuild(map[string][]Item{"s": {{Scope: "s", Payload: bad}}}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Rebuild: err=%v want ErrInvalidInput", err)
+	}
 }
 
 // Gateway.Append exercises the validation pass: a missing scope is
@@ -223,5 +258,78 @@ func TestGateway_ScopeList(t *testing.T) {
 	entries, _ = g.ScopeList("a", "", 10)
 	if len(entries) != 1 || entries[0].Scope != "alpha" {
 		t.Errorf("ScopeList prefix=a: %v want [alpha]", entries)
+	}
+}
+
+// Gateway.ScopeList passes its int limit straight to store.scopeList.
+// Pre-fix, store.scopeList computed `truncated := len(refs) > limit`
+// (true for any non-empty store when limit < 0) and then sliced
+// `refs[:limit]`, which panics with "slice bounds out of range" on a
+// negative index. The HTTP path's normalizeLimit blocks 0/negative
+// with 400 before reaching the store, but a Go-API caller can pass
+// any int — including an uninitialised one. The store-level guard
+// (limit <= 0 → empty) makes Gateway.ScopeList safe at any input.
+func TestGateway_ScopeList_NonPositiveLimitDoesNotPanic(t *testing.T) {
+	g := newGatewayForTest(t)
+	for _, scope := range []string{"alpha", "beta", "gamma"} {
+		_, _ = g.Append(Item{Scope: scope, Payload: json.RawMessage(`{}`)})
+	}
+
+	for _, limit := range []int{-1, 0, -1000} {
+		entries, more := g.ScopeList("", "", limit)
+		if len(entries) != 0 {
+			t.Errorf("limit=%d: entries=%d want 0", limit, len(entries))
+		}
+		if more {
+			t.Errorf("limit=%d: more=true want false", limit)
+		}
+	}
+}
+
+// Every multi-item read on Gateway answers limit ≤ 0 the same way:
+// empty slice, no panic, no "give me everything" surprise.
+//
+// Pre-fix the three methods diverged: Tail returned empty (defensive
+// from day one), Head returned every matching item (limit=0 was
+// treated as "no truncation"), ScopeList panicked on negative limit
+// (truncated branch hit `refs[:limit]` directly). HTTP-callers never
+// saw any of this because normalizeLimit rejected 0/negative with
+// 400, but Go-API callers — addons, tests, a future drainer with an
+// uninitialised cursor — got three different answers for the same
+// input shape.
+//
+// This test pins the new uniformity: `Head`, `Tail`, `ScopeList`,
+// each with limit ∈ {-1, 0}, all return empty + more=false.
+func TestGateway_ReadMethods_NonPositiveLimitUniformlyEmpty(t *testing.T) {
+	g := newGatewayForTest(t)
+	for i := 0; i < 3; i++ {
+		_, _ = g.Append(Item{
+			Scope:   "posts",
+			ID:      "p-" + string(rune('0'+i)),
+			Payload: json.RawMessage(`{"v":1}`),
+		})
+	}
+	_, _ = g.Append(Item{Scope: "other", Payload: json.RawMessage(`{}`)})
+
+	for _, limit := range []int{-1, 0} {
+		t.Run("limit="+strconv.Itoa(limit), func(t *testing.T) {
+			items, more, found := g.Head("posts", 0, limit)
+			if len(items) != 0 || more || !found {
+				t.Errorf("Head: items=%d more=%v found=%v want (0,false,true)",
+					len(items), more, found)
+			}
+
+			tailItems, hasMore, tailFound := g.Tail("posts", limit, 0)
+			if len(tailItems) != 0 || hasMore || !tailFound {
+				t.Errorf("Tail: items=%d more=%v found=%v want (0,false,true)",
+					len(tailItems), hasMore, tailFound)
+			}
+
+			entries, slMore := g.ScopeList("", "", limit)
+			if len(entries) != 0 || slMore {
+				t.Errorf("ScopeList: entries=%d more=%v want (0,false)",
+					len(entries), slMore)
+			}
+		})
 	}
 }

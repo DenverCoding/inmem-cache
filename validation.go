@@ -86,15 +86,38 @@ func requireID(id, endpoint string) error {
 	return checkKeyField("id", id, MaxIDBytes)
 }
 
-// payloadPresent is the single gate for "has the client actually supplied a
-// payload?" Missing field → RawMessage is nil/empty. Explicit `null` → raw
-// bytes "null". Both mean "no payload" and are rejected; every other JSON
-// value (object, array, string, number, bool) is treated as opaque data.
-func payloadPresent(p json.RawMessage) bool {
-	if len(p) == 0 {
-		return false
+// validatePayload enforces the two-part payload shape contract from RFC
+// §4.1: payload must be present (not missing, not literal `null`) AND
+// must be a syntactically valid JSON value. Both cases produce a 400
+// Bad Request via the validator's wrapValidation defer.
+//
+// Why both checks live here:
+//
+//   - Missing / null → RawMessage is nil/empty, or the bytes "null"
+//     (possibly with whitespace). Treated as "no payload" and rejected
+//     with a clear error so callers don't conflate "field absent" with
+//     "field set to JSON null".
+//   - Malformed JSON → the bytes are not a valid JSON encoding. The
+//     HTTP path's encoding/json decode would already fail this case
+//     during the structural scan that populates RawMessage, but a
+//     direct Gateway caller (Append/Upsert/Update/Warm/Rebuild) hands
+//     the slice in as-is. Without an explicit json.Valid check the
+//     invalid bytes would be stored opaquely and re-served by /get,
+//     /head, /tail, /render and `_events` envelopes, breaking any
+//     downstream consumer that json.Unmarshals.
+//
+// Cost: one O(n) scan per write. ~30 ns on small payloads, ~5 µs on a
+// 1 MiB payload — well below the HTTP path's per-request overhead and
+// the existing precomputeRenderBytes / approxItemSize passes the
+// validator already runs.
+func validatePayload(p json.RawMessage) error {
+	if len(p) == 0 || bytes.Equal(bytes.TrimSpace(p), []byte("null")) {
+		return errors.New("the 'payload' field is required")
 	}
-	return !bytes.Equal(bytes.TrimSpace(p), []byte("null"))
+	if !json.Valid(p) {
+		return errors.New("the 'payload' field must be a valid JSON value")
+	}
+	return nil
 }
 
 // checkItemSize must measure what the write path will actually store, not
@@ -199,8 +222,8 @@ func validateWriteItem(item Item, endpoint string, maxItemBytes int64) (returnEr
 	if err := validateID(item.ID); err != nil {
 		return err
 	}
-	if !payloadPresent(item.Payload) {
-		return errors.New("the 'payload' field is required")
+	if err := validatePayload(item.Payload); err != nil {
+		return err
 	}
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '" + endpoint + "' endpoint")
@@ -222,8 +245,8 @@ func validateUpsertItem(item Item, maxItemBytes int64) (returnErr error) {
 	if err := requireID(item.ID, "/upsert"); err != nil {
 		return err
 	}
-	if !payloadPresent(item.Payload) {
-		return errors.New("the 'payload' field is required")
+	if err := validatePayload(item.Payload); err != nil {
+		return err
 	}
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '/upsert' endpoint")
@@ -252,8 +275,8 @@ func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
 			return err
 		}
 	}
-	if !payloadPresent(item.Payload) {
-		return errors.New("the 'payload' field is required")
+	if err := validatePayload(item.Payload); err != nil {
+		return err
 	}
 	if err := rejectClientTs(item, "/update"); err != nil {
 		return err
@@ -264,7 +287,15 @@ func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
 // validateCounterAddRequest returns the parsed `by` on success so the handler
 // can pass it straight to the store without re-dereferencing the pointer.
 // Missing `by` is distinguished from an explicit zero by the pointer type.
-func validateCounterAddRequest(req counterAddRequest) (by int64, returnErr error) {
+//
+// maxItemBytes is the per-item cap that applies to the resulting counter
+// item. Counter items have a fully-determined size (48 fixed overhead +
+// len(scope) + len(id) + counterCellOverhead) — no payload-size variance —
+// so the candidate is checkable up-front, mirroring /append's checkItemSize
+// gate. Without this check the create and promote paths in counterAddSlow
+// silently commit counter items past MaxItemBytes whenever scope+id+56
+// exceeds the cap (and on small caps, that's any scope+id at all).
+func validateCounterAddRequest(req counterAddRequest, maxItemBytes int64) (by int64, returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(req.Scope, "/counter_add"); err != nil {
 		return 0, err
@@ -284,6 +315,20 @@ func validateCounterAddRequest(req counterAddRequest) (by int64, returnErr error
 	}
 	if by > MaxCounterValue || by < -MaxCounterValue {
 		return 0, errors.New("the 'by' field must be within ±(2^53-1)")
+	}
+	// Per-item cap pre-flight on the candidate counter shape. The
+	// candidate carries a non-nil counter marker so approxItemSize
+	// charges counterCellOverhead in place of len(Payload) +
+	// len(renderBytes); Payload itself stays nil because counter items
+	// never store payload bytes (readers materialise from cell.value
+	// at the boundary). Sentinel maxItemBytes <= 0 disables the
+	// check — fuzz callers pass 0 to exercise the shape rules
+	// without provisioning a realistic per-item budget.
+	if maxItemBytes > 0 {
+		candidate := Item{Scope: req.Scope, ID: req.ID, counter: &counterCell{}}
+		if size := approxItemSize(candidate); size > maxItemBytes {
+			return 0, fmt.Errorf("the counter item's approximate size (%d bytes) exceeds the maximum of %d bytes", size, maxItemBytes)
+		}
 	}
 	return by, nil
 }
