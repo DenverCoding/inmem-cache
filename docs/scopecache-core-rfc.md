@@ -1,6 +1,6 @@
 # scopecache — Core RFC
 
-> **Status: pre-v1.0 draft.** All sections (§1–§9) are in place.
+> **Status: pre-v1.0 draft.** All sections (§1–§10) are in place.
 > Wording, structure, and detail levels remain open for revision.
 > [scopecache-rfc-old.md](scopecache-rfc-old.md) is kept as a
 > historical reference for the v0.7.16-era multi-tenant gateway
@@ -107,7 +107,7 @@ build their own addons against the same public interface without
 touching the core.
 
 One addon-shaped concern lives in core by exception: the subscriber
-bridge (§7.4) that turns the in-process `Subscribe` primitive into
+bridge (§7.5) that turns the in-process `Subscribe` primitive into
 external command invocations. That single bridge is universal
 enough that every realistic deployment wants it; the cost of
 keeping it in `package scopecache` is one stdlib `os/exec`
@@ -189,7 +189,7 @@ query-specific scope. The core makes no special accommodations for
 this pattern; it simply allows it through naming flexibility.
 
 Adding more filter axes to the core is explicitly **not** on the
-roadmap. See §9.3.
+roadmap. See §10.3.
 
 ### 2.3 Scopes and IDs are opaque strings
 
@@ -214,7 +214,7 @@ pre-creates at boot and protects from scope-level destruction
 (see §2.6). Other underscore-prefixed names (`_tokens`,
 `_counters_*`, `_guarded:*`, …) remain pure naming convention
 that addons follow for operator recognisability; the core does
-not parse or interpret those prefixes — see §9.2 for the
+not parse or interpret those prefixes — see §10.2 for the
 addon-state protection model.
 
 ### 2.4 Per-scope metadata
@@ -225,7 +225,7 @@ addressing; the two read-bookkeeping fields (`lastAccessTS`,
 `readCountTotal`) are exposed as primitives. Time-windowed
 aggregations (rolling N-day counts, hourly histograms, exponential
 decay, …) are policy and live in addons that poll `readCountTotal`
-deltas off a scheduler — see §8.
+deltas off a scheduler — see §9.
 
 | field                | purpose                                                                        |
 |----------------------|--------------------------------------------------------------------------------|
@@ -246,8 +246,7 @@ The seven primitives (`item_count`, `last_seq`, `approx_scope_mb`,
 are surfaced as a per-scope bundle on `/scopelist` (§6.5), with
 optional prefix filtering and alphabetical cursor pagination.
 `/stats` itself stays aggregate-only (§2.5). In-process Go callers
-will be able to read the same fields via the `*Direct` API once it
-ships in Phase B.
+read the same per-scope fields via `*Gateway.ScopeList` (§7.2).
 
 **`/counter_add` and the freshness signal.** `/counter_add` refreshes
 the per-item `ts` on every create and increment, but does NOT bump the
@@ -281,7 +280,7 @@ The four atomics (`scope_count`, `total_items`, `approx_store_mb`,
 the loads can produce a snapshot where the fields reflect slightly
 different instants; the `Σ scope.bytes == approx_store_mb`, `Σ
 len(scope.items) == total_items`, and `last_write_ts >= max(scope.lastWriteTS)`
-invariants hold at quiesce, not at every observation. See §7.3.
+invariants hold at quiesce, not at every observation. See §8.3.
 
 **Polling pattern.** Clients that maintain a local view of cache
 state can compare `last_write_ts` against the value from their
@@ -296,7 +295,7 @@ clocks advance out of order across CPUs.
 ### 2.6 Reserved scopes and boot-time initialisation
 
 The cache reserves exactly two scope names: `_events` and `_inbox`.
-Both are pre-created at `NewGateway` time so subscribers (§7.4) and
+Both are pre-created at `NewGateway` time so subscribers (§7.4–7.5) and
 apps can attach to a known-stable target without a "scope-doesn't-
 exist-yet" race, and both are re-created automatically after
 `/wipe` and `/rebuild` so the cache always lands on a consistent
@@ -304,8 +303,8 @@ post-event baseline.
 
 | Reserved scope | Role | Writer | Reader |
 |---|---|---|---|
-| `_events` | Cache-managed write-event log | The cache itself, on every successful mutation to any non-reserved scope | The in-core subscriber bridge (§7.4), or any caller of `Gateway.Subscribe` |
-| `_inbox` | Application-side fan-in ingestion scope | External clients via `/append` | The in-core subscriber bridge (§7.4), or any caller of `Gateway.Subscribe` |
+| `_events` | Cache-managed write-event log | The cache itself, on every successful mutation to any non-reserved scope | The in-core subscriber bridge (§7.5), or any caller of `Gateway.Subscribe` |
+| `_inbox` | Application-side fan-in ingestion scope | External clients via `/append` | The in-core subscriber bridge (§7.5), or any caller of `Gateway.Subscribe` |
 
 **Operations on reserved scopes** follow the
 append-only-drain-stream pattern. The cache allows the operations
@@ -429,9 +428,7 @@ result the cache computed. `/counter_add` events carry `by` (the
 increment), not the new value; `/delete_up_to` events carry
 `max_seq`, not the deleted-count. This makes the event stream
 replay-able and matches the WAL discipline downstream sinks
-expect. The auto-populate behaviour itself is wired in steps
-5b-5e of the Phase A roadmap; until those land, `Events.Mode` is
-accepted by config but consulted by no write path.
+expect.
 
 **Implementation locus.** Constants `EventsScopeName` and
 `InboxScopeName` live in `types.go`, alongside `InboxMaxItemBytes`
@@ -484,7 +481,7 @@ in the rightmost column reflect what `Config{}.WithDefaults()` plus
 | *(adapter-level)*             | `SCOPECACHE_SUBSCRIBER_COMMAND`      | `subscriber_command`   | *(empty — no subscriber spawned)* |
 
 The last row is an **adapter-level knob**, not a `Config` field. It
-activates the in-core subscriber bridge at boot — see §7.4 for the
+activates the in-core subscriber bridge at boot — see §7.5 for the
 contract.
 
 The remaining caps in the cache are **derived** from the rows above
@@ -574,7 +571,7 @@ Operator tools to manage capacity:
   previous contents' bytes in the same call)
 - `/rebuild` — atomically replace the entire store
 
-Read-bookkeeping metadata (§8) helps operators identify which
+Read-bookkeeping metadata (§9) helps operators identify which
 scopes are cold enough to evict, but the cache itself never
 decides.
 
@@ -1244,7 +1241,7 @@ true|false`. See §5.3 for why misses are not 404.
 
 **Side effects**
 
-A successful hit bumps the per-scope read-bookkeeping atomics (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 **Example**
 
@@ -1283,7 +1280,7 @@ Same as `/get`: `scope`, plus exactly one of `id` or `seq`.
 
 **Side effects**
 
-A successful hit bumps the per-scope read-bookkeeping atomics (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 **Example**
 
@@ -1346,7 +1343,7 @@ cursor-based forward paging (stable under `/delete_up_to`), or
 
 **Side effects**
 
-A successful hit bumps the per-scope read-bookkeeping atomics (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 **Example**
 
@@ -1393,7 +1390,7 @@ tail. Returns 200 in both the hit and miss case.
 
 **Side effects**
 
-A successful hit bumps the per-scope read-bookkeeping atomics (§8).
+A successful hit bumps the per-scope read-bookkeeping atomics (§9).
 
 **Example**
 
@@ -1609,7 +1606,7 @@ rather than per-request hot paths.
 **Side effects**
 
 None. `/scopelist` is observability and does NOT bump per-scope
-read-bookkeeping (§8). An addon that polls `/scopelist` to compute
+read-bookkeeping (§9). An addon that polls `/scopelist` to compute
 read-count deltas would otherwise see its own polls inflate the
 counters it is trying to measure.
 
@@ -1739,89 +1736,154 @@ curl -s 'http://localhost:8080/help'
 
 ---
 
-## 7. Operational model
+## 7. Go API surface (`*scopecache.Gateway`)
 
-### 7.1 Locking
+Sections 5 and 6 describe the **HTTP** contract. This section
+describes the symmetric **in-process Go** contract — the surface
+addons, the standalone binary, the Caddy module, and any embedded
+consumer reach the cache through.
 
-The cache uses three concentric layers of locks:
+### 7.1 What `*Gateway` is
 
-- **Shard locks** — the scope registry is split into independently
-  locked shards. Scope creation and lookup take only the relevant
-  shard's lock, so unrelated scopes parallelise across shards.
-- **Per-scope locks** — every scope has its own `sync.RWMutex`.
-  Single-item writes take the shard lock to look up the scope,
-  then operate at scope level under the scope's mutex. Concurrent
-  writes to the same scope serialise on this mutex; writes to
-  different scopes do not.
-- **Multi-shard locks** — store-wide mutations (`/wipe`,
-  `/rebuild`, multi-scope `/warm`) acquire shard locks in
-  ascending shard-index order to prevent deadlock between
-  concurrent multi-shard operations.
+`*scopecache.Gateway` is the **only** Go entry point into the
+cache. The underlying `*store` and its lowercase methods are
+unreachable from outside `package scopecache`; every external
+caller — adapter, addon, test — holds a `*Gateway` and calls its
+methods.
 
-The byte-budget counter (used by `MaxStoreBytes` admission) is a
-single atomic value, modified via compare-and-swap. Writes reserve
-their net byte delta on this counter before taking the per-scope
-lock, so an over-cap write fails fast without acquiring the scope
-mutex.
+```
+            HTTP world                      Go world
+                ↓                              ↓
+           *API (handlers)                *Gateway
+                ↓                              ↓
+                └─────── *store ───────────────┘
+                          (internal)
+```
 
-### 7.2 Durability contract
+Two paths into the same store, with different responsibilities:
 
-A `200 OK` response from any write endpoint confirms the write was
-applied to the cache at the moment of commit. It is **not** a
-persistence guarantee:
+- HTTP requests enter through `*API`. `NewAPI(gw, …)` extracts
+  `gw.store` once at construction and dispatches every handler
+  directly through `*store`. Gateway is bypassed; the request
+  body is already detached from the wire by
+  `json.RawMessage.UnmarshalJSON`.
+- Go callers enter through `*Gateway`. Every data-plane method
+  validates and clones (§7.3) before delegating to `*store`.
+  Validation lives at the `*store` method top so callers cannot
+  bypass shape rules by entering via Go instead of HTTP.
 
-- The cache is in-memory only. Process restart clears everything.
-- A concurrent `/rebuild` or `/wipe` replaces or clears the entire
-  store and erases writes that committed moments earlier. This is
-  intentional: both endpoints express "the source of truth says
-  this is the new state," and the cache is explicitly subordinate
-  to that source.
-- `/delete_scope` and `/delete_up_to` erase earlier writes within
-  their scope by design. Appends that committed just before a
-  delete can vanish from the cache (but not from the source of
-  truth, which is where they came from).
-- The orphan-detach mechanism (returning `409` when a scope is
-  unlinked mid-write) protects the store's internal accounting —
-  the byte counter cannot be corrupted by a write committing into
-  a buffer unlinked by a concurrent swap — but it does not, and
-  cannot, retroactively preserve the write itself.
+The package-internal rule, for completeness: in-package code
+(events.go, subscribe.go, subscriber_command.go) reaches `*store`
+directly, not via `*Gateway` — internal callers don't pay the
+boundary tax. External code never has that option.
 
-Clients MUST be idempotent against cache loss (items re-fetchable
-or re-derivable from the source of truth) and MUST NOT treat a
-`200 OK` as a durable acknowledgement.
+`NewGateway(c Config) *Gateway` is the only constructor. Adapters
+pass a fully-populated `Config` (item caps, store-byte cap,
+events mode, inbox tuning); see §3.0 for the knob mapping. The
+returned `*Gateway` is ready to use; it owns the store and is
+goroutine-safe across all methods.
 
-### 7.3 Read consistency
+### 7.2 Method catalog
 
-Read endpoints answer under per-scope read locks: the contents of
-any single scope returned by `/get`, `/head`, `/tail`, or `/render`
-are internally consistent at the moment of the read.
+Every public HTTP endpoint in §6 has a 1:1 `*Gateway` method with
+the identical contract. The shape: HTTP request body fields become
+Go method arguments; HTTP response fields become return values.
 
-`/stats` is an **advisory snapshot**, not a transaction:
+| HTTP endpoint   | `*Gateway` method                                                                       | Returns                              |
+|-----------------|-----------------------------------------------------------------------------------------|--------------------------------------|
+| `POST /append`         | `Append(item Item) (Item, error)`                                                | committed item (Seq + Ts assigned)   |
+| `POST /upsert`         | `Upsert(item Item) (Item, bool, error)`                                          | item, `created` (true on new)        |
+| `POST /update`         | `Update(item Item) (int, error)`                                                 | updated count (0 = miss)             |
+| `POST /counter_add`    | `CounterAdd(scope, id string, by int64) (int64, bool, error)`                    | post-add value, `created`            |
+| `POST /delete`         | `Delete(scope, id string, seq uint64) (int, error)`                              | deleted count                        |
+| `POST /delete_up_to`   | `DeleteUpTo(scope string, maxSeq uint64) (int, error)`                           | deleted count                        |
+| `POST /delete_scope`   | `DeleteScope(scope string) (int, bool, error)`                                   | item count, `found`                  |
+| `POST /wipe`           | `Wipe() (int, int, int64)`                                                       | scopes, items, freed bytes           |
+| `POST /warm`           | `Warm(grouped map[string][]Item) (int, error)`                                   | replaced scope count                 |
+| `POST /rebuild`        | `Rebuild(grouped map[string][]Item) (int, int, error)`                           | scope count, item count              |
+| `GET /get`             | `Get(scope, id string, seq uint64) (Item, bool)`                                 | item, hit                            |
+| `GET /render`          | `Render(scope, id string, seq uint64) ([]byte, bool)`                            | rendered bytes, hit                  |
+| `GET /head`            | `Head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool)`            | items, truncated, scope_found        |
+| `GET /tail`            | `Tail(scope string, limit, offset int) ([]Item, bool, bool)`                     | items, has_more, scope_found         |
+| `GET /stats`           | `Stats() Stats`                                                                  | typed snapshot                       |
+| `GET /scopelist`       | `ScopeList(prefix, after string, limit int) ([]ScopeListEntry, bool)`            | rows, truncated                      |
 
-- Every field comes from an independent atomic load. The three
-  counters (`scope_count`, `total_items`, `approx_store_mb`) are
-  maintained incrementally on every write/delete/bulk path, but
-  they are not loaded under a shared lock — concurrent writes
-  between the three loads can produce a snapshot where the fields
-  reflect three slightly different instants.
-- The `Σ scope.bytes == total_bytes` and `Σ len(scope.items) ==
-  total_items` invariants hold at quiesce, not at every observation.
+For single-item lookup (`Get`, `Render`, `Delete`), pass `id != ""`
+to use the id path; pass `id == ""` and a non-zero `seq` to use
+the seq path. The validator enforces the id-xor-seq invariant.
 
-Operators using `/stats` to drive decisions (capacity planning,
-admission-control headroom) should treat its output as approximate
-rather than transactional.
+Two control-plane methods have no HTTP equivalent because they
+return Go-only types (a channel, a stop function):
 
-### 7.4 Subscribe and the in-core subscriber bridge
+| `*Gateway` method                                                        | Purpose                                       |
+|--------------------------------------------------------------------------|-----------------------------------------------|
+| `Subscribe(scope) (<-chan struct{}, func(), error)`                      | wake-up channel for a reserved scope (§7.4)   |
+| `StartSubscriber(scope, command string) (stop func(), err error)`        | spawn an exec-driven subscriber goroutine (§7.5) |
 
-The cache exposes one in-process Go primitive on top of which
-operators wire automatic drainers, write-event publishers, and
-similar reactive pipelines: `Gateway.Subscribe`. On top of that
-primitive the core ships one ready-to-deploy bridge,
-`Gateway.StartSubscriber`, which translates wake-ups from the
-primitive into invocations of an operator-supplied executable.
-Both are documented here.
+Errors returned by data-plane methods are typed and match the HTTP
+status mapping in §5.3:
 
-#### 7.4.1 Subscribe primitive
+- `ErrInvalidInput` (wrapped) — bad shape: 400 over HTTP. Use
+  `errors.Is(err, scopecache.ErrInvalidInput)`.
+- `*ScopeFullError`, `*StoreFullError`, `*ScopeCapacityError` —
+  capacity rejections: 507 over HTTP. Type-switch to read the
+  fields (counts, caps, offenders).
+- `*ScopeDetachedError` — concurrent destructive op detached the
+  buffer mid-write: 409 over HTTP. Retry-safe.
+- `*CounterPayloadError`, `*CounterOverflowError` — counter-
+  specific rejections: 409 / 400 over HTTP.
+- `ErrInvalidSubscribeScope`, `ErrAlreadySubscribed` — control-
+  plane only; see §7.4.
+
+### 7.3 Defensive payload-byte cloning
+
+`Item.Payload` is `json.RawMessage` — a `[]byte`. Without
+defensive copies, the slice the caller passes to `gw.Append`
+and the slice the cache stores would share the same backing
+array. A Go caller mutating their payload after `Append` returns
+would silently mutate the cached item, **bypassing every lock the
+cache holds**. The same hazard applies in reverse on items
+returned from `Get` / `Head` / `Tail` / `Render`.
+
+`*Gateway` closes this hazard by cloning at every boundary:
+
+- **Entry clone.** `Append`, `Upsert`, `Update`, `Warm`, `Rebuild`
+  copy the caller's `Item.Payload` (and every payload inside the
+  `map[string][]Item` for the bulk paths) into a fresh allocation
+  before delegating to `*store`. The caller may mutate or release
+  their original slice immediately after the call returns; the
+  cached state is independent.
+- **Exit clone.** `Append` and `Upsert` (return the committed
+  item), `Get`, `Head`, `Tail`, and `Render` (return cached state)
+  copy out into fresh allocations before returning. The caller
+  may mutate or retain the returned slice freely; cached state is
+  independent.
+
+`Subscribe` and `StartSubscriber` carry no payload bytes — they
+return a wake-up channel and a stop function — so the clone
+discipline does not apply. `Stats` and `ScopeList` return only
+metadata. `CounterAdd`, `Delete`, `DeleteUpTo`, `DeleteScope`,
+`Wipe` take and return value types only.
+
+The HTTP path does not pay the cloning cost. `NewAPI` extracts
+`gw.store` and dispatches handlers directly; the request body
+arrives via `json.RawMessage.UnmarshalJSON`, which copies its
+input by stdlib contract, so HTTP-decoded payloads are already
+detached. Production HTTP traffic never crosses the Gateway
+boundary.
+
+For Go callers the cost scales with payload size: sub-microsecond
+for ≤1 KiB items, memcpy-bound (~10–20 GB/s) for large payloads.
+A 1 MiB single-clone is roughly 50 µs; an `Append` (entry + exit
+clone) of the same is roughly twice that.
+
+### 7.4 Subscribe primitive
+
+`Subscribe` is the in-process Go primitive on top of which addons
+build automatic drainers, write-event publishers, and reactive
+pipelines. The core ships one ready-to-deploy bridge on top of it
+(§7.5); custom Go subscribers are first-class — see the addon
+skeleton in §7.9.
 
 ```go
 ch, unsub, err := gw.Subscribe(scope)
@@ -1858,7 +1920,7 @@ ch, unsub, err := gw.Subscribe(scope)
   work the subscriber goroutine had already started runs to
   completion.
 
-#### 7.4.2 StartSubscriber bridge
+### 7.5 StartSubscriber bridge
 
 ```go
 stop, err := gw.StartSubscriber(scope, command)
@@ -1886,7 +1948,7 @@ does not know how the command reaches the cache.
 **and** blocks until the goroutine has fully exited (including any
 in-flight `cmd.Run` for the currently-executing command). This
 lets adapters sequence "stop subscribers → tear down server"
-deterministically — see §7.4.4 below for the standalone-binary
+deterministically — see §7.7 below for the standalone-binary
 shutdown ordering.
 
 Concurrency: one goroutine per scope, one command run at a time
@@ -1895,7 +1957,7 @@ running coalesce in the cache's single-slot wake-up channel; the
 next loop iteration sees one pending wake-up and triggers one more
 command run.
 
-#### 7.4.3 Activation knob
+### 7.6 Activation knob
 
 The bridge is wired by the adapters via the single
 `subscriber_command` knob (see §3.0):
@@ -1929,7 +1991,7 @@ shell script that demonstrates the drain pattern (sleep 0.5, GET
 /head, write JSONL, POST /delete_up_to, repeat until empty) but
 operators may swap in any language or compiled binary.
 
-#### 7.4.4 Lifecycle ordering at shutdown
+### 7.7 Lifecycle ordering at shutdown
 
 The standalone binary stops subscribers **before** calling
 `server.Shutdown(ctx)` so any running drain command can complete
@@ -1949,7 +2011,7 @@ adapter responsibility, not core — the bridge exposes a synchronous
 `stop()` so adapters can wire it correctly without needing to know
 internals.
 
-#### 7.4.5 Crash-safety invariant for any subscriber
+### 7.8 Crash-safety invariant for any subscriber
 
 This applies to **any** subscriber pattern — the in-core bridge,
 operators writing their own Go-side subscribers via `Subscribe`,
@@ -1976,21 +2038,276 @@ tmp-file is the closest portable equivalent. The cache itself
 holds nothing recoverable — `_events` is in-memory only — so the
 durability burden is entirely on the sink side.
 
-#### 7.4.6 Reference materials
+### 7.9 Addon skeleton — reactive event drain
+
+The canonical push-shaped addon: subscribe to a reserved scope,
+drain new items in batches on every wake-up, hand each item to a
+caller-supplied handler. Roughly the shape a Mercure publisher,
+in-process logger, or content-routing addon would take.
+
+```go
+package eventdrain
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/VeloxCoding/scopecache"
+)
+
+// Drain wakes up on every write to scope and processes new items
+// in seq order via handler. Cursor advances per processed item;
+// items with seq <= cursor are removed via DeleteUpTo so the
+// reserved scope does not accumulate indefinitely.
+//
+// Crash-safety: this skeleton acks (DeleteUpTo) after the handler
+// returns. Real deployments should persist cursor durably before
+// calling DeleteUpTo — see §7.8.
+type Drain struct {
+	gw      *scopecache.Gateway
+	scope   string
+	handler func(scopecache.Item) error
+}
+
+func New(gw *scopecache.Gateway, scope string, handler func(scopecache.Item) error) *Drain {
+	return &Drain{gw: gw, scope: scope, handler: handler}
+}
+
+// Run blocks until ctx is cancelled or the subscription closes.
+// Returns ctx.Err() on cancellation, the first handler error if
+// the handler ever fails, or nil if the subscription was closed
+// from elsewhere.
+func (d *Drain) Run(ctx context.Context) error {
+	ch, unsub, err := d.gw.Subscribe(d.scope)
+	if err != nil {
+		return fmt.Errorf("subscribe %s: %w", d.scope, err)
+	}
+	defer unsub()
+
+	var cursor uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case _, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			for {
+				items, _, _ := d.gw.Head(d.scope, cursor, 100)
+				if len(items) == 0 {
+					break
+				}
+				for _, ev := range items {
+					if err := d.handler(ev); err != nil {
+						log.Printf("eventdrain: handler error at seq %d: %v", ev.Seq, err)
+						return err
+					}
+					cursor = ev.Seq
+				}
+				if _, err := d.gw.DeleteUpTo(d.scope, cursor); err != nil {
+					return fmt.Errorf("ack: %w", err)
+				}
+			}
+		}
+	}
+}
+```
+
+Wiring into an adapter:
+
+```go
+gw := scopecache.NewGateway(cfg)
+drain := eventdrain.New(gw, scopecache.EventsScopeName, func(ev scopecache.Item) error {
+    // Item.Payload is safe to retain — Gateway has cloned it.
+    return publishToMercure(ev.Scope, ev.ID, ev.Payload)
+})
+go func() {
+    if err := drain.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+        log.Printf("drain exited: %v", err)
+    }
+}()
+```
+
+Notes:
+
+- `Subscribe` is restricted to reserved scopes; pass
+  `scopecache.EventsScopeName` (cache-managed write events) or
+  `scopecache.InboxScopeName` (app-side fan-in).
+- The wake-up channel coalesces — a burst of N writes can produce
+  one wake-up; the inner loop drains until `Head` returns no items.
+- `Item.Payload` is a fresh slice (Gateway clones on exit, §7.3).
+  The handler can retain it, hash it, ship it elsewhere — the
+  cache's storage is unaffected.
+- A single subscriber per scope is enforced; if your addon needs
+  multi-fan-out, drain into an internal channel and split there.
+
+### 7.10 Addon skeleton — wrapper-on-write
+
+The canonical pre-write transformation addon: wrap `*Gateway`,
+intercept a write method, transform a field, forward. A
+content-hasher (id = SHA-256 of payload), an idempotency-key
+deduplicator, or a payload validator all share this shape.
+
+```go
+package contenthash
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+
+	"github.com/VeloxCoding/scopecache"
+)
+
+// Hasher wraps *Gateway and rewrites Append calls so the SHA-256
+// of the payload becomes the item's id. Caller-supplied id is
+// overridden. All other Gateway methods are reachable via Gw().
+type Hasher struct {
+	gw *scopecache.Gateway
+}
+
+func New(gw *scopecache.Gateway) *Hasher {
+	return &Hasher{gw: gw}
+}
+
+// Gw returns the underlying *Gateway for callers that need
+// non-wrapped methods (Get, Tail, Stats, etc.).
+func (h *Hasher) Gw() *scopecache.Gateway { return h.gw }
+
+// Append computes sha256(payload) and substitutes the hex digest
+// as item.ID, then forwards to gw.Append. The committed item
+// (with cache-assigned Seq + Ts) is returned unchanged.
+func (h *Hasher) Append(item scopecache.Item) (scopecache.Item, error) {
+	sum := sha256.Sum256(item.Payload)
+	item.ID = hex.EncodeToString(sum[:])
+	return h.gw.Append(item)
+}
+```
+
+Wiring:
+
+```go
+gw := scopecache.NewGateway(cfg)
+hasher := contenthash.New(gw)
+
+// Writes go through the wrapper:
+hasher.Append(scopecache.Item{Scope: "blobs", Payload: payload})
+
+// Reads go through the underlying gateway:
+item, hit := hasher.Gw().Get("blobs", contentID, 0)
+```
+
+Notes:
+
+- The wrapper holds `*Gateway`, not `*store`. Validation, capacity
+  enforcement, and clone discipline still apply — the wrapper
+  cannot bypass them.
+- Wrapping is selective: only methods you transform need wrapping.
+  Everything else is reachable via `Gw()`.
+- Multiple wrappers compose: `validate(hash(gw))` is a chain where
+  each layer adds one transformation. Each layer holds a
+  `*Gateway` (or another wrapper); the cache never sees the
+  composition.
+
+### 7.11 Reference materials
 
 - [`scripts/drain_events.sh`](../scripts/drain_events.sh) —
-  reference command implementation. POSIX shell, depends on `curl`
-  + `jq`. Reads `SCOPECACHE_SCOPE`, `SCOPECACHE_SOCKET_PATH`, and
+  reference command implementation for the StartSubscriber bridge
+  (§7.5). POSIX shell, depends on `curl` + `jq`. Reads
+  `SCOPECACHE_SCOPE`, `SCOPECACHE_SOCKET_PATH`, and
   `SCOPECACHE_OUTPUT_DIR`; drains the scope into timestamped JSONL
   files and exits.
 - [`scripts/e2e_subscriber.sh`](../scripts/e2e_subscriber.sh) —
   end-to-end smoke test that boots the standalone binary with
   `subscriber_command` set, performs 10 writes, polls until
   `_events` is empty, and verifies the JSONL output shape.
+- [`gateway.go`](../gateway.go) +
+  [`gateway_clone.go`](../gateway_clone.go) — implementation of
+  the Gateway boundary and clone discipline.
+- [`gateway_test.go`](../gateway_test.go) +
+  [`gateway_clone_test.go`](../gateway_clone_test.go) —
+  Gateway-level tests, including both directions of the clone
+  discipline (caller mutates input after write; caller mutates
+  output after read).
 
 ---
 
-## 8. Read bookkeeping
+## 8. Operational model
+
+### 8.1 Locking
+
+The cache uses three concentric layers of locks:
+
+- **Shard locks** — the scope registry is split into independently
+  locked shards. Scope creation and lookup take only the relevant
+  shard's lock, so unrelated scopes parallelise across shards.
+- **Per-scope locks** — every scope has its own `sync.RWMutex`.
+  Single-item writes take the shard lock to look up the scope,
+  then operate at scope level under the scope's mutex. Concurrent
+  writes to the same scope serialise on this mutex; writes to
+  different scopes do not.
+- **Multi-shard locks** — store-wide mutations (`/wipe`,
+  `/rebuild`, multi-scope `/warm`) acquire shard locks in
+  ascending shard-index order to prevent deadlock between
+  concurrent multi-shard operations.
+
+The byte-budget counter (used by `MaxStoreBytes` admission) is a
+single atomic value, modified via compare-and-swap. Writes reserve
+their net byte delta on this counter before taking the per-scope
+lock, so an over-cap write fails fast without acquiring the scope
+mutex.
+
+### 8.2 Durability contract
+
+A `200 OK` response from any write endpoint confirms the write was
+applied to the cache at the moment of commit. It is **not** a
+persistence guarantee:
+
+- The cache is in-memory only. Process restart clears everything.
+- A concurrent `/rebuild` or `/wipe` replaces or clears the entire
+  store and erases writes that committed moments earlier. This is
+  intentional: both endpoints express "the source of truth says
+  this is the new state," and the cache is explicitly subordinate
+  to that source.
+- `/delete_scope` and `/delete_up_to` erase earlier writes within
+  their scope by design. Appends that committed just before a
+  delete can vanish from the cache (but not from the source of
+  truth, which is where they came from).
+- The orphan-detach mechanism (returning `409` when a scope is
+  unlinked mid-write) protects the store's internal accounting —
+  the byte counter cannot be corrupted by a write committing into
+  a buffer unlinked by a concurrent swap — but it does not, and
+  cannot, retroactively preserve the write itself.
+
+Clients MUST be idempotent against cache loss (items re-fetchable
+or re-derivable from the source of truth) and MUST NOT treat a
+`200 OK` as a durable acknowledgement.
+
+### 8.3 Read consistency
+
+Read endpoints answer under per-scope read locks: the contents of
+any single scope returned by `/get`, `/head`, `/tail`, or `/render`
+are internally consistent at the moment of the read.
+
+`/stats` is an **advisory snapshot**, not a transaction:
+
+- Every field comes from an independent atomic load. The three
+  counters (`scope_count`, `total_items`, `approx_store_mb`) are
+  maintained incrementally on every write/delete/bulk path, but
+  they are not loaded under a shared lock — concurrent writes
+  between the three loads can produce a snapshot where the fields
+  reflect three slightly different instants.
+- The `Σ scope.bytes == total_bytes` and `Σ len(scope.items) ==
+  total_items` invariants hold at quiesce, not at every observation.
+
+Operators using `/stats` to drive decisions (capacity planning,
+admission-control headroom) should treat its output as approximate
+rather than transactional.
+
+---
+
+## 9. Read bookkeeping
 
 Every successful read hit on `/get`, `/render`, `/head` or `/tail`
 bumps two per-scope atomics so addons (and operators) can tell
@@ -1999,13 +2316,13 @@ any time-windowed aggregation — rolling 7-day count, hourly
 histogram, exponential decay, eviction ranking — is policy and
 lives in addons that poll the primitives off a scheduler.
 
-### 8.1 Tracked fields
+### 9.1 Tracked fields
 
 The fields are maintained on the per-scope buffer; `/stats` is
 aggregate-only and does not surface them. They are exposed via
-`/scopelist` (§6.5) as part of the per-scope detail bundle, and will
-also be readable via the in-process Go API (Phase B). See §2.4 for
-the full list of per-scope fields.
+`/scopelist` (§6.5) as part of the per-scope detail bundle, and
+also readable via the in-process Go API (§7.2). See §2.4 for the
+full list of per-scope fields.
 
 | field              | type   | meaning                                                 |
 |--------------------|--------|---------------------------------------------------------|
@@ -2018,7 +2335,7 @@ window, no day-bucket ringbuffer, no decay model. `read_count_total`
 the caller wants — the addon owns the policy, the cache owns the
 primitive.
 
-### 8.2 What counts as a read
+### 9.2 What counts as a read
 
 The following endpoints stamp `last_access_ts` and increment
 `read_count_total` on a successful hit:
@@ -2031,14 +2348,14 @@ The following endpoints stamp `last_access_ts` and increment
 Misses (no scope, no item, empty result) do **not** count.
 Observability endpoints (`/stats`, `/scopelist`) do not count.
 
-### 8.3 Concurrency
+### 9.3 Concurrency
 
 Bookkeeping updates are lock-free: `lastAccessTS` is an `atomic.Int64`
 store, `readCountTotal` is an `atomic.Uint64` add. The hot read path
 does not take the scope's write lock to update them, so concurrent
 readers do not serialise on bookkeeping.
 
-### 8.4 Read bookkeeping as a building block
+### 9.4 Read bookkeeping as a building block
 
 The two primitives are exposed unconditionally — there is no
 "disable read bookkeeping" knob. Two atomic stores are not
@@ -2053,14 +2370,14 @@ different models without the core baking any one of them in.
 
 ---
 
-## 9. Out of scope
+## 10. Out of scope
 
 The following are **deliberately not** core features. Anything
 listed here either lives in operator policy (gating, networking,
 deployment), in addon sub-packages (per-addon RFCs), or is a
 non-goal entirely.
 
-### 9.1 Not in core: deferred to addons
+### 10.1 Not in core: deferred to addons
 
 - **Authentication and authorization.** Tokens, signatures, mTLS,
   bearer headers, capability checks — none of this is core. Addons
@@ -2075,9 +2392,9 @@ non-goal entirely.
   forget append patterns, payload-cap variations — addon territory.
 - **Eviction-hint queries.** Sorting scopes by activity, age, or
   byte-size to recommend which to drop — addon, built on
-  `/scopelist` and §8 data.
+  `/scopelist` and §9 data.
 
-### 9.2 Not in core: operator policy
+### 10.2 Not in core: operator policy
 
 - **Access control.** Which clients reach which endpoints is a
   transport-layer decision. Caddyfile route guards (or nginx /
@@ -2097,7 +2414,7 @@ non-goal entirely.
   Caddy listener for the module). The adapter and the operator
   jointly decide what's reachable from where.
 
-### 9.3 Not in core: non-goals
+### 10.3 Not in core: non-goals
 
 - **Persistence.** The core is in-memory only. Process restart
   clears everything; rebuild from the source of truth. Addons
