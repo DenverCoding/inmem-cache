@@ -6,11 +6,15 @@ package scopecache
 // It is the wall around the core: the underlying *Store and its
 // lowercase methods are NOT part of the public contract.
 //
-// Methods on Gateway are pure one-line passthroughs. Validation lives
-// at the top of each *Store method; the Gateway adds nothing on the
-// way through. The actual mutation logic lives in store.go,
-// buffer_*.go, events.go, and subscribe.go — gateway.go is just the
-// registration of which operations are part of the public contract.
+// Methods on Gateway are near-passthroughs to *store: the only work
+// they do beyond delegating is defensive payload-byte cloning at the
+// boundary. Validation lives at the top of each *store method; the
+// Gateway adds no shape checks. The actual mutation logic lives in
+// store.go, buffer_*.go, events.go, and subscribe.go — gateway.go is
+// the registration of which operations are part of the public
+// contract, plus the clone discipline that keeps caller-owned and
+// cache-owned []byte slices independent. See gateway_clone.go for
+// the hazard description and helpers.
 //
 // Why one Gateway instead of separate *API (HTTP) and *Direct (Go):
 // external addon authors learn ONE surface, program against ONE file.
@@ -52,21 +56,33 @@ func (g *Gateway) Subscribe(scope string) (<-chan struct{}, func(), error) {
 // --- Data-plane: writes ---------------------------------------------
 
 // Append inserts a new item with cache-assigned seq and ts. Returns
-// the committed item; ErrInvalidInput on validation failure.
+// the committed item; ErrInvalidInput on validation failure. The
+// caller's item.Payload slice is cloned on the way in and the
+// returned item.Payload is cloned on the way out, so neither side
+// can mutate the other's bytes after the call returns. See
+// gateway_clone.go for the rationale.
 func (g *Gateway) Append(item Item) (Item, error) {
-	return g.store.appendOne(item)
+	item.Payload = clonePayload(item.Payload)
+	result, err := g.store.appendOne(item)
+	return cloneItemPayload(result), err
 }
 
 // Upsert creates or replaces an item by (scope, id). Returns
 // (item, created, err); ErrInvalidInput on validation failure.
+// Payload is cloned on entry and exit; see Append.
 func (g *Gateway) Upsert(item Item) (Item, bool, error) {
-	return g.store.upsertOne(item)
+	item.Payload = clonePayload(item.Payload)
+	result, created, err := g.store.upsertOne(item)
+	return cloneItemPayload(result), created, err
 }
 
 // Update modifies the payload of an existing item addressed by
 // scope+id or scope+seq. Returns (updated_count, err);
-// ErrInvalidInput on validation failure.
+// ErrInvalidInput on validation failure. The caller's item.Payload
+// slice is cloned on entry so a post-call mutation cannot reach
+// stored bytes; the return is just a count, no exit clone needed.
 func (g *Gateway) Update(item Item) (int, error) {
+	item.Payload = clonePayload(item.Payload)
 	return g.store.updateOne(item)
 }
 
@@ -112,43 +128,54 @@ func (g *Gateway) Wipe() (int, int, int64) {
 // Warm replaces the contents of every scope present in `grouped`.
 // Scopes not in `grouped` are left untouched. Reserved scopes cannot
 // be /warm targets — replaceScopes rejects that case internally.
-// Returns the number of scopes the call affected.
+// Returns the number of scopes the call affected. Every payload in
+// every input slice is cloned on entry; see Append for the rationale.
 func (g *Gateway) Warm(grouped map[string][]Item) (int, error) {
-	return g.store.replaceScopes(grouped)
+	return g.store.replaceScopes(cloneGroupedItemPayloads(grouped))
 }
 
 // Rebuild atomically replaces the entire user-managed cache state
 // with `grouped`. Reserved scopes are wiped and re-created. Returns
-// (scope_count, item_count, err).
+// (scope_count, item_count, err). Payloads are cloned on entry; see
+// Append for the rationale.
 func (g *Gateway) Rebuild(grouped map[string][]Item) (int, int, error) {
-	return g.store.rebuildAll(grouped)
+	return g.store.rebuildAll(cloneGroupedItemPayloads(grouped))
 }
 
 // --- Data-plane: reads ----------------------------------------------
 
 // Head returns up to `limit` oldest items in `scope` with seq >
-// afterSeq. Returns (items, truncated, scope_found).
+// afterSeq. Returns (items, truncated, scope_found). Each returned
+// item.Payload is a fresh allocation; callers may mutate them
+// without touching cached bytes. See gateway_clone.go.
 func (g *Gateway) Head(scope string, afterSeq uint64, limit int) ([]Item, bool, bool) {
-	return g.store.head(scope, afterSeq, limit)
+	items, truncated, found := g.store.head(scope, afterSeq, limit)
+	return cloneItemsPayloads(items), truncated, found
 }
 
 // Tail returns up to `limit` newest items in `scope`, skipping the
 // first `offset` from the newest end. Returns (items, has_more,
-// scope_found).
+// scope_found). Each returned item.Payload is freshly allocated.
 func (g *Gateway) Tail(scope string, limit, offset int) ([]Item, bool, bool) {
-	return g.store.tail(scope, limit, offset)
+	items, hasMore, found := g.store.tail(scope, limit, offset)
+	return cloneItemsPayloads(items), hasMore, found
 }
 
 // Get returns a single item by scope+id (id != "") or scope+seq
-// (id == ""). Returns (item, hit).
+// (id == ""). Returns (item, hit). The returned item.Payload is a
+// fresh allocation.
 func (g *Gateway) Get(scope, id string, seq uint64) (Item, bool) {
-	return g.store.get(scope, id, seq)
+	item, hit := g.store.get(scope, id, seq)
+	return cloneItemPayload(item), hit
 }
 
 // Render returns the rendered bytes for a single item, addressed by
-// scope+id or scope+seq. Returns (rendered, hit).
+// scope+id or scope+seq. Returns (rendered, hit). The returned slice
+// is a fresh allocation; callers may mutate it without touching
+// cached bytes.
 func (g *Gateway) Render(scope, id string, seq uint64) ([]byte, bool) {
-	return g.store.render(scope, id, seq)
+	rendered, hit := g.store.render(scope, id, seq)
+	return clonePayload(rendered), hit
 }
 
 // --- Observability --------------------------------------------------
