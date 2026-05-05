@@ -140,37 +140,6 @@ func subscriberCommandFromEnv() string {
 	return os.Getenv("SCOPECACHE_SUBSCRIBER_COMMAND")
 }
 
-// startSubscribers wires the in-core subscriber bridge to both
-// reserved scopes when SCOPECACHE_SUBSCRIBER_COMMAND is set. Returns
-// a single stop function that calls every individual unsub in
-// reverse order; callers defer it during shutdown so subscribers are
-// torn down before the HTTP server stops accepting requests.
-//
-// On a Subscribe error the function logs and continues — a half-wired
-// subscriber (e.g. _events succeeded, _inbox failed) is still useful;
-// the operator sees the warning in their normal log stream and can
-// fix it without scopecache failing to boot.
-func startSubscribers(gw *scopecache.Gateway, command string) func() {
-	if command == "" {
-		return func() {}
-	}
-	stops := []func(){}
-	for _, scope := range []string{scopecache.EventsScopeName, scopecache.InboxScopeName} {
-		stop, err := gw.StartSubscriber(scope, command)
-		if err != nil {
-			log.Printf("subscriber: failed to subscribe to %s: %v", scope, err)
-			continue
-		}
-		stops = append(stops, stop)
-	}
-	log.Printf("subscriber: %d subscriber(s) active, command=%s", len(stops), command)
-	return func() {
-		for i := len(stops) - 1; i >= 0; i-- {
-			stops[i]()
-		}
-	}
-}
-
 // eventsModeFromEnv returns the SCOPECACHE_EVENTS_MODE setting parsed
 // into the typed scopecache.EventsMode. Empty string maps to
 // EventsModeOff (the default — auto-populate disabled). Any other
@@ -262,7 +231,7 @@ func main() {
 	// server.Serve returns so subscribers are torn down once the HTTP
 	// layer is no longer accepting writes — otherwise an in-flight
 	// command invocation could outlive the cache.
-	stopSubscribers := startSubscribers(gw, subscriberCommandFromEnv())
+	stopSubscribers := gw.StartReservedSubscribers(subscriberCommandFromEnv(), log.Printf)
 	defer stopSubscribers()
 
 	// Timeouts sized for a local AF_UNIX cache. Budgets account for wire

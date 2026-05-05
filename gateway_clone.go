@@ -21,7 +21,7 @@ import "encoding/json"
 // Unexported Item fields (renderBytes, counter) ALSO need clearing at
 // the boundary, despite being unreachable to outside-package callers
 // directly. The hazard is round-tripping: a caller does
-//   item, _ := gw.Get("scope", "id", 0)   // counter item — pointer rides on the Item
+//   item, _ := gw.GetByID("scope", "id")  // counter item — pointer rides on the Item
 //   item.Scope = "other"; item.Payload = newBytes
 //   _, _ = gw.Append(item)                // counter pointer rides through Append
 // without the clearing, the cache treats the new item as a counter,

@@ -148,7 +148,7 @@ func TestGateway_DataplaneRoundtrip(t *testing.T) {
 	}
 
 	// Get by id.
-	item, hit := g.Get("posts", "p-0", 0)
+	item, hit := g.GetByID("posts", "p-0")
 	if !hit {
 		t.Fatalf("Get(p-0): hit=false; want true")
 	}

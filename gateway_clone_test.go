@@ -49,7 +49,7 @@ func TestGateway_AppendInputClone(t *testing.T) {
 	}
 	mutateBytes(payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -68,7 +68,7 @@ func TestGateway_UpsertInputClone_Create(t *testing.T) {
 	}
 	mutateBytes(payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -91,7 +91,7 @@ func TestGateway_UpsertInputClone_Replace(t *testing.T) {
 	}
 	mutateBytes(payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -115,7 +115,7 @@ func TestGateway_UpdateInputClone(t *testing.T) {
 	}
 	mutateBytes(payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -147,7 +147,7 @@ func TestGateway_WarmInputClone(t *testing.T) {
 		id      string
 		payload []byte
 	}{{"p-1", originalA}, {"p-2", originalB}} {
-		item, hit := g.Get("posts", want.id, 0)
+		item, hit := g.GetByID("posts", want.id)
 		if !hit {
 			t.Fatalf("Get(%s): hit=false; want true", want.id)
 		}
@@ -170,7 +170,7 @@ func TestGateway_RebuildInputClone(t *testing.T) {
 	}
 	mutateBytes(payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -191,7 +191,7 @@ func TestGateway_AppendOutputClone(t *testing.T) {
 	}
 	mutateBytes(result.Payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -210,7 +210,7 @@ func TestGateway_UpsertOutputClone(t *testing.T) {
 	}
 	mutateBytes(result.Payload)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -226,13 +226,13 @@ func TestGateway_GetOutputClone(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	first, hit := g.Get("posts", "p-1", 0)
+	first, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get#1: hit=false; want true")
 	}
 	mutateBytes(first.Payload)
 
-	second, hit := g.Get("posts", "p-1", 0)
+	second, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get#2: hit=false; want true")
 	}
@@ -254,7 +254,7 @@ func TestGateway_HeadOutputClone(t *testing.T) {
 	}
 	mutateBytes(items[0].Payload)
 
-	again, hit := g.Get("posts", "p-1", 0)
+	again, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -276,7 +276,7 @@ func TestGateway_TailOutputClone(t *testing.T) {
 	}
 	mutateBytes(items[0].Payload)
 
-	again, hit := g.Get("posts", "p-1", 0)
+	again, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -296,13 +296,13 @@ func TestGateway_RenderOutputClone_NonStringPayload(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	rendered, hit := g.Render("posts", "p-1", 0)
+	rendered, hit := g.RenderByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Render: hit=false; want true")
 	}
 	mutateBytes(rendered)
 
-	item, hit := g.Get("posts", "p-1", 0)
+	item, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Get: hit=false; want true")
 	}
@@ -319,7 +319,7 @@ func TestGateway_RenderOutputClone_StringPayload(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	rendered, hit := g.Render("posts", "p-1", 0)
+	rendered, hit := g.RenderByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Render: hit=false; want true")
 	}
@@ -328,7 +328,7 @@ func TestGateway_RenderOutputClone_StringPayload(t *testing.T) {
 	}
 	mutateBytes(rendered)
 
-	again, hit := g.Render("posts", "p-1", 0)
+	again, hit := g.RenderByID("posts", "p-1")
 	if !hit {
 		t.Fatalf("Render#2: hit=false; want true")
 	}
@@ -400,7 +400,7 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Append(t *testing.T) {
 
 	// Caller pulls the counter item, swaps it into a fresh
 	// (scope,id) and replaces the payload with a regular JSON object.
-	carrier, hit := g.Get("counters", "c1", 0)
+	carrier, hit := g.GetByID("counters", "c1")
 	if !hit {
 		t.Fatal("Get(counters/c1) miss")
 	}
@@ -415,7 +415,7 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Append(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	got, hit := g.Get("posts", "", committed.Seq)
+	got, hit := g.GetBySeq("posts", committed.Seq)
 	if !hit {
 		t.Fatal("readback miss")
 	}
@@ -435,7 +435,7 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Upsert(t *testing.T) {
 		t.Fatalf("CounterAdd seed: %v", err)
 	}
 
-	carrier, hit := g.Get("counters", "c1", 0)
+	carrier, hit := g.GetByID("counters", "c1")
 	if !hit {
 		t.Fatal("Get miss")
 	}
@@ -449,7 +449,7 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Upsert(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	got, hit := g.Get("posts", "p-1", 0)
+	got, hit := g.GetByID("posts", "p-1")
 	if !hit {
 		t.Fatal("readback miss")
 	}
@@ -469,7 +469,7 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Warm(t *testing.T) {
 		t.Fatalf("CounterAdd seed: %v", err)
 	}
 
-	carrier, hit := g.Get("counters", "c1", 0)
+	carrier, hit := g.GetByID("counters", "c1")
 	if !hit {
 		t.Fatal("Get miss")
 	}
@@ -483,7 +483,7 @@ func TestGateway_CounterPointerDoesNotCrossBoundary_Warm(t *testing.T) {
 		t.Fatalf("Warm: %v", err)
 	}
 
-	got, hit := g.Get("posts", "p-warmed", 0)
+	got, hit := g.GetByID("posts", "p-warmed")
 	if !hit {
 		t.Fatal("readback miss")
 	}

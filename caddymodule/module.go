@@ -109,7 +109,10 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	h.api = scopecache.NewAPI(gw, scopecache.APIConfig{})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
-	h.stopSubscribers = startSubscribers(gw, h.SubscriberCommand)
+	h.stopSubscribers = gw.StartReservedSubscribers(
+		h.SubscriberCommand,
+		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
+	)
 	return nil
 }
 
@@ -123,36 +126,6 @@ func (h *Handler) Cleanup() error {
 		h.stopSubscribers = nil
 	}
 	return nil
-}
-
-// startSubscribers wires the in-core subscriber bridge to both
-// reserved scopes when command is non-empty. Mirrors the
-// standalone-binary helper in cmd/scopecache/main.go: a half-wired
-// subscriber (e.g. _events succeeded, _inbox failed) is allowed; the
-// function logs to stderr and continues so a single misconfiguration
-// doesn't take the Caddy module offline. The returned stop func
-// tears down every successful subscribe in reverse order.
-func startSubscribers(gw *scopecache.Gateway, command string) func() {
-	if command == "" {
-		return func() {}
-	}
-	stops := []func(){}
-	for _, scope := range []string{scopecache.EventsScopeName, scopecache.InboxScopeName} {
-		stop, err := gw.StartSubscriber(scope, command)
-		if err != nil {
-			caddy.Log().Named("scopecache.subscriber").Sugar().Warnf(
-				"subscriber: failed to subscribe to %s: %v", scope, err)
-			continue
-		}
-		stops = append(stops, stop)
-	}
-	caddy.Log().Named("scopecache.subscriber").Sugar().Infof(
-		"subscriber: %d subscriber(s) active, command=%s", len(stops), command)
-	return func() {
-		for i := len(stops) - 1; i >= 0; i-- {
-			stops[i]()
-		}
-	}
 }
 
 // ServeHTTP dispatches to the scopecache mux. Any path the mux does not

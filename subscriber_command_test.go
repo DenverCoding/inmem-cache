@@ -10,6 +10,7 @@ package scopecache
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -452,6 +453,70 @@ func TestStartSubscriber_StopReapsBackgroundedChildren(t *testing.T) {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 		t.Errorf("backgrounded child pid=%d still running 2s after stop() — process group not reaped (orphan-child regression)", pid)
 	}
+}
+
+// StartReservedSubscribers is the helper both adapters (cmd/scopecache,
+// caddymodule) call instead of duplicating their own subscribe-both-
+// reserved-scopes loop. The test pins the contract: empty command is
+// a no-op, non-empty command subscribes both reserved scopes, the
+// returned stop tears them down, the supplied logf is called for the
+// summary line.
+func TestStartReservedSubscribers(t *testing.T) {
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "out.log")
+	command := writeSubscriberCommandHelper(t, dir, outFile)
+
+	t.Run("empty command is a no-op", func(t *testing.T) {
+		gw := NewGateway(Config{Events: EventsConfig{Mode: EventsModeFull}})
+		var logged int
+		stop := gw.StartReservedSubscribers("", func(string, ...any) {
+			logged++
+		})
+		stop() // must be safe to call on the no-op
+		if logged != 0 {
+			t.Errorf("logf called %d times for empty command, want 0", logged)
+		}
+	})
+
+	t.Run("subscribes both reserved scopes and stops cleanly", func(t *testing.T) {
+		gw := NewGateway(Config{Events: EventsConfig{Mode: EventsModeFull}})
+		var summaryLines []string
+		stop := gw.StartReservedSubscribers(command, func(format string, args ...any) {
+			summaryLines = append(summaryLines, fmt.Sprintf(format, args...))
+		})
+
+		// The summary line goes through logf; per-failure lines would
+		// too, but the happy path produces exactly one line.
+		if len(summaryLines) != 1 {
+			t.Fatalf("logf calls = %d, want 1 (summary only); got: %v", len(summaryLines), summaryLines)
+		}
+		if !strings.Contains(summaryLines[0], "2 subscriber(s) active") {
+			t.Errorf("summary = %q, want substring '2 subscriber(s) active'", summaryLines[0])
+		}
+
+		// Sanity: a write to either reserved scope wakes its subscriber.
+		// A write to a non-reserved scope auto-populates _events (events
+		// mode = full) and thus also wakes the _events drainer.
+		if _, err := gw.Append(Item{Scope: "trigger", Payload: []byte(`"x"`)}); err != nil {
+			t.Fatalf("append trigger: %v", err)
+		}
+		if !waitForSubscriberCommand(2*time.Second, func() bool {
+			return len(readSubscriberCommandLines(t, outFile)) >= 1
+		}) {
+			stop()
+			t.Fatal("subscriber never fired after wake-up")
+		}
+
+		// Stop returns; subsequent Subscribe attempts on the same scopes
+		// must succeed (otherwise the unsubscribe path silently leaked).
+		stop()
+		if _, _, err := gw.Subscribe(EventsScopeName); err != nil {
+			t.Errorf("after stop, re-Subscribe to _events: %v (stop did not release the slot)", err)
+		}
+		if _, _, err := gw.Subscribe(InboxScopeName); err != nil {
+			t.Errorf("after stop, re-Subscribe to _inbox: %v (stop did not release the slot)", err)
+		}
+	})
 }
 
 // pidIsRunning returns true iff /proc/<pid>/status reports a live

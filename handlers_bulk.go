@@ -1,7 +1,6 @@
 package scopecache
 
 import (
-	"errors"
 	"net/http"
 	"time"
 )
@@ -39,16 +38,9 @@ func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	grouped := groupItemsByScope(req.Items)
 	replacedScopes, err := api.store.replaceScopes(grouped)
 	if err != nil {
-		if errors.Is(err, ErrInvalidInput) {
-			badRequest(w, started, err.Error())
-			return
-		}
 		// /warm cannot produce *ScopeFullError (only single-item paths do);
 		// scopeForSFE is unused here.
-		if writeStoreCapacityError(w, started, err, "") {
-			return
-		}
-		conflict(w, started, err.Error())
+		writeMutationError(w, started, err, "")
 		return
 	}
 
@@ -89,16 +81,9 @@ func (api *API) handleRebuild(w http.ResponseWriter, r *http.Request) {
 	grouped := groupItemsByScope(req.Items)
 	rebuiltScopes, rebuiltItems, err := api.store.rebuildAll(grouped)
 	if err != nil {
-		if errors.Is(err, ErrInvalidInput) {
-			badRequest(w, started, err.Error())
-			return
-		}
 		// /rebuild cannot produce *ScopeFullError (only single-item paths
 		// do); scopeForSFE is unused here.
-		if writeStoreCapacityError(w, started, err, "") {
-			return
-		}
-		conflict(w, started, err.Error())
+		writeMutationError(w, started, err, "")
 		return
 	}
 

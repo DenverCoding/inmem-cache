@@ -73,6 +73,42 @@ func writeStoreCapacityError(w http.ResponseWriter, started time.Time, err error
 	return false
 }
 
+// writeMutationError centralises the error-mapping pattern shared by
+// /append, /upsert, /update, /warm, and /rebuild:
+//
+//   - ErrInvalidInput  → 400 with the wrapped message
+//   - capacity classes → 507 via writeStoreCapacityError
+//     (*ScopeFullError / *ScopeCapacityError / *StoreFullError)
+//   - anything else    → 409 conflict (the orphan/race shape:
+//     *ScopeDetachedError, *ScopeFullError races resolved by detach,
+//     etc.)
+//
+// `scopeForSFE` plumbs into the single-element offenders list on the
+// *ScopeFullError path; pass "" for callers that cannot produce sfe
+// (/warm, /rebuild produce *ScopeCapacityError; /update produces only
+// *StoreFullError). See writeStoreCapacityError for the rationale on
+// keeping the unused-param shape over splitting helpers.
+//
+// /counter_add does NOT use this helper — it has two extra
+// counter-specific error types (*CounterPayloadError → 409,
+// *CounterOverflowError → 400) that don't fit the helper's vocabulary
+// without coupling it to counter semantics. Delete handlers don't use
+// it either: deletes never produce capacity errors, so the
+// writeStoreCapacityError hop would be dead code on every call.
+//
+// Caller invariant: err is non-nil. The helper writes exactly one
+// response and the caller must `return` immediately afterward.
+func writeMutationError(w http.ResponseWriter, started time.Time, err error, scopeForSFE string) {
+	if errors.Is(err, ErrInvalidInput) {
+		badRequest(w, started, err.Error())
+		return
+	}
+	if writeStoreCapacityError(w, started, err, scopeForSFE) {
+		return
+	}
+	conflict(w, started, err.Error())
+}
+
 // decodeBody caps the request body at max bytes and decodes JSON into out.
 // The MaxBytesReader guard runs at read time, so it protects against clients
 // that omit Content-Length or stream chunked bodies just as much as sized ones.

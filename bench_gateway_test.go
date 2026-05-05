@@ -234,7 +234,7 @@ func BenchmarkGateway_Get(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, ok := gw.Get(scope, ids[i%count], 0); !ok {
+				if _, ok := gw.GetByID(scope, ids[i%count]); !ok {
 					b.Fatalf("Get miss")
 				}
 			}
@@ -344,7 +344,7 @@ func BenchmarkGateway_Render(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				if _, ok := gw.Render(scope, ids[i%len(ids)], 0); !ok {
+				if _, ok := gw.RenderByID(scope, ids[i%len(ids)]); !ok {
 					b.Fatalf("Render miss")
 				}
 			}

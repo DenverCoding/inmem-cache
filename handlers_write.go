@@ -16,8 +16,11 @@ import (
 // All four decode an Item body, run shape validation, reject reserved
 // scope prefixes for non-admin callers, route through the matching
 // Store method (appendOne / upsertOne / counterAddOne / updateOne),
-// and map *ScopeFullError / *ScopeCapacityError / *StoreFullError
-// uniformly via writeStoreCapacityError.
+// and map errors uniformly. /append, /upsert, /update use the shared
+// writeMutationError helper (handlers.go) — ErrInvalidInput → 400,
+// capacity → 507, else 409. /counter_add stays inline because it has
+// two extra error types (*CounterPayloadError → 409,
+// *CounterOverflowError → 400) that don't fit the helper's vocabulary.
 
 // writeAck is the response shape /append and /upsert nest under "item".
 // Mirrors Item's json layout for scope/id/seq/ts so multi_call slots
@@ -52,14 +55,7 @@ func (api *API) handleAppend(w http.ResponseWriter, r *http.Request) {
 	origScope := item.Scope
 	item, err := api.store.appendOne(item)
 	if err != nil {
-		if errors.Is(err, ErrInvalidInput) {
-			badRequest(w, started, err.Error())
-			return
-		}
-		if writeStoreCapacityError(w, started, err, origScope) {
-			return
-		}
-		conflict(w, started, err.Error())
+		writeMutationError(w, started, err, origScope)
 		return
 	}
 
@@ -95,14 +91,7 @@ func (api *API) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	origScope := item.Scope
 	result, created, err := api.store.upsertOne(item)
 	if err != nil {
-		if errors.Is(err, ErrInvalidInput) {
-			badRequest(w, started, err.Error())
-			return
-		}
-		if writeStoreCapacityError(w, started, err, origScope) {
-			return
-		}
-		conflict(w, started, err.Error())
+		writeMutationError(w, started, err, origScope)
 		return
 	}
 
@@ -197,17 +186,10 @@ func (api *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	updated, err := api.store.updateOne(item)
 	if err != nil {
-		if errors.Is(err, ErrInvalidInput) {
-			badRequest(w, started, err.Error())
-			return
-		}
 		// /update only ever sees *StoreFullError on the cap path
 		// (existing-item replace can grow byte size); scopeForSFE is
 		// unused.
-		if writeStoreCapacityError(w, started, err, "") {
-			return
-		}
-		conflict(w, started, err.Error())
+		writeMutationError(w, started, err, "")
 		return
 	}
 

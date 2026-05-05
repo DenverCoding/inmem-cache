@@ -142,6 +142,57 @@ func (gw *Gateway) StartSubscriber(scope, command string) (stop func(), err erro
 	return stop, nil
 }
 
+// StartReservedSubscribers wires the in-core subscriber bridge to
+// every reserved scope (`_events` and `_inbox`) when command is
+// non-empty, returning a single stop function that tears down each
+// subscription in reverse start-order. This is the helper the
+// standalone binary (cmd/scopecache) and the Caddy adapter
+// (caddymodule) both rely on, so the start-order, stop-order,
+// half-wired-on-error policy, and any future fixes live in one
+// place.
+//
+// Behaviour:
+//   - command == "" returns a no-op stop func and logs nothing — the
+//     operator just hasn't enabled the bridge.
+//   - On a per-scope subscribe error, logf is called with a "failed
+//     to subscribe to %s: %v" message and the loop continues. A half-
+//     wired bridge (e.g. _events succeeded, _inbox failed) is still
+//     useful — the operator sees the warning in their normal log
+//     stream and can fix it without taking the whole cache offline.
+//   - After the loop, logf is called once more with a summary
+//     "%d subscriber(s) active, command=%s". Operators rely on this
+//     line to confirm the bridge actually came up.
+//
+// logf must accept the standard fmt-style (string, ...any) shape;
+// callers wrap their preferred logger:
+//
+//	cmd/scopecache:  log.Printf
+//	caddymodule:     caddy.Log().Named("scopecache.subscriber").Sugar().Infof
+//
+// The summary and per-failure messages share the same level by design
+// — Caddy operators who want strict warn/error filtering can route
+// the "failed" substring elsewhere.
+func (g *Gateway) StartReservedSubscribers(command string, logf func(string, ...any)) func() {
+	if command == "" {
+		return func() {}
+	}
+	stops := []func(){}
+	for _, scope := range []string{EventsScopeName, InboxScopeName} {
+		stop, err := g.StartSubscriber(scope, command)
+		if err != nil {
+			logf("subscriber: failed to subscribe to %s: %v", scope, err)
+			continue
+		}
+		stops = append(stops, stop)
+	}
+	logf("subscriber: %d subscriber(s) active, command=%s", len(stops), command)
+	return func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+}
+
 // runSubscriberCommand executes the configured command once, blocking
 // on its exit OR on cancellation of ctx (whichever fires first).
 // Stderr/stdout are inherited from the parent process so operators

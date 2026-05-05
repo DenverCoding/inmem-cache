@@ -57,32 +57,35 @@ func (g *Gateway) Subscribe(scope string) (<-chan struct{}, func(), error) {
 
 // Append inserts a new item with cache-assigned seq and ts. Returns
 // the committed item; ErrInvalidInput on validation failure. The
-// caller's item.Payload slice is cloned on the way in and the
-// returned item.Payload is cloned on the way out, so neither side
-// can mutate the other's bytes after the call returns. See
+// caller's item is cloned on the way in (Payload + the unexported
+// renderBytes/counter fields, via cloneItemPayload) and the returned
+// item is cloned on the way out, so neither side can mutate the
+// other's bytes after the call returns and a counter pointer cannot
+// ride through the Gateway boundary in either direction. See
 // gateway_clone.go for the rationale.
 func (g *Gateway) Append(item Item) (Item, error) {
-	item.Payload = clonePayload(item.Payload)
+	item = cloneItemPayload(item)
 	result, err := g.store.appendOne(item)
 	return cloneItemPayload(result), err
 }
 
 // Upsert creates or replaces an item by (scope, id). Returns
 // (item, created, err); ErrInvalidInput on validation failure.
-// Payload is cloned on entry and exit; see Append.
+// Item is cloned on entry and exit via cloneItemPayload; see Append.
 func (g *Gateway) Upsert(item Item) (Item, bool, error) {
-	item.Payload = clonePayload(item.Payload)
+	item = cloneItemPayload(item)
 	result, created, err := g.store.upsertOne(item)
 	return cloneItemPayload(result), created, err
 }
 
 // Update modifies the payload of an existing item addressed by
 // scope+id or scope+seq. Returns (updated_count, err);
-// ErrInvalidInput on validation failure. The caller's item.Payload
-// slice is cloned on entry so a post-call mutation cannot reach
-// stored bytes; the return is just a count, no exit clone needed.
+// ErrInvalidInput on validation failure. The caller's item is cloned
+// on entry via cloneItemPayload so a post-call mutation cannot reach
+// stored bytes and a stale counter pointer cannot ride through; the
+// return is just a count, no exit clone needed.
 func (g *Gateway) Update(item Item) (int, error) {
-	item.Payload = clonePayload(item.Payload)
+	item = cloneItemPayload(item)
 	return g.store.updateOne(item)
 }
 
@@ -161,20 +164,40 @@ func (g *Gateway) Tail(scope string, limit, offset int) ([]Item, bool, bool) {
 	return cloneItemsPayloads(items), hasMore, found
 }
 
-// Get returns a single item by scope+id (id != "") or scope+seq
-// (id == ""). Returns (item, hit). The returned item.Payload is a
-// fresh allocation.
-func (g *Gateway) Get(scope, id string, seq uint64) (Item, bool) {
-	item, hit := g.store.get(scope, id, seq)
+// GetByID returns a single item addressed by scope+id. Returns
+// (item, hit). The returned item.Payload is a fresh allocation.
+//
+// The address shape is split into ByID/BySeq variants (rather than a
+// single Get with id-or-seq args) so the caller's intent is explicit
+// at the call site and there is no precedence rule to remember. The
+// HTTP /get endpoint enforces the same "exactly one of id/seq" via
+// parseLookupTarget, so the Go API and the wire stay symmetric.
+func (g *Gateway) GetByID(scope, id string) (Item, bool) {
+	item, hit := g.store.get(scope, id, 0)
 	return cloneItemPayload(item), hit
 }
 
-// Render returns the rendered bytes for a single item, addressed by
-// scope+id or scope+seq. Returns (rendered, hit). The returned slice
-// is a fresh allocation; callers may mutate it without touching
-// cached bytes.
-func (g *Gateway) Render(scope, id string, seq uint64) ([]byte, bool) {
-	rendered, hit := g.store.render(scope, id, seq)
+// GetBySeq returns a single item addressed by scope+seq. Same
+// semantics as GetByID; see that method for the rationale on splitting
+// the address shape.
+func (g *Gateway) GetBySeq(scope string, seq uint64) (Item, bool) {
+	item, hit := g.store.get(scope, "", seq)
+	return cloneItemPayload(item), hit
+}
+
+// RenderByID returns the rendered bytes for a single item addressed
+// by scope+id. Returns (rendered, hit). The returned slice is a fresh
+// allocation; callers may mutate it without touching cached bytes.
+// See GetByID for the rationale on the ByID/BySeq split.
+func (g *Gateway) RenderByID(scope, id string) ([]byte, bool) {
+	rendered, hit := g.store.render(scope, id, 0)
+	return clonePayload(rendered), hit
+}
+
+// RenderBySeq returns the rendered bytes for a single item addressed
+// by scope+seq. Same semantics as RenderByID.
+func (g *Gateway) RenderBySeq(scope string, seq uint64) ([]byte, bool) {
+	rendered, hit := g.store.render(scope, "", seq)
 	return clonePayload(rendered), hit
 }
 
