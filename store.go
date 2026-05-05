@@ -13,9 +13,9 @@ import (
 // numShards splits the scope map into independently-locked shards.
 // Power of 2 so the modulo collapses to a bitmask.
 //
-// Multi-shard operations (/wipe, /rebuild, /admin /delete_guarded,
-// /warm) MUST acquire shard locks in ascending shard-index order to
-// avoid deadlock with each other.
+// Multi-shard operations (/wipe, /rebuild, /warm) MUST acquire shard
+// locks in ascending shard-index order to avoid deadlock with each
+// other.
 const (
 	numShards = 32
 	shardMask = numShards - 1
@@ -29,9 +29,9 @@ type scopeShard struct {
 type store struct {
 	// shards splits the scope map into numShards independently-locked
 	// buckets. Per-scope hot paths (getOrCreate, lookup, delete) take
-	// only one shard's lock; multi-shard ops (/wipe, /rebuild, /warm,
-	// /admin /delete_guarded) take a sorted subset in ascending index
-	// order. Pre-sharding the store had a single store-wide RWMutex that
+	// only one shard's lock; multi-shard ops (/wipe, /rebuild, /warm)
+	// take a sorted subset in ascending index order. Pre-sharding the
+	// store had a single store-wide RWMutex that
 	// serialised every scope creation through one queue — see phase-4
 	// finding "/append to a unique scope per request serializes on the
 	// store-wide write lock".
@@ -435,7 +435,7 @@ func (s *store) shardsForScopes(scopes []string) []*scopeShard {
 // acquisition (see the numShards comment block above).
 
 // lockAllShards locks every shard in ascending index order. Used by
-// /wipe, /rebuild, /admin /delete_guarded.
+// /wipe and /rebuild.
 func (s *store) lockAllShards() {
 	for i := range s.shards {
 		s.shards[i].mu.Lock()
@@ -516,13 +516,12 @@ func addClampedInt64(a, b int64) int64 {
 // ringbuffer, scope-name string in its shard's map), plus slack for the
 // per-key map entry overhead. A conservative single-KiB number.
 //
-// Including it in totalBytes admission control means an attacker
-// holding a valid token who tries to spam empty scopes within their
-// `_guarded:<capId>:*` prefix will hit the store-byte cap (default
-// 100 MiB → ~100k empty scopes) and 507 instead of growing memory
-// unbounded. Without this, totalBytes only counts payload bytes —
-// 1M empty scopes consume ~1 GiB of struct memory but report
-// approx_store_mb = 0.
+// Including it in totalBytes admission control means a workload that
+// spams empty scopes — whether by accident or as part of a misbehaving
+// addon — hits the store-byte cap (default 100 MiB ≈ 100k empty
+// scopes) and 507's instead of growing memory unbounded. Without
+// this, totalBytes only counts payload bytes — 1M empty scopes
+// consume ~1 GiB of struct memory but report approx_store_mb = 0.
 //
 // This is also a /stats accuracy improvement: approx_store_mb now
 // matches actual memory pressure, not just item bytes.
@@ -597,15 +596,22 @@ func (s *store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, boo
 	}
 	sh.scopes[scope] = preBuf
 	s.scopeCount.Add(1)
-	// Scope creation changes scope_count — a /stats field — so bump
-	// the freshness tick. Most callers immediately follow with a write
-	// that bumps again with a strictly later timestamp; the CAS-max
-	// makes the second bump a no-op or a tick advance, either way
-	// honest. The transient "scope created but item insert failed"
-	// rollback path leaves a one-tick blip that resolves by the next
-	// real write — harmless under the polling contract (clients see a
-	// tick, refetch, find nothing changed, move on).
-	s.bumpLastWriteTS(preBuf.lastWriteTS)
+	// NO bumpLastWriteTS here. The scope is a precursor to the caller's
+	// actual write (appendOne / upsertOne / counterAddOne) and those
+	// success paths emit their own bump — insertNewItemLocked for
+	// append/upsert, an explicit bump in counterAddOne when scopeCreated
+	// is true. Bumping here would leave a ghost tick when the caller's
+	// item reservation fails and cleanupIfEmptyAndUnused rolls the scope
+	// back: s.lastWriteTS is monotonic via CAS-max, so a precursor bump
+	// cannot be undone. Polling clients would then see a tick that
+	// corresponds to no committed cache-state change, contradicting
+	// the freshness-signal contract.
+	//
+	// Infrastructure scope creates where the empty scope IS the goal
+	// (not a precursor to an item write) go through ensureScope, which
+	// bumps unconditionally — its callers commit no items beyond the
+	// scope itself, so the scope's existence is the committed state
+	// change.
 	sh.mu.Unlock()
 	return preBuf, true, nil
 }
@@ -745,6 +751,18 @@ func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 			s.cleanupIfEmptyAndUnused(scope, buf)
 		}
 		return value, counterCreated, addErr
+	}
+	// Counter mutations are silent on s.lastWriteTS by design (see
+	// buffer_counter.go). The one legitimate exception: a counter_add
+	// that just allocated a brand-new scope as a side effect — that
+	// scope's existence IS observable on /stats (scope_count grew), so
+	// polling clients need a tick to refetch. Pre-step-3 of the
+	// rollback-tick fix this bump fired inside getOrCreateScopeTrackingCreated
+	// before the cell commit, leaving a ghost tick on cell-allocation
+	// failure; moving it here means it fires only after the counter
+	// committed, so success ticks and rollback stays silent.
+	if scopeCreated {
+		s.bumpLastWriteTS(nowUnixMicro())
 	}
 	s.emitCounterAddEvent(scope, id, by)
 	return value, counterCreated, nil

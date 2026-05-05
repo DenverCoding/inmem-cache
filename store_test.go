@@ -1756,12 +1756,19 @@ func TestStore_LastWriteTS_BumpsOnEveryWritePath(t *testing.T) {
 // rationale.
 //
 // scopeCreated is the one bump that legitimately fires when /counter_add
-// runs against a brand-new scope: getOrCreateScopeTrackingCreated
-// bumps s.lastWriteTS as part of scope provisioning (scope_count grew
-// — a structural /stats change). That bump is incidental to the counter
-// operation itself, so the test seeds the scope first to keep the
-// counter ops on an existing-scope path where no other bump source
-// exists.
+// runs against a brand-new scope: counterAddOne emits an explicit
+// s.bumpLastWriteTS after the counter commits successfully when its
+// scopeCreated flag is set, so the structural /stats change
+// (scope_count grew) is signalled to polling clients. That bump is
+// incidental to the counter operation itself, so the test seeds the
+// scope first to keep the counter ops on an existing-scope path where
+// no other bump source exists.
+//
+// The bump used to fire inside getOrCreateScopeTrackingCreated as a
+// precursor — fast but it leaked a ghost tick when the subsequent cell
+// commit failed and cleanupIfEmptyAndUnused rolled the scope back.
+// Moving the bump to "after success, when scopeCreated" preserves the
+// signal for the success path while keeping rollback silent.
 func TestStore_LastWriteTS_NotBumpedByCounterAdd(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 
@@ -1812,6 +1819,62 @@ func TestStore_LastWriteTS_NotBumpedByCounterAdd(t *testing.T) {
 			t.Fatalf("counter post-promote increment: %v", err)
 		}
 	})
+}
+
+// A failed appendOne to a non-existent scope must not advance
+// s.lastWriteTS. The earlier shape of getOrCreateScopeTrackingCreated
+// bumped before the item-bytes reservation was attempted, leaving a
+// ghost tick when the reservation failed and the scope was
+// rolled back via cleanupIfEmptyAndUnused. Polling clients would then
+// observe a freshness tick that corresponds to no committed
+// cache-state change.
+//
+// This test pre-loads totalBytes near the cap so a write to a fresh
+// scope passes the per-scope-overhead reservation but fails the
+// item-bytes reservation, hits the rollback path, and exposes the
+// ghost-tick if it returns. Pre-fix this fails with `lastWriteTS
+// advanced from N to M`; post-fix it stays put.
+func TestStore_LastWriteTS_NoGhostTickOnRollbackOfFailedAppend(t *testing.T) {
+	s := newStore(Config{
+		ScopeMaxItems: 100,
+		MaxStoreBytes: reservedScopesOverhead + scopeBufferOverhead + 50, // overhead for two reserved scopes + one user scope, no room for any item bytes
+		MaxItemBytes:  1 << 20,
+	})
+
+	// Sleep one microsecond so any post-create bump (if it fired) lands
+	// at a strictly later timestamp than `before`, making the assertion
+	// sensitive even on hosts with coarse time.Now() resolution.
+	time.Sleep(time.Microsecond)
+	before := s.lastWriteTS.Load()
+
+	// This must fail with *StoreFullError on the item-bytes reservation
+	// (the per-scope overhead just fits, leaving 50 bytes for any item;
+	// even the smallest realistic item exceeds this once approxItemSize
+	// adds the per-item overhead + scope name + payload).
+	_, err := s.appendOne(Item{
+		Scope:   "transient",
+		Payload: json.RawMessage(`"this payload pushes us over the cap"`),
+	})
+	if err == nil {
+		t.Fatal("expected appendOne to fail on item-byte reservation")
+	}
+	var sfe *StoreFullError
+	if !errors.As(err, &sfe) {
+		t.Fatalf("expected *StoreFullError, got %T: %v", err, err)
+	}
+
+	after := s.lastWriteTS.Load()
+	if after != before {
+		t.Errorf("rolled-back appendOne advanced s.lastWriteTS: before=%d after=%d (ghost tick — the failed write should leave no freshness signal)",
+			before, after)
+	}
+
+	// Sanity: the rollback also reverts scopeCount and totalBytes, so
+	// no observable state lingers from the failed write.
+	if got := s.scopeCount.Load(); got != int64(len(reservedScopeNames)) {
+		t.Errorf("scopeCount=%d after rolled-back create, want %d (only reserved scopes should remain)",
+			got, len(reservedScopeNames))
+	}
 }
 
 // TestStore_LastWriteTS_MonotonicUnderRace verifies the CAS-max
