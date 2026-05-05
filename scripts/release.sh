@@ -83,6 +83,32 @@ run() {
     fi
 }
 
+# go_in_repo runs a `go ...` command in caddymodule/. On hosts with go
+# on PATH (Linux dev boxes, CI runners) we just exec it directly. On
+# Windows hosts the go toolchain typically lives only inside the dev
+# container — we detect that case by trying `go version` and fall back
+# to `docker compose exec -T dev sh -c 'cd /src/caddymodule && ...'`.
+# Either way the working directory inside the call is caddymodule/,
+# so callers can write the command as if they had cd'd there.
+go_in_repo() {
+    local cmd="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  [dry-run] (in caddymodule/) $cmd"
+        return 0
+    fi
+    if command -v go >/dev/null 2>&1; then
+        echo "  + (host go) (cd caddymodule && $cmd)"
+        ( cd caddymodule && eval "$cmd" )
+    elif docker compose ps --services --filter status=running 2>/dev/null | grep -qx dev; then
+        echo "  + (docker compose exec dev) (cd /src/caddymodule && $cmd)"
+        docker compose exec -T dev sh -c "cd /src/caddymodule && $cmd"
+    else
+        echo "  no 'go' on PATH and no running 'dev' compose service to fall back to" >&2
+        echo "  start the dev container with 'docker compose up -d dev' and re-run" >&2
+        exit 1
+    fi
+}
+
 # --- pre-flight ----------------------------------------------------
 
 echo "[pre-flight] working tree clean"
@@ -142,16 +168,16 @@ if [ "$CURRENT_PIN" = "$VERSION" ]; then
     echo "[step 3-5/6] caddymodule/go.mod already requires $VERSION; skipping bump"
 else
     echo "[step 3/6] bump caddymodule/go.mod from $CURRENT_PIN to $VERSION"
-    run "( cd caddymodule && go mod edit -require=github.com/VeloxCoding/scopecache@$VERSION )"
+    go_in_repo "go mod edit -require=github.com/VeloxCoding/scopecache@$VERSION"
 
     echo "[step 4/6] go mod tidy in caddymodule (5x retry, GOPROXY=direct fallback)"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "  [dry-run] ( cd caddymodule && GOWORK=off go mod tidy )"
-        echo "  [dry-run] on persistent failure: GOPROXY=direct go mod tidy"
+        echo "  [dry-run] (in caddymodule/) GOWORK=off go mod tidy   # with up to 5 retries"
+        echo "  [dry-run] on persistent failure: GOWORK=off GOPROXY=direct go mod tidy"
     else
         SUCCESS=0
         for i in 1 2 3 4 5; do
-            if ( cd caddymodule && GOWORK=off go mod tidy ); then
+            if go_in_repo "GOWORK=off go mod tidy"; then
                 SUCCESS=1
                 break
             fi
@@ -160,7 +186,7 @@ else
         done
         if [ "$SUCCESS" != "1" ]; then
             echo "  proxy retries exhausted; falling back to GOPROXY=direct"
-            ( cd caddymodule && GOWORK=off GOPROXY=direct go mod tidy )
+            go_in_repo "GOWORK=off GOPROXY=direct go mod tidy"
         fi
     fi
 
