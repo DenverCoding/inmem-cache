@@ -4,19 +4,50 @@ name: Sync caddymodule tag with root tag
 # caddymodule/v0.7.2 tag whose go.mod pins the new core version. That
 # way `xcaddy --with .../caddymodule@latest` always resolves to a
 # caddymodule release that ships the latest core.
+#
+# Two trigger modes:
+#   - Automatic on every `v*` tag push (the normal release flow).
+#   - Manual via `workflow_dispatch` with a `tag` input — recovery
+#     path when the automatic run failed (proxy race, transient
+#     runner issue) and the user wants to re-run without re-pushing
+#     the tag. Go to Actions tab → "Sync caddymodule tag with root
+#     tag" → "Run workflow" → enter e.g. v0.8.2.
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to sync (e.g. v0.8.2). Must already exist on the remote.'
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+# Resolve the effective tag name once at job level so both the
+# auto-run path (github.ref_name) and the manual-dispatch path
+# (inputs.tag) use the same variable downstream.
+env:
+  TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate TAG_NAME shape
+        # Defensive guard — workflow_dispatch input is operator-typed and
+        # could be anything. Also catches a future tag pattern that
+        # doesn't match v*. The auto-trigger filter already enforces v*
+        # but the env passes through both code paths.
+        run: |
+          case "${TAG_NAME}" in
+            v*) echo "TAG_NAME=${TAG_NAME} (valid)" ;;
+            *)  echo "TAG_NAME=${TAG_NAME} does not match v*; aborting"; exit 1 ;;
+          esac
+
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -28,11 +59,33 @@ jobs:
           go-version: '1.25'
           cache-dependency-path: caddymodule/go.sum
 
-      - name: Bump caddymodule require to ${{ github.ref_name }}
+      - name: Bump caddymodule require to ${{ env.TAG_NAME }}
         working-directory: caddymodule
+        # `go mod tidy` fetches the new scopecache version from
+        # proxy.golang.org. There is a known race between tag-push and
+        # proxy-pickup (typically resolves within seconds, occasionally
+        # up to a minute). Five retries with 20s back-off cover > 99% of
+        # races; if the proxy is genuinely down or slow, the
+        # GOPROXY=direct fallback skips the proxy entirely and resolves
+        # the version straight from git.
+        #
+        # `go mod edit` is offline (no network); only `tidy` needs the
+        # proxy reachable.
         run: |
-          go mod edit -require=github.com/VeloxCoding/scopecache@${GITHUB_REF_NAME}
-          go mod tidy
+          go mod edit -require=github.com/VeloxCoding/scopecache@${TAG_NAME}
+          SUCCESS=0
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then
+              SUCCESS=1
+              break
+            fi
+            echo "go mod tidy attempt $i failed; sleeping 20s before retry"
+            sleep 20
+          done
+          if [ "$SUCCESS" != "1" ]; then
+            echo "Proxy retries exhausted; falling back to GOPROXY=direct"
+            GOPROXY=direct go mod tidy
+          fi
 
       - name: Configure git
         run: |
@@ -43,13 +96,13 @@ jobs:
         run: |
           if ! git diff --quiet caddymodule/go.mod caddymodule/go.sum; then
             git add caddymodule/go.mod caddymodule/go.sum
-            git commit -m "build(caddymodule): bump scopecache dep to ${GITHUB_REF_NAME}"
+            git commit -m "build(caddymodule): bump scopecache dep to ${TAG_NAME}"
             git push origin main
           fi
 
-      - name: Tag caddymodule/${{ github.ref_name }} and push
+      - name: Tag caddymodule/${{ env.TAG_NAME }} and push
         run: |
-          TAG="caddymodule/${GITHUB_REF_NAME}"
+          TAG="caddymodule/${TAG_NAME}"
           if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "Tag ${TAG} already exists, skipping"
             exit 0
