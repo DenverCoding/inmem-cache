@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +16,15 @@ import (
 	"time"
 
 	"github.com/VeloxCoding/scopecache"
+)
+
+// maxEnvConfigMB / maxEnvConfigKB are the upper bounds beyond which
+// the later `int64(value) << 20` (MiB→bytes) or `<< 10` (KiB→bytes)
+// would silently overflow. Mirrors caddymodule's maxConfigMB /
+// maxConfigKB; same rationale (loud rejection beats silent wrong cap).
+const (
+	maxEnvConfigMB = math.MaxInt64 >> 20
+	maxEnvConfigKB = math.MaxInt64 >> 10
 )
 
 // UnixSocketPerm is applied to the listening socket file on POSIX systems
@@ -63,6 +73,9 @@ func socketPathFromEnv() string {
 
 // maxStoreBytesFromEnv returns SCOPECACHE_MAX_STORE_MB (in MiB, converted to bytes)
 // if set to a positive integer, otherwise the compile-time default.
+// Values above maxEnvConfigMB would overflow int64 after the shift; we
+// log + fall back to the default rather than letting a wrap silently
+// produce a tiny or negative cap.
 func maxStoreBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_STORE_MB")
 	if raw == "" {
@@ -73,11 +86,16 @@ func maxStoreBytesFromEnv() int64 {
 		log.Printf("SCOPECACHE_MAX_STORE_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxStoreMiB)
 		return int64(scopecache.MaxStoreMiB) << 20
 	}
+	if int64(n) > maxEnvConfigMB {
+		log.Printf("SCOPECACHE_MAX_STORE_MB=%d exceeds the maximum MiB value (%d); using default %d MiB", n, maxEnvConfigMB, scopecache.MaxStoreMiB)
+		return int64(scopecache.MaxStoreMiB) << 20
+	}
 	return int64(n) << 20
 }
 
 // maxItemBytesFromEnv returns SCOPECACHE_MAX_ITEM_MB (in MiB, converted to bytes)
 // if set to a positive integer, otherwise the compile-time default.
+// See maxStoreBytesFromEnv for the upper-bound rationale.
 func maxItemBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_ITEM_MB")
 	if raw == "" {
@@ -86,6 +104,10 @@ func maxItemBytesFromEnv() int64 {
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
 		log.Printf("SCOPECACHE_MAX_ITEM_MB=%q is not a positive integer; using default %d MiB", raw, scopecache.MaxItemBytes>>20)
+		return int64(scopecache.MaxItemBytes)
+	}
+	if int64(n) > maxEnvConfigMB {
+		log.Printf("SCOPECACHE_MAX_ITEM_MB=%d exceeds the maximum MiB value (%d); using default %d MiB", n, maxEnvConfigMB, scopecache.MaxItemBytes>>20)
 		return int64(scopecache.MaxItemBytes)
 	}
 	return int64(n) << 20
@@ -114,6 +136,8 @@ func inboxMaxItemsFromEnv() int {
 // InboxMaxItemBytes (64 KiB) for the `_inbox` scope. A malformed or
 // non-positive value is ignored with a warning. KiB is the configured
 // unit because the default (64 KiB) reads awkwardly as MiB (0.0625).
+// Values above maxEnvConfigKB would overflow int64 after the shift;
+// see maxStoreBytesFromEnv for the upper-bound rationale.
 func inboxMaxItemBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEM_KB")
 	if raw == "" {
@@ -122,6 +146,10 @@ func inboxMaxItemBytesFromEnv() int64 {
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
 		log.Printf("SCOPECACHE_INBOX_MAX_ITEM_KB=%q is not a positive integer; falling back to %d KiB", raw, scopecache.InboxMaxItemBytes>>10)
+		return 0
+	}
+	if int64(n) > maxEnvConfigKB {
+		log.Printf("SCOPECACHE_INBOX_MAX_ITEM_KB=%d exceeds the maximum KiB value (%d); falling back to %d KiB", n, maxEnvConfigKB, scopecache.InboxMaxItemBytes>>10)
 		return 0
 	}
 	return int64(n) << 10
@@ -270,10 +298,19 @@ func main() {
 		<-signalCtx.Done()
 		log.Print("scopecache shutting down")
 		// Stop subscribers FIRST, while the HTTP server is still up.
-		// stopSubscribers blocks until each goroutine has finished its
-		// current cmd.Run, so any in-flight drain command completes its
-		// curl roundtrips against a still-listening cache — no orphan
-		// curl ever hits a torn-down socket. unsubscribe is idempotent
+		// stopSubscribers cancels each goroutine's per-subscriber
+		// context, which makes exec.CommandContext SIGKILL the
+		// in-flight drain command (the entire process group via
+		// configureProcessGroup, so script-spawned children die
+		// alongside their parent). The call then blocks until each
+		// goroutine has fully exited, bounded by OS kill latency
+		// rather than the command's voluntary completion — a stuck
+		// curl or tarpitted endpoint cannot stall shutdown past the
+		// 5s grace period. The cache socket stays open during the
+		// kill window, so any HTTP roundtrip the killed command had
+		// in flight produces a "connection reset" client-side rather
+		// than hitting a torn-down socket; the cache treats it as
+		// any other client crash. unsubscribe is idempotent
 		// (subscribe.go), so the deferred stopSubscribers() at the
 		// outer scope is a safe no-op backstop.
 		stopSubscribers()

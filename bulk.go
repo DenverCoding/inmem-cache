@@ -81,8 +81,17 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 	var offenders []ScopeCapacityOffender
 
 	for scope, items := range grouped {
-		if scope == "" {
-			return 0, fmt.Errorf("%w: the 'scope' field is required", ErrInvalidInput)
+		// Validate the map KEY itself — empty, length, character-set —
+		// before the reserved-scope check. Empty-slice batches
+		// (`grouped["bad ": nil}`) would otherwise bypass the per-item
+		// loop's validateWriteItem entirely and let a Go caller create
+		// a scope whose name violates the normal shape rules. The HTTP
+		// path can't trip this because groupItemsByScope only groups
+		// keys that came from a non-empty item.Scope (already
+		// shape-validated upstream), but the Gateway is the supported
+		// alternate entry point and addon authors compose maps by hand.
+		if err := validateScope(scope, "/warm"); err != nil {
+			return 0, wrapValidation(err)
 		}
 		if isReservedScope(scope) {
 			return 0, fmt.Errorf("%w: scope '%s' is reserved and cannot be the target of /warm", ErrInvalidInput, scope)
@@ -273,8 +282,11 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	var offenders []ScopeCapacityOffender
 
 	for scope, items := range grouped {
-		if scope == "" {
-			return 0, 0, fmt.Errorf("%w: the 'scope' field is required", ErrInvalidInput)
+		// Validate the map KEY itself before the reserved-scope check;
+		// see replaceScopes for the rationale (empty-slice batches
+		// would otherwise bypass per-item validation).
+		if err := validateScope(scope, "/rebuild"); err != nil {
+			return 0, 0, wrapValidation(err)
 		}
 		if isReservedScope(scope) {
 			return 0, 0, fmt.Errorf("%w: scope '%s' is reserved and cannot appear in /rebuild input", ErrInvalidInput, scope)

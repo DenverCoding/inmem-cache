@@ -1944,12 +1944,21 @@ Everything else the command needs (cache socket path, HTTP base
 URL, auth headers) is the operator's responsibility — the bridge
 does not know how the command reaches the cache.
 
-`stop` is graceful and synchronous: it closes the wake-up channel
-**and** blocks until the goroutine has fully exited (including any
-in-flight `cmd.Run` for the currently-executing command). This
-lets adapters sequence "stop subscribers → tear down server"
-deterministically — see §7.7 below for the standalone-binary
-shutdown ordering.
+`stop` is **abortive** and synchronous: it cancels the goroutine's
+per-subscriber context (which `SIGKILLs` the in-flight `cmd.Run`
+via `exec.CommandContext` — the whole process group on Unix, so
+script-spawned children die alongside their parent), closes the
+wake-up channel, and blocks until the goroutine has fully exited.
+The call returns within OS kill latency rather than waiting for
+the running command to complete voluntarily, so a stuck curl or
+tarpitted endpoint cannot stall shutdown.
+
+The HTTP-roundtrip-orphan concern is addressed by ordering, not by
+graceful waiting: adapters call `stop` BEFORE tearing down the
+server, so the cache socket stays open during the kill window and
+any HTTP roundtrip the killed command had in flight produces a
+plain "connection reset" client-side — same as any other client
+crash. See §7.7 below for the standalone-binary shutdown ordering.
 
 Concurrency: one goroutine per scope, one command run at a time
 per scope, in strict order. Wake-ups arriving while a command is
@@ -1994,17 +2003,26 @@ operators may swap in any language or compiled binary.
 ### 7.7 Lifecycle ordering at shutdown
 
 The standalone binary stops subscribers **before** calling
-`server.Shutdown(ctx)` so any running drain command can complete
-its HTTP roundtrips against a still-listening cache. The order is:
+`server.Shutdown(ctx)` so the cache socket stays open while
+subscribers tear down. The order is:
 
 1. `SIGINT` / `SIGTERM` arrives.
-2. `stopSubscribers()` runs — blocks until each subscriber goroutine
-   has finished its current command run. The HTTP server is still
-   accepting requests during this phase; in-flight `curl /head` /
-   `curl /delete_up_to` calls complete normally.
+2. `stopSubscribers()` runs — cancels each subscriber context,
+   `SIGKILL`s the in-flight `cmd.Run` (whole process group on
+   Unix), closes the wake-up channel, and blocks until each
+   goroutine has fully exited. The HTTP server is still accepting
+   requests during this phase, so any HTTP roundtrip the killed
+   drain command had in flight produces a plain "connection reset"
+   client-side rather than hitting a torn-down socket — same as
+   any other client crash.
 3. `server.Shutdown(ctx)` runs — drains any non-subscriber HTTP
    requests, then closes the listener.
 4. Socket file removed; process exits.
+
+Step 2's abortive shape is deliberate: a graceful "wait until the
+command finishes voluntarily" would let a stuck curl or tarpitted
+endpoint stall shutdown past the 5s grace period. Bounded
+shutdown latency wins; see §7.5 for the trade-off rationale.
 
 The Caddy module mirrors this in `Cleanup()`. Shutdown ordering is
 adapter responsibility, not core — the bridge exposes a synchronous

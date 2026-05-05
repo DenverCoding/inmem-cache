@@ -172,14 +172,25 @@ func (g *Gateway) Tail(scope string, limit, offset int) ([]Item, bool, bool) {
 // at the call site and there is no precedence rule to remember. The
 // HTTP /get endpoint enforces the same "exactly one of id/seq" via
 // parseLookupTarget, so the Go API and the wire stay symmetric.
+//
+// Read paths are PERMISSIVE: invalid scope/id shapes (over-length,
+// embedded control characters, leading/trailing whitespace) silently
+// miss with hit=false rather than returning an error. The HTTP layer
+// returns 400 on the same input via parseLookupTarget; addons that
+// proxy HTTP traffic inherit that strict validation upstream and need
+// not re-check here. The Gateway read shape stays "did I find it?
+// (Item{}, false)" so call sites don't pay validation overhead on
+// every hot-path read for shapes that can never match a stored item
+// anyway.
 func (g *Gateway) GetByID(scope, id string) (Item, bool) {
 	item, hit := g.store.get(scope, id, 0)
 	return cloneItemPayload(item), hit
 }
 
 // GetBySeq returns a single item addressed by scope+seq. Same
-// semantics as GetByID; see that method for the rationale on splitting
-// the address shape.
+// semantics and permissive contract as GetByID — see that method for
+// the rationale on the address-shape split and on silent miss for
+// invalid scope shapes.
 func (g *Gateway) GetBySeq(scope string, seq uint64) (Item, bool) {
 	item, hit := g.store.get(scope, "", seq)
 	return cloneItemPayload(item), hit
@@ -188,14 +199,14 @@ func (g *Gateway) GetBySeq(scope string, seq uint64) (Item, bool) {
 // RenderByID returns the rendered bytes for a single item addressed
 // by scope+id. Returns (rendered, hit). The returned slice is a fresh
 // allocation; callers may mutate it without touching cached bytes.
-// See GetByID for the rationale on the ByID/BySeq split.
+// Permissive on invalid scope/id shapes — see GetByID.
 func (g *Gateway) RenderByID(scope, id string) ([]byte, bool) {
 	rendered, hit := g.store.render(scope, id, 0)
 	return clonePayload(rendered), hit
 }
 
 // RenderBySeq returns the rendered bytes for a single item addressed
-// by scope+seq. Same semantics as RenderByID.
+// by scope+seq. Same semantics and permissive contract as RenderByID.
 func (g *Gateway) RenderBySeq(scope string, seq uint64) ([]byte, bool) {
 	rendered, hit := g.store.render(scope, "", seq)
 	return clonePayload(rendered), hit

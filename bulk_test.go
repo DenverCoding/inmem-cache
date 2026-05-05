@@ -396,6 +396,61 @@ func TestStore_RebuildAll_RejectsScopeKeyMismatch(t *testing.T) {
 	}
 }
 
+// /warm and /rebuild must validate the map KEY itself (length,
+// character set) — not just the per-item validation. An empty-slice
+// batch (`grouped["bad ": nil}`) bypasses the per-item loop entirely;
+// without an explicit map-key validateScope a Go caller could create
+// a scope whose name violates the normal shape rules. The HTTP path
+// is already shielded because groupItemsByScope only groups keys that
+// came from a non-empty item.Scope already shape-validated upstream.
+//
+// "bad " has a trailing space — checkKeyField rejects leading and
+// trailing whitespace in scope identifiers. Pre-fix this slipped
+// through both replaceScopes and rebuildAll on an empty-slice payload;
+// post-fix both reject with ErrInvalidInput before any shard lock is
+// taken.
+func TestStore_BulkWritePaths_ValidateMapKeyOnEmptySlice(t *testing.T) {
+	t.Run("replaceScopes rejects invalid map key with empty slice", func(t *testing.T) {
+		s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+		grouped := map[string][]Item{"bad ": nil}
+		_, err := s.replaceScopes(grouped)
+		if err == nil {
+			t.Fatal("expected error for invalid map-key scope shape, got nil")
+		}
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("err must wrap ErrInvalidInput, got: %v", err)
+		}
+		// Pre-flight reject — no scope buffer should have been created.
+		sh := s.shardFor("bad ")
+		sh.mu.RLock()
+		_, exists := sh.scopes["bad "]
+		sh.mu.RUnlock()
+		if exists {
+			t.Fatal("invalid scope name 'bad ' must not be created on rejected /warm")
+		}
+	})
+
+	t.Run("rebuildAll rejects invalid map key with empty slice", func(t *testing.T) {
+		s := newStore(Config{ScopeMaxItems: 100, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
+		grouped := map[string][]Item{"bad ": nil}
+		_, _, err := s.rebuildAll(grouped)
+		if err == nil {
+			t.Fatal("expected error for invalid map-key scope shape, got nil")
+		}
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("err must wrap ErrInvalidInput, got: %v", err)
+		}
+		// Reserved scopes must still exist — rebuild aborted pre-mutation.
+		sh := s.shardFor(EventsScopeName)
+		sh.mu.RLock()
+		_, hasEvents := sh.scopes[EventsScopeName]
+		sh.mu.RUnlock()
+		if !hasEvents {
+			t.Fatal("reserved scope _events must survive a rejected /rebuild")
+		}
+	})
+}
+
 func TestStore_RebuildAll_WipesEverything(t *testing.T) {
 	s := newStore(Config{ScopeMaxItems: 10, MaxStoreBytes: 100 << 20, MaxItemBytes: 1 << 20})
 

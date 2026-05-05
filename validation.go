@@ -86,6 +86,30 @@ func requireID(id, endpoint string) error {
 	return checkKeyField("id", id, MaxIDBytes)
 }
 
+// validateIDOrSeq enforces the "exactly one of id or seq" addressing
+// contract used by /update and /delete: passing neither (id=="" &&
+// seq==0) or both (id!="" && seq!=0) is rejected with the same
+// endpoint-aware message. When an id is supplied, its shape is
+// validated via checkKeyField; seq has no shape to validate beyond
+// the non-zero check.
+//
+// Centralises the pattern that previously lived parallel in
+// validateUpdateItem and validateDeleteRequest. Other endpoints take
+// a plain `Item` whose seq is pre-rejected (writeItem / upsert) and
+// don't need this gate. Reads (GetByID / GetBySeq) split the address
+// shape at the Gateway boundary so the helper is unused there.
+func validateIDOrSeq(endpoint, id string, seq uint64) error {
+	hasID := id != ""
+	hasSeq := seq != 0
+	if hasID == hasSeq {
+		return errors.New("exactly one of 'id' or 'seq' must be provided for the '" + endpoint + "' endpoint")
+	}
+	if hasID {
+		return checkKeyField("id", id, MaxIDBytes)
+	}
+	return nil
+}
+
 // validatePayload enforces the two-part payload shape contract from RFC
 // §4.1: payload must be present (not missing, not literal `null`) AND
 // must be a syntactically valid JSON value. Both cases produce a 400
@@ -265,15 +289,8 @@ func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
 	if isReservedScope(item.Scope) {
 		return errors.New("scope '" + item.Scope + "' is reserved; in-place mutation (/update) is not supported on the drain-stream scopes")
 	}
-	hasID := item.ID != ""
-	hasSeq := item.Seq != 0
-	if hasID == hasSeq {
-		return errors.New("exactly one of 'id' or 'seq' must be provided for the '/update' endpoint")
-	}
-	if hasID {
-		if err := checkKeyField("id", item.ID, MaxIDBytes); err != nil {
-			return err
-		}
+	if err := validateIDOrSeq("/update", item.ID, item.Seq); err != nil {
+		return err
 	}
 	if err := validatePayload(item.Payload); err != nil {
 		return err
@@ -338,15 +355,7 @@ func validateDeleteRequest(req deleteRequest) (returnErr error) {
 	if err := validateScope(req.Scope, "/delete"); err != nil {
 		return err
 	}
-	hasID := req.ID != ""
-	hasSeq := req.Seq != 0
-	if hasID == hasSeq {
-		return errors.New("exactly one of 'id' or 'seq' must be provided for the '/delete' endpoint")
-	}
-	if hasID {
-		return checkKeyField("id", req.ID, MaxIDBytes)
-	}
-	return nil
+	return validateIDOrSeq("/delete", req.ID, req.Seq)
 }
 
 func validateDeleteScopeRequest(req deleteScopeRequest) (returnErr error) {

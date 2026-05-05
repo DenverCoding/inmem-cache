@@ -39,6 +39,66 @@ func TestValidateConfig_RejectsNegative(t *testing.T) {
 	}
 }
 
+// validateConfig must reject values whose `int64(value) << 20` (MiB→
+// bytes) or `<< 10` (KiB→bytes) would silently overflow int64. Pre-fix
+// a huge max_store_mb wrapped to a tiny or negative cap, falling back
+// to defaults or producing a misleading "small" cap. Post-fix the
+// shift is gated by an explicit upper bound and the operator gets a
+// loud configuration error.
+func TestValidateConfig_RejectsOverflowOnUnitShift(t *testing.T) {
+	cases := []struct {
+		name      string
+		set       func(*Handler)
+		wantField string
+	}{
+		{
+			name:      "max_store_mb above MiB shift bound",
+			set:       func(h *Handler) { h.MaxStoreMB = maxConfigMB + 1 },
+			wantField: "max_store_mb",
+		},
+		{
+			name:      "max_item_mb above MiB shift bound",
+			set:       func(h *Handler) { h.MaxItemMB = maxConfigMB + 1 },
+			wantField: "max_item_mb",
+		},
+		{
+			name:      "inbox_max_item_kb above KiB shift bound",
+			set:       func(h *Handler) { h.InboxMaxItemKB = maxConfigKB + 1 },
+			wantField: "inbox_max_item_kb",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{}
+			tc.set(h)
+			err := h.validateConfig()
+			if err == nil {
+				t.Fatalf("expected overflow rejection for %s; got nil", tc.wantField)
+			}
+			if !strings.Contains(err.Error(), tc.wantField) {
+				t.Errorf("error %q does not name the offending key %q", err.Error(), tc.wantField)
+			}
+			if !strings.Contains(err.Error(), "overflow") {
+				t.Errorf("error %q does not mention overflow", err.Error())
+			}
+		})
+	}
+}
+
+// The values JUST AT the upper bound must be accepted — the fix is
+// "> upper", not ">= upper". Confirms the boundary is inclusive on the
+// safe side.
+func TestValidateConfig_AcceptsValuesAtUpperBound(t *testing.T) {
+	h := &Handler{
+		MaxStoreMB:     maxConfigMB,
+		MaxItemMB:      maxConfigMB,
+		InboxMaxItemKB: maxConfigKB,
+	}
+	if err := h.validateConfig(); err != nil {
+		t.Errorf("at-bound config rejected: %v", err)
+	}
+}
+
 // Zero is the documented sentinel for "use compile-time default" — must
 // stay accepted.
 func TestValidateConfig_AcceptsZero(t *testing.T) {

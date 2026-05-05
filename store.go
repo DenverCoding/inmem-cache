@@ -727,15 +727,24 @@ func (s *store) appendOne(item Item) (Item, error) {
 	}
 	// Order: emit FIRST (recurses into appendOne(_events) which itself
 	// fires notifySubscriber(_events) at the bottom of its own frame),
-	// THEN notify on the SCOPE we just wrote. For user-scope writes,
-	// the outer notify is a no-op (no subscriber on user scopes per
-	// settled #2); for /append directly to _events or _inbox the
-	// outer notify is what wakes the drainer. Single notify-call site
-	// in the cache — every write that targets _events or _inbox routes
-	// through this method (validator rejects /upsert /update /counter_add
-	// on reserved scopes per RFC §2.6).
+	// THEN notify on the SCOPE we just wrote. The outer notify is
+	// gated to reserved scopes because Subscribe rejects non-reserved
+	// scopes outright (see ErrInvalidSubscribeScope) — for any other
+	// scope notifySubscriber would acquire subsMu.RLock and do a map
+	// lookup that can never hit. Skipping the call entirely on the hot
+	// user-scope path saves that lock/lookup pair per append. The
+	// recursive emitAppendEvent → appendOne(_events) frame still
+	// notifies _events because _events IS reserved, so EventsModeFull
+	// drainers stay woken correctly.
+	//
+	// Single direct notify-call site in the cache — /upsert, /update,
+	// /counter_add, /warm, /rebuild are validator-gated off reserved
+	// scopes (RFC §2.6), so every write that targets a reserved scope
+	// routes through this method.
 	s.emitAppendEvent(result.Scope, result.ID, result.Seq, result.Ts, result.Payload)
-	s.notifySubscriber(result.Scope)
+	if isReservedScope(result.Scope) {
+		s.notifySubscriber(result.Scope)
+	}
 	return result, nil
 }
 
