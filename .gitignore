@@ -3,6 +3,7 @@
 *.test
 /sock/
 /CLAUDE.md
+/phase4.md
 /init.txt
 /caddy-module-plan.md
 /cross-cutting-concerns.md
