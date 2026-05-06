@@ -43,7 +43,6 @@ import (
 type scopeReplacement struct {
 	items      []Item
 	byID       map[string]Item
-	bySeq      map[uint64]Item
 	lastSeq    uint64
 	idKeyBytes int64
 }
@@ -58,14 +57,12 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 		return scopeReplacement{
 			items: []Item{},
 			byID:  make(map[string]Item),
-			bySeq: make(map[uint64]Item),
 		}, nil
 	}
 
 	seen := make(map[string]struct{}, len(items))
 	nonEmptyIDs := 0
 	built := make([]Item, 0, len(items))
-	bySeq := make(map[uint64]Item, len(items))
 
 	// seq is a cache-local cursor that is NOT stable across /warm or /rebuild.
 	// We regenerate it from 1 for every call so scope buffers have monotonic,
@@ -102,7 +99,6 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 		item.renderBytes = precomputeRenderBytes(item.Payload)
 
 		built = append(built, item)
-		bySeq[item.Seq] = item
 	}
 
 	byID := make(map[string]Item, nonEmptyIDs)
@@ -117,7 +113,6 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 	return scopeReplacement{
 		items:      built,
 		byID:       byID,
-		bySeq:      bySeq,
 		lastSeq:    lastSeq,
 		idKeyBytes: idKeyBytes,
 	}, nil
@@ -164,7 +159,6 @@ func (b *scopeBuffer) commitReplacement(r scopeReplacement, newBytes int64) {
 	b.idKeyBytes = r.idKeyBytes
 	b.items = r.items
 	b.byID = r.byID
-	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
 	b.lastWriteTS = now
 }
@@ -209,7 +203,6 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 	b.idKeyBytes = r.idKeyBytes
 	b.items = r.items
 	b.byID = r.byID
-	b.bySeq = r.bySeq
 	b.lastSeq = r.lastSeq
 	b.lastWriteTS = now
 }

@@ -141,8 +141,8 @@ func BenchmarkStore_Append(b *testing.B) {
 // The only difference between them is Events.Mode — so the ns/op
 // delta is exactly the cost of one emit: json.Marshal of the
 // envelope + a recursive appendOne into `_events` (lock acquire
-// + slice append + bySeq map update + reserveBytes CAS + lock
-// release). Sequential, no contention, so the result is pure CPU
+// + slice append + reserveBytes CAS + lock release). Sequential,
+// no contention, so the result is pure CPU
 // cost; the HTTP-level p99 inflation seen in scripts/bench.sh
 // EVENTS_MODE=full reflects added _events.buf.mu contention on
 // top of this base cost.
@@ -356,9 +356,10 @@ func BenchmarkStore_CounterAdd_LargeScope(b *testing.B) {
 // Run with -cpuprofile -memprofile -blockprofile to find what
 // dominates the parallel read path.
 
-// BenchmarkStore_GetBySeq_Parallel mirrors GetByID_Parallel but on the
-// bySeq map. Same RLock + map lookup; included so the two read paths
-// can be compared side by side.
+// BenchmarkStore_GetBySeq_Parallel mirrors GetByID_Parallel but resolves
+// items by seq via O(log n) binary search on the seq-ordered items slice
+// (no separate bySeq map). Included so the two read paths — id-keyed
+// hash lookup vs seq-keyed binary search — can be compared side by side.
 func BenchmarkStore_GetBySeq_Parallel(b *testing.B) {
 	store, scopes, _ := benchStore(b, 100, 1000, 512)
 	numScopes := len(scopes)

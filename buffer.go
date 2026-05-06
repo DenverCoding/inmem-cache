@@ -59,7 +59,6 @@ type scopeBuffer struct {
 	detached bool
 	items    []Item
 	byID     map[string]Item
-	bySeq    map[uint64]Item
 	lastSeq  uint64
 	// maxItems caps the number of items this scope may hold; writes
 	// past it produce *ScopeFullError. The unboundedScopeMaxItems
@@ -105,24 +104,28 @@ type scopeBuffer struct {
 }
 
 func newscopeBuffer(maxItems int) *scopeBuffer {
-	// items, byID and bySeq all grow on-demand. Pre-allocating any of
-	// them on every scope-create is the wrong default: a unique-scope-
-	// per-write workload creates millions of buffers, most of which
-	// hold one item and never need byID at all (items without an `id`
-	// have no byID entry). See:
+	// items and byID grow on-demand. Pre-allocating either on every
+	// scope-create is the wrong default: a unique-scope-per-write
+	// workload creates millions of buffers, most of which hold one item
+	// and never need byID at all (items without an `id` have no byID
+	// entry). See:
 	//
 	//   - phase-4 finding "Sharded scopes map: pre-existing-scope
 	//     writes 2× faster, unique-scope writes barely" — traces the
 	//     items-slice pre-alloc that GC could not keep up with.
 	//   - the follow-up "Lazy maps in newscopeBuffer" — extends the
-	//     same reasoning to byID and bySeq. Lazy bySeq saves the
-	//     create-time alloc on every scope; lazy byID skips the
-	//     allocation entirely on scopes whose items never carry an id.
+	//     same reasoning to byID. Lazy byID skips the allocation
+	//     entirely on scopes whose items never carry an id.
 	//
-	// The write paths (in buffer_write.go, buffer_counter.go) and the
-	// replaceItemAtIndexLocked helper lazily initialise these maps
-	// before assigning into them. Reads, deletes, len and range are
-	// nil-safe in Go and need no guard.
+	// The write paths (in buffer_write.go, buffer_counter.go) lazily
+	// initialise byID before assigning into it. Reads, deletes, len and
+	// range are nil-safe in Go and need no guard.
+	//
+	// There is no bySeq map: items is monotonically seq-ordered (every
+	// append assigns b.lastSeq+1 and nothing inserts in the middle), so
+	// indexBySeqLocked finds an item by seq via O(log n) binary search.
+	// Avoiding the duplicate value-storage saves ~100 B per item plus
+	// per-scope map overhead — material on high-scope-count workloads.
 	now := nowUnixMicro()
 	return &scopeBuffer{
 		maxItems:    maxItems,

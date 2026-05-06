@@ -109,7 +109,8 @@ func payloadAndRenderBytes(item Item) int64 {
 //
 // The byID sync is conditional because /append accepts items without
 // an id (id="" is legal), so not every item has a byID entry to keep
-// in sync. bySeq is unconditional because every item has a seq.
+// in sync. The items[i] write above already covers seq-addressable
+// updates — no separate seq-keyed map exists.
 //
 // Ts is always overwritten by the caller-supplied value: every
 // caller (updateByID, updateBySeq, counterAdd) computes a fresh
@@ -136,9 +137,8 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	b.items[i].counter = nil
 	updated := b.items[i]
 	// replaceItemAtIndexLocked is only reachable when the item already
-	// existed in this buffer, so bySeq and (when ID != "") byID have
-	// already been allocated by the original write that created it.
-	b.bySeq[updated.Seq] = updated
+	// existed in this buffer, so byID (when ID != "") has already been
+	// allocated by the original write that created it.
 	if updated.ID != "" {
 		b.byID[updated.ID] = updated
 	}
@@ -152,11 +152,10 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 // indexBySeqLocked returns the position of the item with the given seq
 // inside b.items. Returns (0, false) when no such item exists. items is
 // always ordered ascending by seq (appendItem assigns monotonic seqs and
-// nothing inserts in the middle), so this is O(log n) — the canonical
-// way to translate a byID/bySeq map hit into a slice index for in-place
-// mutation. Caller must hold b.mu (read or write — both are fine,
-// callers have a write lock in practice because every user is about to
-// mutate b.items[i]).
+// nothing inserts in the middle), so this is O(log n). It is the
+// canonical seq→item lookup: there is no separate bySeq map, so reads
+// and writes addressed by seq both go through here. Caller must hold
+// b.mu (read or write — both are fine).
 func (b *scopeBuffer) indexBySeqLocked(seq uint64) (int, bool) {
 	i := sort.Search(len(b.items), func(i int) bool {
 		return b.items[i].Seq >= seq

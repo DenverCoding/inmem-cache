@@ -18,9 +18,9 @@ import "sort"
 // zeroes the now-duplicate last slot (so the GC can reclaim the
 // removed Item's payload bytes — without this the backing array
 // keeps a reference and the payload leaks), removes the item from
-// bySeq + byID (the latter only if the id is non-empty), and
-// releases the item's bytes from both b.bytes and the store-wide
-// totalBytes counter when store-attached.
+// byID (when the id is non-empty), and releases the item's bytes
+// from both b.bytes and the store-wide totalBytes counter when
+// store-attached.
 //
 // PRECONDITION: caller holds b.mu and i is a valid index into b.items.
 //
@@ -48,7 +48,6 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 	b.items[len(b.items)-1] = Item{}
 	b.items = b.items[:len(b.items)-1]
 
-	delete(b.bySeq, removed.Seq)
 	if removed.ID != "" {
 		delete(b.byID, removed.ID)
 		b.idKeyBytes -= int64(len(removed.ID))
@@ -70,8 +69,7 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 // deleteIndexLocked (b.items = b.items[:len-1]) reduces len but not
 // cap, so a scope that briefly held N items keeps the N-element
 // backing array alive after every item has been deleted. The same
-// goes for b.bySeq and b.byID: Go maps don't shrink their bucket
-// arrays on delete().
+// goes for b.byID: Go maps don't shrink their bucket arrays on delete().
 //
 // In the write-buffer pattern (drain-and-refill on a long-lived
 // scope) the wasted capacity sits idle between bursts. At ~104 bytes
@@ -79,10 +77,10 @@ func (b *scopeBuffer) deleteIndexLocked(i int) {
 // drains to empty leaks ~100 KiB until appendItem grows it again.
 //
 // nil-ing is safe because appendItem (buffer_write.go) lazy-inits
-// both maps on first write after a reset, and append() on a nil
-// slice grows naturally. b.lastSeq is intentionally NOT reset —
-// the seq cursor must remain monotonic across drain/refill cycles
-// so downstream consumers tracking the cursor cannot see a regression
+// byID on first write after a reset, and append() on a nil slice
+// grows naturally. b.lastSeq is intentionally NOT reset — the seq
+// cursor must remain monotonic across drain/refill cycles so
+// downstream consumers tracking the cursor cannot see a regression
 // and a fresh /append after the reset still produces a strictly-
 // greater seq than anything observers may have remembered.
 //
@@ -93,7 +91,6 @@ func (b *scopeBuffer) resetIfEmptyLocked() {
 		return
 	}
 	b.items = nil
-	b.bySeq = nil
 	b.byID = nil
 	// b.idKeyBytes is already zero — every removed item subtracted its
 	// id length on delete; an explicit assignment here is belt-and-
@@ -116,7 +113,7 @@ func (b *scopeBuffer) deleteByID(id string) (int, error) {
 
 	i, ok := b.indexBySeqLocked(existing.Seq)
 	if !ok {
-		// Unreachable under b.mu: b.byID confirmed the item exists and items/bySeq are kept in sync.
+		// Unreachable under b.mu: b.byID confirmed the item exists and items is the source of truth for seq.
 		return 0, nil
 	}
 	b.deleteIndexLocked(i)
@@ -131,13 +128,8 @@ func (b *scopeBuffer) deleteBySeq(seq uint64) (int, error) {
 		return 0, &ScopeDetachedError{}
 	}
 
-	if _, ok := b.bySeq[seq]; !ok {
-		return 0, nil
-	}
-
 	i, ok := b.indexBySeqLocked(seq)
 	if !ok {
-		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
 		return 0, nil
 	}
 	b.deleteIndexLocked(i)
@@ -170,7 +162,6 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	for i := 0; i < idx; i++ {
 		removed := b.items[i]
 		freedBytes += approxItemSize(removed)
-		delete(b.bySeq, removed.Seq)
 		if removed.ID != "" {
 			delete(b.byID, removed.ID)
 			freedIDKeyBytes += int64(len(removed.ID))
@@ -197,9 +188,9 @@ func (b *scopeBuffer) deleteUpToSeq(maxSeq uint64) (int, error) {
 	b.lastWriteTS = now
 	// `rest` already replaced b.items with a fresh backing array, so
 	// the items-slice high-watermark is freed regardless of len. The
-	// reset still matters for the maps: their bucket arrays do not
-	// shrink on delete(), and resetIfEmptyLocked nil's them when this
-	// drain emptied the scope.
+	// reset still matters for byID: its bucket array does not shrink
+	// on delete(), and resetIfEmptyLocked nils it when this drain
+	// emptied the scope.
 	b.resetIfEmptyLocked()
 	return idx, nil
 }

@@ -107,9 +107,7 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		b.items[i].counter = nil
 
 		updated := b.items[i]
-		// b.byID hit above proves byID was already allocated; same for
-		// bySeq (every item that lives in byID also lives in bySeq).
-		b.bySeq[updated.Seq] = updated
+		// b.byID hit above proves byID was already allocated.
 		b.byID[item.ID] = updated
 		b.bytes += delta
 		b.lastWriteTS = nowUs
@@ -181,10 +179,11 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 		return 0, &ScopeDetachedError{}
 	}
 
-	existing, ok := b.bySeq[seq]
+	idx, ok := b.indexBySeqLocked(seq)
 	if !ok {
 		return 0, nil
 	}
+	existing := b.items[idx]
 
 	// See updateByID for the renderBytes-aware delta rationale.
 	newRender := precomputeRenderBytes(payload)
@@ -225,21 +224,16 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 		return 0, err
 	}
 
-	i, ok := b.indexBySeqLocked(seq)
-	if !ok {
-		// Unreachable under b.mu: b.bySeq confirmed the item exists and items/bySeq are kept in sync.
-		return 0, nil
-	}
-	b.replaceItemAtIndexLocked(i, payload, time.Now().UnixMicro(), newRender, delta)
+	b.replaceItemAtIndexLocked(idx, payload, time.Now().UnixMicro(), newRender, delta)
 	return 1, nil
 }
 
 // insertNewItemLocked is the shared "append a fresh item to this scope"
 // pipeline used by appendItem and upsertByID's miss-branch. It owns the
-// nine-step sequence that must stay coherent across both paths:
+// eight-step sequence that must stay coherent across both paths:
 // ts-stamp → renderBytes precompute → size → store-byte reservation →
-// seq assignment → b.items append → b.bySeq sync → b.byID sync (when ID
-// non-empty) → b.bytes update.
+// seq assignment → b.items append → b.byID sync (when ID non-empty)
+// → b.bytes update.
 //
 // PRECONDITIONS — caller responsibilities, not re-checked here:
 //   - holds b.mu (write lock)
@@ -293,10 +287,6 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	item.Seq = b.lastSeq
 
 	b.items = append(b.items, item)
-	if b.bySeq == nil {
-		b.bySeq = make(map[uint64]Item)
-	}
-	b.bySeq[item.Seq] = item
 	if item.ID != "" {
 		if b.byID == nil {
 			b.byID = make(map[string]Item)
