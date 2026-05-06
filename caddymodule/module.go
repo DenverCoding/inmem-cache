@@ -141,8 +141,8 @@ func (h *Handler) Cleanup() error {
 // mount scopecache under a path prefix (`handle /cache/*`) alongside other
 // handlers without scopecache swallowing unrelated traffic.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if _, pattern := h.mux.Handler(r); pattern != "" {
-		h.mux.ServeHTTP(w, r)
+	if handler, pattern := h.mux.Handler(r); pattern != "" {
+		handler.ServeHTTP(w, r)
 		return nil
 	}
 	return next.ServeHTTP(w, r)
