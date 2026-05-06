@@ -96,7 +96,12 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 		item.counter = nil
 		item.Seq = lastSeq
 		item.Ts = nowUs
-		item.renderBytes = precomputeRenderBytes(item.Payload)
+		// /warm and /rebuild's per-item validateWriteItem already filled
+		// renderBytes for string payloads; recompute only when this helper
+		// is called from a path that bypassed the validator.
+		if item.renderBytes == nil {
+			item.renderBytes = precomputeRenderBytes(item.Payload)
+		}
 
 		built = append(built, item)
 	}

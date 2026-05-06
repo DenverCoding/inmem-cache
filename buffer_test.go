@@ -179,7 +179,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 	original, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
-	n, err := buf.updateByID("a", newPayload)
+	n, err := buf.updateByID("a", newPayload, nil)
 	if err != nil {
 		t.Fatalf("updateByID: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestUpdateByID_HitPreservesSeq(t *testing.T) {
 func TestUpdateByID_Miss(t *testing.T) {
 	buf := newscopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
-	n, err := buf.updateByID("missing", raw)
+	n, err := buf.updateByID("missing", raw, nil)
 	if err != nil {
 		t.Fatalf("updateByID: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestUpdateBySeq_Hit(t *testing.T) {
 	it, _ := buf.appendItem(newItem("s", "", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 2})
-	n, err := buf.updateBySeq(it.Seq, newPayload)
+	n, err := buf.updateBySeq(it.Seq, newPayload, nil)
 	if err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 	it, _ := buf.appendItem(newItem("s", "a", map[string]interface{}{"v": 1}))
 
 	newPayload, _ := json.Marshal(map[string]interface{}{"v": 42})
-	if _, err := buf.updateBySeq(it.Seq, newPayload); err != nil {
+	if _, err := buf.updateBySeq(it.Seq, newPayload, nil); err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
 
@@ -262,7 +262,7 @@ func TestUpdateBySeq_KeepsByIDIndexInSync(t *testing.T) {
 func TestUpdateBySeq_Miss(t *testing.T) {
 	buf := newscopeBuffer(10)
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1})
-	n, err := buf.updateBySeq(999, raw)
+	n, err := buf.updateBySeq(999, raw, nil)
 	if err != nil {
 		t.Fatalf("updateBySeq: %v", err)
 	}
@@ -1221,7 +1221,7 @@ func TestApproxSizeBytes_MatchesWalkAcrossMutations(t *testing.T) {
 	}
 	check("after upsert replace (ID unchanged, payload grew)")
 
-	if _, err := buf.updateByID("id_3", json.RawMessage(`{"v":3,"x":"larger"}`)); err != nil {
+	if _, err := buf.updateByID("id_3", json.RawMessage(`{"v":3,"x":"larger"}`), nil); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	check("after updateByID")
@@ -1361,7 +1361,7 @@ func TestLastWriteTS_AdvancesOnUpdate(t *testing.T) {
 	}
 
 	pre := nowUnixMicro()
-	if _, err := buf.updateByID("a", json.RawMessage(`{"v":2}`)); err != nil {
+	if _, err := buf.updateByID("a", json.RawMessage(`{"v":2}`), nil); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	if buf.lastWriteTS < pre {

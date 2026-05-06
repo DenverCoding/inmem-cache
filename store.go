@@ -710,7 +710,7 @@ func (s *store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 // `_events` scope, which is recursion-guarded inside the helper.
 // See events.go for the full discipline.
 func (s *store) appendOne(item Item) (Item, error) {
-	if err := validateWriteItem(item, "/append", s.maxItemBytesFor(item.Scope)); err != nil {
+	if err := validateWriteItem(&item, "/append", s.maxItemBytesFor(item.Scope)); err != nil {
 		return Item{}, err
 	}
 	buf, created, err := s.getOrCreateScopeTrackingCreated(item.Scope)
@@ -753,7 +753,7 @@ func (s *store) appendOne(item Item) (Item, error) {
 // emits an upsert event into `_events` (Phase A auto-populate; gated
 // on Config.Events.Mode — see events.go).
 func (s *store) upsertOne(item Item) (Item, bool, error) {
-	if err := validateUpsertItem(item, s.maxItemBytes); err != nil {
+	if err := validateUpsertItem(&item, s.maxItemBytes); err != nil {
 		return Item{}, false, err
 	}
 	buf, scopeCreated, err := s.getOrCreateScopeTrackingCreated(item.Scope)
@@ -827,7 +827,7 @@ func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 // Drainers replaying `_events` against an empty cache produce the
 // same final state without these noise entries.
 func (s *store) updateOne(item Item) (int, error) {
-	if err := validateUpdateItem(item, s.maxItemBytes); err != nil {
+	if err := validateUpdateItem(&item, s.maxItemBytes); err != nil {
 		return 0, err
 	}
 	buf, ok := s.getScope(item.Scope)
@@ -839,9 +839,9 @@ func (s *store) updateOne(item Item) (int, error) {
 		err     error
 	)
 	if item.ID != "" {
-		updated, err = buf.updateByID(item.ID, item.Payload)
+		updated, err = buf.updateByID(item.ID, item.Payload, item.renderBytes)
 	} else {
-		updated, err = buf.updateBySeq(item.Seq, item.Payload)
+		updated, err = buf.updateBySeq(item.Seq, item.Payload, item.renderBytes)
 	}
 	if err != nil {
 		return updated, err

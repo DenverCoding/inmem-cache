@@ -147,23 +147,25 @@ func validatePayload(p json.RawMessage) error {
 // checkItemSize must measure what the write path will actually store, not
 // the raw decoded request. JSON-string payloads carry a precomputed
 // renderBytes shortcut (decoded form, populated at write time so /render
-// skips a per-hit Unmarshal); approxItemSize counts those bytes too. The
-// validator runs before the buffer-write path has filled renderBytes, so
-// for string payloads we precompute it here and add its length. Without
-// this, a 1 MiB JSON-string payload passes the per-item cap on raw bytes
-// but is stored at ~2× the cap once renderBytes is materialised — the
-// store-wide cap still catches aggregate, but the per-item cap silently
-// admits items that violate the documented invariant (rfc §3).
+// skips a per-hit Unmarshal); approxItemSize counts those bytes too.
 //
-// The duplicate precompute (here + buffer write path) is bounded by the
-// per-item cap (default 1 MiB) and only fires for string payloads, so
-// the cost is acceptable; the buffer paths are not changed because they
-// own the canonical renderBytes assignment under b.mu.
-func checkItemSize(item Item, maxItemBytes int64) error {
-	size := approxItemSize(item)
+// The validator owns the renderBytes assignment for write paths: it
+// computes the decoded form once here, stores it on the item, and the
+// downstream buffer-write paths (insertNewItemLocked, upsertByID hit
+// branch, updateByID/updateBySeq, buildReplacementState) reuse it
+// instead of recomputing. Without the carry-through a JSON-string
+// payload would be json.Unmarshal'd twice per write (once for the
+// size check, once for storage), wasting CPU and one allocation
+// proportional to the decoded length.
+//
+// PRECONDITION: item must already have passed validatePayload — the
+// JSON validity invariant lets precomputeRenderBytes treat the input
+// as well-formed JSON.
+func checkItemSize(item *Item, maxItemBytes int64) error {
 	if item.renderBytes == nil {
-		size += int64(len(precomputeRenderBytes(item.Payload)))
+		item.renderBytes = precomputeRenderBytes(item.Payload)
 	}
+	size := approxItemSize(*item)
 	if size > maxItemBytes {
 		return errors.New("the item's approximate size (" + strconv.FormatInt(size, 10) +
 			" bytes) exceeds the maximum of " + strconv.FormatInt(maxItemBytes, 10) + " bytes")
@@ -238,7 +240,7 @@ func rejectClientTs(item Item, endpoint string) error {
 	return nil
 }
 
-func validateWriteItem(item Item, endpoint string, maxItemBytes int64) (returnErr error) {
+func validateWriteItem(item *Item, endpoint string, maxItemBytes int64) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, endpoint); err != nil {
 		return err
@@ -252,13 +254,13 @@ func validateWriteItem(item Item, endpoint string, maxItemBytes int64) (returnEr
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '" + endpoint + "' endpoint")
 	}
-	if err := rejectClientTs(item, endpoint); err != nil {
+	if err := rejectClientTs(*item, endpoint); err != nil {
 		return err
 	}
 	return checkItemSize(item, maxItemBytes)
 }
 
-func validateUpsertItem(item Item, maxItemBytes int64) (returnErr error) {
+func validateUpsertItem(item *Item, maxItemBytes int64) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, "/upsert"); err != nil {
 		return err
@@ -275,13 +277,13 @@ func validateUpsertItem(item Item, maxItemBytes int64) (returnErr error) {
 	if item.Seq != 0 {
 		return errors.New("the 'seq' field is managed by the cache and must not be provided to the '/upsert' endpoint")
 	}
-	if err := rejectClientTs(item, "/upsert"); err != nil {
+	if err := rejectClientTs(*item, "/upsert"); err != nil {
 		return err
 	}
 	return checkItemSize(item, maxItemBytes)
 }
 
-func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
+func validateUpdateItem(item *Item, maxItemBytes int64) (returnErr error) {
 	defer func() { returnErr = wrapValidation(returnErr) }()
 	if err := validateScope(item.Scope, "/update"); err != nil {
 		return err
@@ -295,7 +297,7 @@ func validateUpdateItem(item Item, maxItemBytes int64) (returnErr error) {
 	if err := validatePayload(item.Payload); err != nil {
 		return err
 	}
-	if err := rejectClientTs(item, "/update"); err != nil {
+	if err := rejectClientTs(*item, "/update"); err != nil {
 		return err
 	}
 	return checkItemSize(item, maxItemBytes)

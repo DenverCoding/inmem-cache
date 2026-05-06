@@ -81,7 +81,13 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// handles the counter-item case where `existing.Payload` is
 		// stale-by-construction and the real cost lives in the cell —
 		// a naive `len(existing.Payload)` would under-count.
-		newRender := precomputeRenderBytes(item.Payload)
+		// validateUpsertItem already filled item.renderBytes for
+		// string payloads; recompute only when the call came in via
+		// a Gateway path that bypassed the validator.
+		newRender := item.renderBytes
+		if newRender == nil {
+			newRender = precomputeRenderBytes(item.Payload)
+		}
 		delta := int64(len(item.Payload)+len(newRender)) - payloadAndRenderBytes(existing)
 		if b.store != nil && delta != 0 {
 			ok, current, max := b.store.reserveBytes(delta)
@@ -135,7 +141,11 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 // updateByID mutates the item at (scope, id). Payload is always overwritten;
 // ts is refreshed to time.Now().UnixMicro() — every write that touches an
 // item refreshes ts to "when did the cache write this content."
-func (b *scopeBuffer) updateByID(id string, payload json.RawMessage) (int, error) {
+//
+// preRender is the validator's precomputed renderBytes for the new payload.
+// Pass nil from direct Gateway callers that bypass the validator path; the
+// helper falls back to precomputeRenderBytes(payload) in that case.
+func (b *scopeBuffer) updateByID(id string, payload json.RawMessage, preRender []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -153,7 +163,10 @@ func (b *scopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 	// payload-bytes. payloadAndRenderBytes handles the counter-item
 	// case (cell overhead vs len(Payload)+len(renderBytes)); see
 	// buffer_locked.go for the rationale.
-	newRender := precomputeRenderBytes(payload)
+	newRender := preRender
+	if newRender == nil {
+		newRender = precomputeRenderBytes(payload)
+	}
 	delta, err := b.reservePayloadDeltaLocked(
 		payloadAndRenderBytes(existing),
 		int64(len(payload)+len(newRender)),
@@ -171,7 +184,9 @@ func (b *scopeBuffer) updateByID(id string, payload json.RawMessage) (int, error
 	return 1, nil
 }
 
-func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, error) {
+// preRender mirrors updateByID: the validator's renderBytes for the new
+// payload, or nil to recompute.
+func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -186,7 +201,10 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage) (int, err
 	existing := b.items[idx]
 
 	// See updateByID for the renderBytes-aware delta rationale.
-	newRender := precomputeRenderBytes(payload)
+	newRender := preRender
+	if newRender == nil {
+		newRender = precomputeRenderBytes(payload)
+	}
 
 	// Per-item cap re-check on the fully-materialized post-update item.
 	// The validator's checkItemSize ran on the request body, where ID
@@ -273,7 +291,13 @@ func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) 
 	// reassigns it unconditionally on the next line.
 	item.counter = nil
 	item.Ts = nowUs
-	item.renderBytes = precomputeRenderBytes(item.Payload)
+	// renderBytes is normally pre-computed by the validator's checkItemSize
+	// (so the byte cap measures what we actually store) and carried through
+	// on the same Item value. Recompute only on direct Gateway callers
+	// that bypass the validator path.
+	if item.renderBytes == nil {
+		item.renderBytes = precomputeRenderBytes(item.Payload)
+	}
 
 	size := approxItemSize(item)
 	if b.store != nil {

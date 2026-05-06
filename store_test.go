@@ -1123,7 +1123,7 @@ func TestStore_Update_RejectsGrowAtByteCap(t *testing.T) {
 		"v":    1,
 		"blob": "x_________________________________________________________________________________________________",
 	})
-	n, err := buf.updateByID("a", bigPayload)
+	n, err := buf.updateByID("a", bigPayload, nil)
 	if err == nil {
 		t.Fatal("expected StoreFullError on grow past cap")
 	}

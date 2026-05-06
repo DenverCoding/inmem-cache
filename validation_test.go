@@ -80,19 +80,22 @@ func TestNormalizeHours(t *testing.T) {
 
 func TestValidateWriteItem(t *testing.T) {
 	ok := Item{Scope: "s", Payload: json.RawMessage(`{"v":1}`)}
-	if err := validateWriteItem(ok, "/append", MaxItemBytes); err != nil {
+	if err := validateWriteItem(&ok, "/append", MaxItemBytes); err != nil {
 		t.Errorf("valid item rejected: %v", err)
 	}
 
-	if err := validateWriteItem(Item{Scope: "s"}, "/append", MaxItemBytes); err == nil {
+	missingPayload := Item{Scope: "s"}
+	if err := validateWriteItem(&missingPayload, "/append", MaxItemBytes); err == nil {
 		t.Error("missing payload should error")
 	}
 
-	if err := validateWriteItem(Item{}, "/append", MaxItemBytes); err == nil {
+	missingScope := Item{}
+	if err := validateWriteItem(&missingScope, "/append", MaxItemBytes); err == nil {
 		t.Error("missing scope should error")
 	}
 
-	if err := validateWriteItem(Item{Scope: "s", Payload: json.RawMessage(`{}`), Seq: 5}, "/append", MaxItemBytes); err == nil {
+	withSeq := Item{Scope: "s", Payload: json.RawMessage(`{}`), Seq: 5}
+	if err := validateWriteItem(&withSeq, "/append", MaxItemBytes); err == nil {
 		t.Error("non-zero seq should error")
 	}
 }
@@ -113,7 +116,7 @@ func TestValidateWriteItem_AcceptsAnyJSONShape(t *testing.T) {
 	}
 	for _, p := range shapes {
 		item := Item{Scope: "s", Payload: p}
-		if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
+		if err := validateWriteItem(&item, "/append", MaxItemBytes); err != nil {
 			t.Errorf("shape %s rejected: %v", string(p), err)
 		}
 	}
@@ -131,7 +134,8 @@ func TestValidateWriteItem_RejectsMissingAndNullPayload(t *testing.T) {
 		{"literal null with whitespace", Item{Scope: "s", Payload: json.RawMessage(`  null  `)}},
 	}
 	for _, tc := range cases {
-		if err := validateWriteItem(tc.item, "/append", MaxItemBytes); err == nil {
+		item := tc.item
+		if err := validateWriteItem(&item, "/append", MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}
@@ -160,7 +164,7 @@ func TestValidateWriteItem_RejectsInvalidJSON(t *testing.T) {
 	}
 	for _, tc := range cases {
 		item := Item{Scope: "s", Payload: tc.payload}
-		err := validateWriteItem(item, "/append", MaxItemBytes)
+		err := validateWriteItem(&item, "/append", MaxItemBytes)
 		if err == nil {
 			t.Errorf("%s: expected rejection", tc.name)
 			continue
@@ -176,7 +180,7 @@ func TestValidateWriteItem_RejectsInvalidJSON(t *testing.T) {
 // bytes that future /get on (scope, id) returns to clients.
 func TestValidateUpsertItem_RejectsInvalidJSON(t *testing.T) {
 	item := Item{Scope: "s", ID: "x", Payload: json.RawMessage(`{"a":`)}
-	err := validateUpsertItem(item, MaxItemBytes)
+	err := validateUpsertItem(&item, MaxItemBytes)
 	if err == nil {
 		t.Fatal("expected rejection of malformed JSON payload")
 	}
@@ -191,7 +195,7 @@ func TestValidateUpsertItem_RejectsInvalidJSON(t *testing.T) {
 // break readers that previously worked.
 func TestValidateUpdateItem_RejectsInvalidJSON(t *testing.T) {
 	item := Item{Scope: "s", ID: "x", Payload: json.RawMessage(`{"a":`)}
-	err := validateUpdateItem(item, MaxItemBytes)
+	err := validateUpdateItem(&item, MaxItemBytes)
 	if err == nil {
 		t.Fatal("expected rejection of malformed JSON payload")
 	}
@@ -221,7 +225,7 @@ func TestValidateWriteItem_RejectsOversizedPayload(t *testing.T) {
 	buf[n-1] = ']'
 
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
-	if err := validateWriteItem(item, "/append", MaxItemBytes); err == nil {
+	if err := validateWriteItem(&item, "/append", MaxItemBytes); err == nil {
 		t.Error("expected oversized item to be rejected")
 	}
 }
@@ -247,7 +251,7 @@ func TestValidateWriteItem_AcceptsExactCapPayload(t *testing.T) {
 	buf[n-1] = ']'
 
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
-	if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
+	if err := validateWriteItem(&item, "/append", MaxItemBytes); err != nil {
 		t.Errorf("under-cap item rejected: %v", err)
 	}
 }
@@ -273,7 +277,7 @@ func TestValidateWriteItem_StringPayloadCountsRenderBytes(t *testing.T) {
 	buf[n-1] = '"'
 
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
-	if err := validateWriteItem(item, "/append", MaxItemBytes); err == nil {
+	if err := validateWriteItem(&item, "/append", MaxItemBytes); err == nil {
 		t.Fatal("expected rejection: JSON-string payload + renderBytes exceeds per-item cap")
 	}
 }
@@ -299,7 +303,7 @@ func TestValidateWriteItem_NonStringPayloadSkipsRenderBytesInflation(t *testing.
 	buf[n-1] = ']'
 
 	item := Item{Scope: "s", Payload: json.RawMessage(buf)}
-	if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
+	if err := validateWriteItem(&item, "/append", MaxItemBytes); err != nil {
 		t.Errorf("non-string payload of raw size %d unexpectedly rejected: %v", n, err)
 	}
 }
@@ -333,7 +337,8 @@ func TestValidateWriteItem_ScopeAndIDShapeRules(t *testing.T) {
 		{"id has control char", Item{Scope: "s", ID: "x\x01", Payload: json.RawMessage(`{}`)}},
 	}
 	for _, tc := range cases {
-		if err := validateWriteItem(tc.item, "/append", MaxItemBytes); err == nil {
+		item := tc.item
+		if err := validateWriteItem(&item, "/append", MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}
@@ -376,7 +381,8 @@ func TestValidateWriteItem_AcceptsKeyEdges(t *testing.T) {
 		{"empty id is allowed", Item{Scope: "s", ID: "", Payload: json.RawMessage(`{}`)}},
 	}
 	for _, tc := range cases {
-		if err := validateWriteItem(tc.item, "/append", MaxItemBytes); err != nil {
+		item := tc.item
+		if err := validateWriteItem(&item, "/append", MaxItemBytes); err != nil {
 			t.Errorf("%s: unexpectedly rejected: %v", tc.name, err)
 		}
 	}
@@ -384,12 +390,12 @@ func TestValidateWriteItem_AcceptsKeyEdges(t *testing.T) {
 
 func TestValidateUpdateItem(t *testing.T) {
 	goodByID := Item{Scope: "s", ID: "a", Payload: json.RawMessage(`{"v":1}`)}
-	if err := validateUpdateItem(goodByID, MaxItemBytes); err != nil {
+	if err := validateUpdateItem(&goodByID, MaxItemBytes); err != nil {
 		t.Errorf("valid update (by id) rejected: %v", err)
 	}
 
 	goodBySeq := Item{Scope: "s", Seq: 7, Payload: json.RawMessage(`{"v":1}`)}
-	if err := validateUpdateItem(goodBySeq, MaxItemBytes); err != nil {
+	if err := validateUpdateItem(&goodBySeq, MaxItemBytes); err != nil {
 		t.Errorf("valid update (by seq) rejected: %v", err)
 	}
 
@@ -406,7 +412,8 @@ func TestValidateUpdateItem(t *testing.T) {
 		{"id with control char", Item{Scope: "s", ID: "a\x01", Payload: json.RawMessage(`{}`)}},
 	}
 	for _, tc := range cases {
-		if err := validateUpdateItem(tc.item, MaxItemBytes); err == nil {
+		item := tc.item
+		if err := validateUpdateItem(&item, MaxItemBytes); err == nil {
 			t.Errorf("%s: expected error", tc.name)
 		}
 	}
@@ -547,10 +554,12 @@ func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
 		t.Run("scope="+scope, func(t *testing.T) {
 			payload := json.RawMessage(`{"v":1}`)
 
-			if err := validateUpsertItem(Item{Scope: scope, ID: "x", Payload: payload}, maxItem); err == nil {
+			upsertIt := Item{Scope: scope, ID: "x", Payload: payload}
+			if err := validateUpsertItem(&upsertIt, maxItem); err == nil {
 				t.Errorf("validateUpsertItem on %q: expected reservation error, got nil", scope)
 			}
-			if err := validateUpdateItem(Item{Scope: scope, ID: "x", Payload: payload}, maxItem); err == nil {
+			updateIt := Item{Scope: scope, ID: "x", Payload: payload}
+			if err := validateUpdateItem(&updateIt, maxItem); err == nil {
 				t.Errorf("validateUpdateItem on %q: expected reservation error, got nil", scope)
 			}
 			by := int64(1)
@@ -563,7 +572,8 @@ func TestReservedScopes_RejectsScopeLevelAndMutationOps(t *testing.T) {
 
 			// /append on reserved must still succeed at the validator level —
 			// apps write to _inbox, the cache later auto-populates _events.
-			if err := validateWriteItem(Item{Scope: scope, Payload: payload}, "/append", maxItem); err != nil {
+			appendIt := Item{Scope: scope, Payload: payload}
+			if err := validateWriteItem(&appendIt, "/append", maxItem); err != nil {
 				t.Errorf("validateWriteItem on %q: append must be allowed, got %v", scope, err)
 			}
 			// /delete on reserved must succeed (drainer single-item cleanup).

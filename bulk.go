@@ -114,12 +114,12 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 		// /events emit. Reject explicitly rather than normalising — a
 		// silent rewrite would mask a misconstructed map and let the
 		// real client bug ship.
-		for i, item := range items {
-			if err := validateWriteItem(item, "/warm", s.maxItemBytes); err != nil {
+		for i := range items {
+			if err := validateWriteItem(&items[i], "/warm", s.maxItemBytes); err != nil {
 				return 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
 			}
-			if item.Scope != scope {
-				return 0, fmt.Errorf("%w: scope '%s', item at index %d: item.scope %q does not match the map key", ErrInvalidInput, scope, i, item.Scope)
+			if items[i].Scope != scope {
+				return 0, fmt.Errorf("%w: scope '%s', item at index %d: item.scope %q does not match the map key", ErrInvalidInput, scope, i, items[i].Scope)
 			}
 		}
 		if len(items) > s.defaultMaxItems {
@@ -294,12 +294,12 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		// Per-item shape validation, same shape as /warm — see
 		// replaceScopes for the rationale on per-scope-slice indexing
 		// AND on the map-key/item.Scope equality check.
-		for i, item := range items {
-			if err := validateWriteItem(item, "/rebuild", s.maxItemBytes); err != nil {
+		for i := range items {
+			if err := validateWriteItem(&items[i], "/rebuild", s.maxItemBytes); err != nil {
 				return 0, 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
 			}
-			if item.Scope != scope {
-				return 0, 0, fmt.Errorf("%w: scope '%s', item at index %d: item.scope %q does not match the map key", ErrInvalidInput, scope, i, item.Scope)
+			if items[i].Scope != scope {
+				return 0, 0, fmt.Errorf("%w: scope '%s', item at index %d: item.scope %q does not match the map key", ErrInvalidInput, scope, i, items[i].Scope)
 			}
 		}
 		if len(items) > s.defaultMaxItems {

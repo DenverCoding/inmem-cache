@@ -84,7 +84,7 @@ func FuzzValidateWriteItem(f *testing.F) {
 	f.Add("s", "", []byte(`   null   `))
 	f.Fuzz(func(t *testing.T, scope, id string, payload []byte) {
 		item := Item{Scope: scope, ID: id, Payload: json.RawMessage(payload)}
-		if err := validateWriteItem(item, "/append", MaxItemBytes); err != nil {
+		if err := validateWriteItem(&item, "/append", MaxItemBytes); err != nil {
 			return
 		}
 		if scope == "" {
