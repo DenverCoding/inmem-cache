@@ -156,6 +156,55 @@ func TestUnmarshalCaddyfile_SubscriberCommand(t *testing.T) {
 	})
 }
 
+// init_command lands on the InitCommand field as-is. Same parser
+// shape as subscriber_command; the test pins the routing so a typo
+// or refactor doesn't silently drop the value or misroute it onto
+// another field.
+func TestUnmarshalCaddyfile_InitCommand(t *testing.T) {
+	t.Run("set", func(t *testing.T) {
+		input := `scopecache {
+			init_command /usr/local/bin/rebuild.sh
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		if h.InitCommand != "/usr/local/bin/rebuild.sh" {
+			t.Errorf("InitCommand=%q, want /usr/local/bin/rebuild.sh", h.InitCommand)
+		}
+	})
+
+	t.Run("unset defaults to empty", func(t *testing.T) {
+		input := `scopecache {
+			max_store_mb 100
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		if h.InitCommand != "" {
+			t.Errorf("InitCommand=%q, want empty when not set", h.InitCommand)
+		}
+	})
+
+	t.Run("set alongside subscriber_command", func(t *testing.T) {
+		input := `scopecache {
+			subscriber_command /usr/local/bin/drain.sh
+			init_command       /usr/local/bin/rebuild.sh
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		if h.SubscriberCommand != "/usr/local/bin/drain.sh" {
+			t.Errorf("SubscriberCommand=%q", h.SubscriberCommand)
+		}
+		if h.InitCommand != "/usr/local/bin/rebuild.sh" {
+			t.Errorf("InitCommand=%q", h.InitCommand)
+		}
+	})
+}
+
 // events_mode must accept "", "off", "notify", "full" and reject
 // anything else. The empty string is the documented sentinel for
 // "use the compile-time default" (= off), same shape as the integer

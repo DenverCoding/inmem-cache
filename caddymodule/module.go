@@ -14,10 +14,15 @@
 package caddymodule
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/VeloxCoding/scopecache"
 	"github.com/caddyserver/caddy/v2"
@@ -67,6 +72,19 @@ type Handler struct {
 	// binary, or anything else exec.Command can run. See
 	// scopecache.Gateway.StartSubscriber for the contract.
 	SubscriberCommand string `json:"subscriber_command,omitempty"`
+	// InitCommand is the absolute path to an executable invoked once
+	// at Provision time, after the cache has been constructed and the
+	// reserved scopes (`_events`, `_inbox`) are pre-created. Empty
+	// (default) = no init command. Set = the helper runs sync inside
+	// Provision, blocking the rest of Caddy's start-up until the
+	// command exits. Use case: rebuild the cache from a source of
+	// truth at boot. See scopecache.Gateway.RunInitCommand for the
+	// timing caveat — Caddy hasn't bound its HTTP listeners yet, so
+	// scripts that need to write into the cache via Caddy's listener
+	// either prepare external state, run via a separate ingestion
+	// path that comes up after Caddy, or live in the standalone
+	// adapter where AF_UNIX is already up at init time.
+	InitCommand string `json:"init_command,omitempty"`
 
 	api             *scopecache.API
 	mux             *http.ServeMux
@@ -114,7 +132,88 @@ func (h *Handler) Provision(_ caddy.Context) error {
 		h.SubscriberCommand,
 		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
 	)
+	// Boot-time init command. We open a private Unix socket exposing
+	// the cache's HTTP routes ONLY for the duration of the init
+	// script, then run the script sync, then tear the socket down.
+	// This solves the timing problem that Caddy's own HTTP listeners
+	// aren't bound yet during Provision: by binding our own listener
+	// we give the script a way to write into THIS instance's cache
+	// even though Caddy isn't accepting traffic.
+	//
+	// The same in-memory Gateway powers both this temporary socket
+	// and the eventual Caddy ServeHTTP path; the script and later
+	// Caddy traffic see the same data. The socket is private (per-
+	// instance temp dir, removed on shutdown) so it doesn't become
+	// a separate operator-facing surface.
+	//
+	// Sync — Provision blocks until the script exits. Caddy keeps
+	// the previous instance serving traffic during reload, so a
+	// long-running init script does not interrupt service; first
+	// boot waits for the cache to be populated before Caddy starts
+	// listening. A failure is logged and ignored: empty cache is
+	// still a working cache.
+	if h.InitCommand != "" {
+		if err := h.runInitWithPrivateSocket(gw); err != nil {
+			caddy.Log().Named("scopecache.init").Sugar().Warnf("init: %v", err)
+		}
+	}
 	return nil
+}
+
+// runInitWithPrivateSocket binds a temp Unix socket serving the cache
+// routes, runs the init command (which is told the socket path via
+// SCOPECACHE_SOCKET_PATH), then tears the socket down. The script can
+// curl --unix-socket "$SCOPECACHE_SOCKET_PATH" http://localhost/...
+// exactly like the standalone adapter.
+//
+// The temp dir + socket are created with restrictive permissions
+// (the dir is 0o700 by default from MkdirTemp; the socket inherits
+// the dir's access control) so other users on the host can't read
+// or write through it.
+func (h *Handler) runInitWithPrivateSocket(gw *scopecache.Gateway) error {
+	logf := caddy.Log().Named("scopecache.init").Sugar().Infof
+	logger := caddy.Log().Named("scopecache.init").Sugar()
+
+	dir, err := os.MkdirTemp("", "scopecache-init-")
+	if err != nil {
+		return fmt.Errorf("create temp dir for init socket: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			logger.Warnf("remove temp dir %s: %v", dir, err)
+		}
+	}()
+
+	sockPath := filepath.Join(dir, "init.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("listen on init socket %s: %w", sockPath, err)
+	}
+
+	server := &http.Server{Handler: h.mux}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(ln)
+	}()
+
+	runErr := gw.RunInitCommand(
+		h.InitCommand,
+		[]string{"SCOPECACHE_SOCKET_PATH=" + sockPath},
+		logf,
+	)
+
+	// Tear the socket down before Provision returns. Shutdown
+	// gracefully closes idle connections; in-flight curls from the
+	// init script have already completed (RunInitCommand is sync).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Warnf("shutdown init socket: %v", err)
+	}
+	<-serveDone
+
+	return runErr
 }
 
 // Cleanup is called by Caddy when the module is being torn down (config
@@ -160,6 +259,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    inbox_max_item_kb   64
 //	    events_mode         off
 //	    subscriber_command  /usr/local/bin/drain.sh
+//	    init_command        /usr/local/bin/rebuild.sh
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -184,6 +284,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			if key == "subscriber_command" {
 				h.SubscriberCommand = value
+				continue
+			}
+			if key == "init_command" {
+				h.InitCommand = value
 				continue
 			}
 

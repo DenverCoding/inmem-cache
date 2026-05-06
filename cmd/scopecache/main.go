@@ -168,6 +168,20 @@ func subscriberCommandFromEnv() string {
 	return os.Getenv("SCOPECACHE_SUBSCRIBER_COMMAND")
 }
 
+// initCommandFromEnv returns SCOPECACHE_INIT_COMMAND if set to a
+// non-empty value, otherwise the empty string. Empty = no init
+// command (default). Set = the cache invokes the command once at
+// boot, after the AF_UNIX listener is up and after subscribers have
+// started, but before main blocks on the shutdown signal.
+// SCOPECACHE_SOCKET_PATH is exported into the script's environment
+// so it can curl --unix-socket back into the cache.
+//
+// The path is not stat'd here; missing-executable errors surface at
+// invocation time (see init_command.go in the core package).
+func initCommandFromEnv() string {
+	return os.Getenv("SCOPECACHE_INIT_COMMAND")
+}
+
 // eventsModeFromEnv returns the SCOPECACHE_EVENTS_MODE setting parsed
 // into the typed scopecache.EventsMode. Empty string maps to
 // EventsModeOff (the default — auto-populate disabled). Any other
@@ -322,7 +336,27 @@ func main() {
 	}()
 
 	log.Printf("scopecache listening on unix://%s", socketPath)
-	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+
+	// Serve runs in a goroutine so the boot-time init command (sync,
+	// blocking) can curl back into the cache over its own socket while
+	// startup proceeds. See init_command.go for the contract.
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ln)
+	}()
+
+	if err := gw.RunInitCommand(
+		initCommandFromEnv(),
+		[]string{"SCOPECACHE_SOCKET_PATH=" + socketPath},
+		log.Printf,
+	); err != nil {
+		log.Printf("scopecache init: %v (continuing with empty cache)", err)
+	}
+
+	// Block on Serve's exit. The signal goroutine triggers
+	// server.Shutdown on SIGINT/SIGTERM, which makes Serve return
+	// http.ErrServerClosed; any other exit is logged.
+	if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("serve error: %v", err)
 	}
 
