@@ -214,6 +214,7 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 		// signals (see file header). The cell's own ts captures the
 		// "when did this counter last change" view directly.
 		b.items[i] = promoted
+		b.bySeq[promoted.Seq] = promoted
 		b.byID[id] = promoted
 		b.bytes += delta
 
@@ -252,6 +253,10 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 	b.lastSeq++
 	item.Seq = b.lastSeq
 	b.items = append(b.items, item)
+	if b.bySeq == nil {
+		b.bySeq = make(map[uint64]Item)
+	}
+	b.bySeq[item.Seq] = item
 	if b.byID == nil {
 		b.byID = make(map[string]Item)
 	}

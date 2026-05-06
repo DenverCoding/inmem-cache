@@ -650,7 +650,7 @@ func TestDeleteByID_DoesNotRollbackLastSeq(t *testing.T) {
 //
 // Asserts the post-conditions resetIfEmptyLocked promises:
 //   - items slice is nil (cap == 0; no backing array retained)
-//   - byID map is nil
+//   - bySeq / byID maps are nil
 //   - lastSeq is preserved (monotonic across drain/refill cycles)
 //   - subsequent appendItem still works (lazy-init verified)
 //
@@ -744,6 +744,9 @@ func TestDeleteByID_DrainToEmptyReleasesBacking(t *testing.T) {
 	if buf.items != nil {
 		t.Errorf("items slice = %v, want nil", buf.items)
 	}
+	if buf.bySeq != nil {
+		t.Errorf("bySeq = %v, want nil (map buckets not released)", buf.bySeq)
+	}
 	if buf.byID != nil {
 		t.Errorf("byID = %v, want nil (map buckets not released)", buf.byID)
 	}
@@ -783,6 +786,9 @@ func TestDeleteUpToSeq_DrainToEmptyReleasesBacking(t *testing.T) {
 	if cap(buf.items) != 0 {
 		t.Errorf("cap(items)=%d after drain, want 0", cap(buf.items))
 	}
+	if buf.bySeq != nil {
+		t.Errorf("bySeq = %v, want nil", buf.bySeq)
+	}
 	if buf.byID != nil {
 		t.Errorf("byID = %v, want nil", buf.byID)
 	}
@@ -800,8 +806,8 @@ func TestDeleteBySeq_Hit(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("deleted=%d want 1", n)
 	}
-	if _, ok := buf.indexBySeqLocked(it2.Seq); ok {
-		t.Fatal("seq still in items after deleteBySeq")
+	if _, ok := buf.bySeq[it2.Seq]; ok {
+		t.Fatal("seq still in bySeq index")
 	}
 	if _, ok := buf.byID["b"]; ok {
 		t.Fatal("id 'b' still in byID index")
@@ -866,8 +872,8 @@ func TestDeleteUpToSeq_RemovesPrefix(t *testing.T) {
 		t.Fatalf("unexpected survivors: %+v", buf.items)
 	}
 	for seq := uint64(1); seq <= 3; seq++ {
-		if _, ok := buf.indexBySeqLocked(seq); ok {
-			t.Fatalf("seq %d should be gone from items", seq)
+		if _, ok := buf.bySeq[seq]; ok {
+			t.Fatalf("seq %d should be gone from bySeq", seq)
 		}
 	}
 }
@@ -1180,6 +1186,7 @@ func walkApproxSize(b *scopeBuffer) int64 {
 	for k := range b.byID {
 		total += int64(len(k))
 	}
+	total += int64(len(b.bySeq)) * 16
 	return total
 }
 
@@ -1524,7 +1531,7 @@ func TestBuildReplacementState_SeqFromOne(t *testing.T) {
 	if _, ok := r.byID["a"]; !ok {
 		t.Fatal("byID missing 'a'")
 	}
-	if r.items[0].Seq != 1 {
-		t.Fatalf("items[0].Seq=%d want 1", r.items[0].Seq)
+	if _, ok := r.bySeq[1]; !ok {
+		t.Fatal("bySeq missing seq 1")
 	}
 }

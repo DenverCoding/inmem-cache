@@ -320,6 +320,7 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		buf := s.newscopeBuffer()
 		buf.items = r.items
 		buf.byID = r.byID
+		buf.bySeq = r.bySeq
 		buf.lastSeq = r.lastSeq
 		buf.bytes = sumItemBytes(r.items)
 		newShardMaps[s.shardIdxFor(scope)][scope] = buf

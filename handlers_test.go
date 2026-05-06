@@ -2049,7 +2049,7 @@ func TestIntegration_MixedWorkload_StatsAndInvariants(t *testing.T) {
 //
 //   - total_items from /stats == Σ appendsOK − Σ deletedN
 //   - same total matches len(items) walked across every live scope
-//   - per scope: items slice and byID map are mutually consistent
+//   - per scope: items slice, bySeq map, byID map are mutually consistent
 //   - per scope: items are still sorted ascending by seq (append contract)
 //   - per scope: lastSeq >= the highest seq present (never rewinds)
 //   - store.totalBytes == Σ buf.bytes == Σ approxItemSize recomputed from items
@@ -2179,6 +2179,9 @@ func TestRace_ParallelMixedWorkload(t *testing.T) {
 		totalItemsWalked += int64(len(buf.items))
 		totalReadCount += buf.readCountTotal.Load()
 
+		if got, want := len(buf.bySeq), len(buf.items); got != want {
+			t.Errorf("scope %q: len(bySeq)=%d != len(items)=%d", scopeName, got, want)
+		}
 		nonEmptyIDs := 0
 		for i := range buf.items {
 			if buf.items[i].ID != "" {
@@ -3953,9 +3956,9 @@ func TestWriteJSONWithMeta_MarshalFailureReturns500(t *testing.T) {
 // non-internal way to construct this state (validatePayload now
 // blocks every write path), and the whole point of the test is to
 // prove the read path stays safe even when something upstream of it
-// has gone wrong. Items live in two places inside scopeBuffer
-// (items slice + byID map); both must be patched in lockstep because
-// /get?id=a reads byID.
+// has gone wrong. Items live in three places inside scopeBuffer
+// (items slice, byID map, bySeq map); all three must be patched in
+// lockstep because /get?id=a reads byID.
 func TestGet_CorruptStoredPayloadReturns500(t *testing.T) {
 	h, api := newTestHandler(10)
 
@@ -3978,6 +3981,7 @@ func TestGet_CorruptStoredPayloadReturns500(t *testing.T) {
 	corrupt.renderBytes = nil
 	buf.items[0] = corrupt
 	buf.byID["a"] = corrupt
+	buf.bySeq[corrupt.Seq] = corrupt
 	buf.mu.Unlock()
 
 	rec := doRawRequest(t, h, "GET", "/get?scope=s&id=a")

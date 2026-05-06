@@ -19,9 +19,9 @@ import (
 //
 //   - s.totalBytes (atomic counter) == sum of buf.bytes across all scopes
 //   - buf.bytes == sum of approxItemSize(item) within the scope
-//   - buf.items is strictly seq-ordered (so indexBySeqLocked stays correct)
-//   - every buf.byID[id].Seq is locatable via indexBySeqLocked, and the
-//     item there carries the same id (byID and items stay in lockstep)
+//   - len(buf.items) == len(buf.bySeq)
+//   - buf.items is strictly seq-ordered
+//   - every buf.byID[id] has a matching entry in buf.bySeq
 //
 // A broken invariant after concurrent load almost always points to a missed
 // lock, a missed counter delta, or an index that drifted from items. This
@@ -239,6 +239,10 @@ func verifyInvariants(t *testing.T, s *store) {
 				t.Errorf("scope %q: sum(approxItemSize)=%d != buf.bytes=%d", name, sum, buf.bytes)
 			}
 
+			if len(buf.bySeq) != len(buf.items) {
+				t.Errorf("scope %q: len(bySeq)=%d != len(items)=%d", name, len(buf.bySeq), len(buf.items))
+			}
+
 			for i := 1; i < len(buf.items); i++ {
 				if buf.items[i].Seq <= buf.items[i-1].Seq {
 					t.Errorf("scope %q: items not strictly seq-ordered at %d (seq %d <= %d)",
@@ -248,14 +252,14 @@ func verifyInvariants(t *testing.T, s *store) {
 			}
 
 			for id, item := range buf.byID {
-				idx, ok := buf.indexBySeqLocked(item.Seq)
+				bySeqItem, ok := buf.bySeq[item.Seq]
 				if !ok {
-					t.Errorf("scope %q: byID[%q].Seq=%d not findable in items", name, id, item.Seq)
+					t.Errorf("scope %q: byID[%q].Seq=%d not in bySeq", name, id, item.Seq)
 					continue
 				}
-				if buf.items[idx].ID != id {
-					t.Errorf("scope %q: byID[%q] points at seq=%d but items[%d].ID=%q",
-						name, id, item.Seq, idx, buf.items[idx].ID)
+				if bySeqItem.ID != id {
+					t.Errorf("scope %q: byID[%q] points at seq=%d but bySeq[%d].ID=%q",
+						name, id, item.Seq, item.Seq, bySeqItem.ID)
 				}
 			}
 

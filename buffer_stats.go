@@ -1,7 +1,7 @@
 package scopecache
 
 // approxSizeBytes is a richer estimate than the raw approxItemSize sum: it
-// also folds in Go map/slice overhead for b.byID. It surfaces
+// also folds in Go map/slice overhead for b.byID and b.bySeq. It surfaces
 // as the per-scope approx_scope_mb value in observability snapshots. It
 // is NOT used for cap enforcement — admission control uses
 // Store.totalBytes (approxItemSize sum + scopeBufferOverhead per scope)
@@ -26,6 +26,7 @@ package scopecache
 //   - b.bytes                     : Σ approxItemSize(item) — admission-control byte sum
 //   - len(b.byID) * 32            : map bucket overhead per byID entry
 //   - b.idKeyBytes                : Σ len(item.ID) over the byID keys
+//   - len(b.bySeq) * 16           : map bucket overhead per bySeq entry
 //
 // PRECONDITION: caller holds b.mu (or b.mu.RLock — the formula reads
 // only mu-protected state).
@@ -33,12 +34,14 @@ func (b *scopeBuffer) approxSizeBytesLocked() int64 {
 	const structOverhead = int64(64)
 	const itemSlotOverhead = int64(32)
 	const byIDBucketOverhead = int64(32)
+	const bySeqBucketOverhead = int64(16)
 
 	return structOverhead +
 		int64(len(b.items))*itemSlotOverhead +
 		b.bytes +
 		int64(len(b.byID))*byIDBucketOverhead +
-		b.idKeyBytes
+		b.idKeyBytes +
+		int64(len(b.bySeq))*bySeqBucketOverhead
 }
 
 func (b *scopeBuffer) approxSizeBytes() int64 {

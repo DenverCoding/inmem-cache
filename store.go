@@ -113,8 +113,9 @@ type store struct {
 	// all describe the same accounting model.
 	//
 	// totalBytes is leaner than scopeBuffer.approxSizeBytes — the
-	// per-scope estimate folds in Go map/slice overhead for byID, which
-	// admission control deliberately does NOT charge against the cap. Counting per-scope overhead is
+	// per-scope estimate folds in Go map/slice overhead for byID, bySeq
+	// and the heat-bucket ring, which admission control deliberately
+	// does NOT charge against the cap. Counting per-scope overhead is
 	// what closes the empty-scope-spam DoS (see scopeBufferOverhead's
 	// own comment); counting per-item Go heap overhead would be
 	// honest-er to real memory pressure but at the cost of making the

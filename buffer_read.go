@@ -133,9 +133,9 @@ func (b *scopeBuffer) getByID(id string) (Item, bool) {
 func (b *scopeBuffer) getBySeq(seq uint64) (Item, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	idx, ok := b.indexBySeqLocked(seq)
+	item, ok := b.bySeq[seq]
 	if !ok {
 		return Item{}, false
 	}
-	return materialiseCounter(b.items[idx]), true
+	return materialiseCounter(item), true
 }
