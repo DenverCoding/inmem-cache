@@ -199,6 +199,56 @@ func eventsModeFromEnv() scopecache.EventsMode {
 
 const shutdownGracePeriod = 5 * time.Second
 
+// runInitWithPrivateSocket binds a private temp Unix socket serving
+// the cache routes, runs the init command (which is told the socket
+// path via SCOPECACHE_SOCKET_PATH), then tears the socket down. The
+// public socketPath stays unbound throughout, so external clients
+// hitting it during init get connection-refused instead of hitting
+// a partially-populated cache.
+//
+// Mirrors caddymodule's runInitWithPrivateSocket — the standalone
+// and Caddy adapters share the same "init runs behind a private
+// channel" contract so the same script body works in both.
+func runInitWithPrivateSocket(gw *scopecache.Gateway, mux *http.ServeMux, command string) error {
+	dir, err := os.MkdirTemp("", "scopecache-init-")
+	if err != nil {
+		return fmt.Errorf("create temp dir for init socket: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("remove temp dir %s: %v", dir, err)
+		}
+	}()
+
+	sockPath := filepath.Join(dir, "init.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("listen on init socket %s: %w", sockPath, err)
+	}
+
+	server := &http.Server{Handler: mux}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(ln)
+	}()
+
+	runErr := gw.RunInitCommand(
+		command,
+		[]string{"SCOPECACHE_SOCKET_PATH=" + sockPath},
+		log.Printf,
+	)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown init socket: %v", err)
+	}
+	<-serveDone
+
+	return runErr
+}
+
 func listenUnixSocket(path string) (net.Listener, error) {
 	dir := filepath.Dir(path)
 
@@ -297,16 +347,28 @@ func main() {
 	}
 
 	socketPath := socketPathFromEnv()
-	ln, err := listenUnixSocket(socketPath)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	// SIGINT/SIGTERM triggers Shutdown, which drains in-flight requests.
 	// Using log.Fatal here would bypass the shutdown path entirely because it
 	// calls os.Exit and skips deferred cleanup.
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+
+	// Boot-time init command runs BEFORE the public socket is bound,
+	// behind a private temp socket. External clients trying to reach
+	// the configured socketPath during init get connection-refused —
+	// no half-populated responses leak out. Mirrors the Caddy module's
+	// runInitWithPrivateSocket pattern. See init_command.go.
+	if cmd := initCommandFromEnv(); cmd != "" {
+		if err := runInitWithPrivateSocket(gw, mux, cmd); err != nil {
+			log.Printf("scopecache init: %v (continuing with empty cache)", err)
+		}
+	}
+
+	ln, err := listenUnixSocket(socketPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	go func() {
 		<-signalCtx.Done()
@@ -337,21 +399,10 @@ func main() {
 
 	log.Printf("scopecache listening on unix://%s", socketPath)
 
-	// Serve runs in a goroutine so the boot-time init command (sync,
-	// blocking) can curl back into the cache over its own socket while
-	// startup proceeds. See init_command.go for the contract.
 	serveDone := make(chan error, 1)
 	go func() {
 		serveDone <- server.Serve(ln)
 	}()
-
-	if err := gw.RunInitCommand(
-		initCommandFromEnv(),
-		[]string{"SCOPECACHE_SOCKET_PATH=" + socketPath},
-		log.Printf,
-	); err != nil {
-		log.Printf("scopecache init: %v (continuing with empty cache)", err)
-	}
 
 	// Block on Serve's exit. The signal goroutine triggers
 	// server.Shutdown on SIGINT/SIGTERM, which makes Serve return
