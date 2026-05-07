@@ -18,13 +18,19 @@ import (
 	"github.com/VeloxCoding/scopecache"
 )
 
-// maxEnvConfigMB / maxEnvConfigKB are the upper bounds beyond which
-// the later `int64(value) << 20` (MiB→bytes) or `<< 10` (KiB→bytes)
-// would silently overflow. Mirrors caddymodule's maxConfigMB /
-// maxConfigKB; same rationale (loud rejection beats silent wrong cap).
+// maxEnvConfig{MB,KB,Sec} are the upper bounds beyond which a later
+// unit conversion would silently overflow int64:
+//
+//   - MB  (MiB→bytes via `<< 20`)
+//   - KB  (KiB→bytes via `<< 10`)
+//   - Sec (seconds → nanoseconds via `time.Duration * time.Second`)
+//
+// Mirrors caddymodule's maxConfig{MB,KB,Sec}; same rationale (loud
+// rejection beats silent wrong cap).
 const (
-	maxEnvConfigMB = math.MaxInt64 >> 20
-	maxEnvConfigKB = math.MaxInt64 >> 10
+	maxEnvConfigMB  = math.MaxInt64 >> 20
+	maxEnvConfigKB  = math.MaxInt64 >> 10
+	maxEnvConfigSec = math.MaxInt64 / int64(time.Second)
 )
 
 // UnixSocketPerm is applied to the listening socket file on POSIX systems
@@ -184,13 +190,15 @@ func initCommandFromEnv() string {
 
 // initTimeoutFromEnv returns SCOPECACHE_INIT_TIMEOUT_SEC parsed as a
 // positive number of seconds, otherwise 0 (no timeout — only
-// SIGINT/SIGTERM cancels the running script). Negative or malformed
-// values fall back to 0 with a warning.
+// SIGINT/SIGTERM cancels the running script). Negative, malformed,
+// or above-bound values fall back to 0 with a warning.
 //
 // 0 is the default because "rebuild from source of truth at boot"
 // can legitimately take many minutes on a large dataset; a
 // surprise-default would cut off real workloads. Operators who want
-// a hard ceiling opt in.
+// a hard ceiling opt in. Above maxEnvConfigSec the multiplication
+// would overflow int64 and silently wrap to a tiny or negative
+// timeout — rejected loudly so the operator notices.
 func initTimeoutFromEnv() time.Duration {
 	raw := os.Getenv("SCOPECACHE_INIT_TIMEOUT_SEC")
 	if raw == "" {
@@ -199,6 +207,10 @@ func initTimeoutFromEnv() time.Duration {
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 0 {
 		log.Printf("SCOPECACHE_INIT_TIMEOUT_SEC=%q is not a non-negative integer; using no timeout", raw)
+		return 0
+	}
+	if int64(n) > maxEnvConfigSec {
+		log.Printf("SCOPECACHE_INIT_TIMEOUT_SEC=%d exceeds the maximum (%d seconds); using no timeout", n, maxEnvConfigSec)
 		return 0
 	}
 	return time.Duration(n) * time.Second

@@ -39,12 +39,18 @@ func TestValidateConfig_RejectsNegative(t *testing.T) {
 	}
 }
 
-// validateConfig must reject values whose `int64(value) << 20` (MiB→
-// bytes) or `<< 10` (KiB→bytes) would silently overflow int64. Pre-fix
-// a huge max_store_mb wrapped to a tiny or negative cap, falling back
-// to defaults or producing a misleading "small" cap. Post-fix the
-// shift is gated by an explicit upper bound and the operator gets a
-// loud configuration error.
+// validateConfig must reject values whose unit conversion in
+// Provision would silently overflow int64:
+//
+//   - max_store_mb / max_item_mb: `int64(value) << 20` (MiB → bytes)
+//   - inbox_max_item_kb:          `int64(value) << 10` (KiB → bytes)
+//   - init_timeout_sec:           `time.Duration(value) * time.Second`
+//     (seconds → nanoseconds)
+//
+// Pre-fix a huge value wrapped to a tiny or negative cap, falling
+// back to defaults or producing a misleading "small" cap. Post-fix
+// each conversion is gated by an explicit upper bound and the
+// operator gets a loud configuration error.
 func TestValidateConfig_RejectsOverflowOnUnitShift(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -65,6 +71,11 @@ func TestValidateConfig_RejectsOverflowOnUnitShift(t *testing.T) {
 			name:      "inbox_max_item_kb above KiB shift bound",
 			set:       func(h *Handler) { h.InboxMaxItemKB = maxConfigKB + 1 },
 			wantField: "inbox_max_item_kb",
+		},
+		{
+			name:      "init_timeout_sec above seconds bound",
+			set:       func(h *Handler) { h.InitTimeoutSec = int(maxConfigSec) + 1 },
+			wantField: "init_timeout_sec",
 		},
 	}
 	for _, tc := range cases {
@@ -93,6 +104,7 @@ func TestValidateConfig_AcceptsValuesAtUpperBound(t *testing.T) {
 		MaxStoreMB:     maxConfigMB,
 		MaxItemMB:      maxConfigMB,
 		InboxMaxItemKB: maxConfigKB,
+		InitTimeoutSec: int(maxConfigSec),
 	}
 	if err := h.validateConfig(); err != nil {
 		t.Errorf("at-bound config rejected: %v", err)

@@ -360,17 +360,22 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // validateConfig rejects values the standalone binary's env-var parsers
 // would have ignored with a warning (negative integers, unknown
 // events_mode strings).
-// maxConfigMB / maxConfigKB are the upper bounds beyond which the
-// later `int64(value) << 20` (MiB→bytes) or `int64(value) << 10`
-// (KiB→bytes) conversion in Provision would silently overflow. The
-// shift consumes 20 (or 10) bits of headroom from int64, so anything
-// above MaxInt64 / (1<<20) (or 1<<10) wraps to negative or to a small
-// positive that does not match what the operator typed. Operationally
-// absurd values, but rejecting them turns "silent wrong cap" into
-// "loud configuration error" — the cheaper failure mode.
+// maxConfigMB / maxConfigKB / maxConfigSec are the upper bounds
+// beyond which a later unit conversion in Provision would silently
+// overflow int64:
+//
+//   - MaxStoreMB / MaxItemMB:    `int64(value) << 20` (MiB→bytes).
+//   - InboxMaxItemKB:            `int64(value) << 10` (KiB→bytes).
+//   - InitTimeoutSec:            `time.Duration(value) * time.Second`
+//     (seconds → nanoseconds).
+//
+// Operationally absurd values, but rejecting them turns "silent
+// wrong cap" into "loud configuration error" — the cheaper failure
+// mode.
 const (
-	maxConfigMB = math.MaxInt64 >> 20 // ~8.79 trillion MiB
-	maxConfigKB = math.MaxInt64 >> 10 // ~9 quadrillion KiB
+	maxConfigMB  = math.MaxInt64 >> 20                // ~8.79 trillion MiB
+	maxConfigKB  = math.MaxInt64 >> 10                // ~9 quadrillion KiB
+	maxConfigSec = math.MaxInt64 / int64(time.Second) // ~292 years
 )
 
 func (h *Handler) validateConfig() error {
@@ -380,23 +385,23 @@ func (h *Handler) validateConfig() error {
 		upper    int
 		upperFmt string
 	}{
-		// scope_max_items / inbox_max_items / init_timeout_sec are
-		// plain int counts/seconds — no shift, no upper bound check
-		// beyond non-negative. upper == 0 disables the bound check
-		// for those rows.
+		// scope_max_items / inbox_max_items are plain int counts —
+		// no unit conversion, no upper bound check beyond
+		// non-negative. upper == 0 disables the bound check for
+		// those rows.
 		{"scope_max_items", h.ScopeMaxItems, 0, ""},
 		{"max_store_mb", h.MaxStoreMB, maxConfigMB, "MiB"},
 		{"max_item_mb", h.MaxItemMB, maxConfigMB, "MiB"},
 		{"inbox_max_items", h.InboxMaxItems, 0, ""},
 		{"inbox_max_item_kb", h.InboxMaxItemKB, maxConfigKB, "KiB"},
-		{"init_timeout_sec", h.InitTimeoutSec, 0, ""},
+		{"init_timeout_sec", h.InitTimeoutSec, int(maxConfigSec), "seconds"},
 	} {
 		if e.value < 0 {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)
 		}
 		if e.upper > 0 && e.value > e.upper {
-			return fmt.Errorf("%s=%d exceeds the maximum %s value (%d); larger values would overflow int64 after %s→bytes conversion",
-				e.key, e.value, e.upperFmt, e.upper, e.upperFmt)
+			return fmt.Errorf("%s=%d exceeds the maximum (%d %s); larger values would overflow int64 after unit conversion",
+				e.key, e.value, e.upper, e.upperFmt)
 		}
 	}
 	if _, err := scopecache.ParseEventsMode(h.EventsMode); err != nil {
