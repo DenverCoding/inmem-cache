@@ -182,6 +182,28 @@ func initCommandFromEnv() string {
 	return os.Getenv("SCOPECACHE_INIT_COMMAND")
 }
 
+// initTimeoutFromEnv returns SCOPECACHE_INIT_TIMEOUT_SEC parsed as a
+// positive number of seconds, otherwise 0 (no timeout — only
+// SIGINT/SIGTERM cancels the running script). Negative or malformed
+// values fall back to 0 with a warning.
+//
+// 0 is the default because "rebuild from source of truth at boot"
+// can legitimately take many minutes on a large dataset; a
+// surprise-default would cut off real workloads. Operators who want
+// a hard ceiling opt in.
+func initTimeoutFromEnv() time.Duration {
+	raw := os.Getenv("SCOPECACHE_INIT_TIMEOUT_SEC")
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		log.Printf("SCOPECACHE_INIT_TIMEOUT_SEC=%q is not a non-negative integer; using no timeout", raw)
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
 // eventsModeFromEnv returns the SCOPECACHE_EVENTS_MODE setting parsed
 // into the typed scopecache.EventsMode. Empty string maps to
 // EventsModeOff (the default — auto-populate disabled). Any other
@@ -206,10 +228,14 @@ const shutdownGracePeriod = 5 * time.Second
 // hitting it during init get connection-refused instead of hitting
 // a partially-populated cache.
 //
+// ctx is propagated into RunInitCommand: SIGINT/SIGTERM at the
+// signal handler cancels the in-flight script via SIGKILL on the
+// whole process group. timeout > 0 wraps ctx with a hard deadline.
+//
 // Mirrors caddymodule's runInitWithPrivateSocket — the standalone
 // and Caddy adapters share the same "init runs behind a private
 // channel" contract so the same script body works in both.
-func runInitWithPrivateSocket(gw *scopecache.Gateway, mux *http.ServeMux, command string) error {
+func runInitWithPrivateSocket(ctx context.Context, gw *scopecache.Gateway, mux *http.ServeMux, command string, timeout time.Duration) error {
 	dir, err := os.MkdirTemp("", "scopecache-init-")
 	if err != nil {
 		return fmt.Errorf("create temp dir for init socket: %w", err)
@@ -233,7 +259,15 @@ func runInitWithPrivateSocket(gw *scopecache.Gateway, mux *http.ServeMux, comman
 		_ = server.Serve(ln)
 	}()
 
+	runCtx := ctx
+	if timeout > 0 {
+		var cancelTimeout context.CancelFunc
+		runCtx, cancelTimeout = context.WithTimeout(ctx, timeout)
+		defer cancelTimeout()
+	}
+
 	runErr := gw.RunInitCommand(
+		runCtx,
 		command,
 		[]string{"SCOPECACHE_SOCKET_PATH=" + sockPath},
 		log.Printf,
@@ -318,14 +352,6 @@ func main() {
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
-	// Activate the in-core subscriber bridge when
-	// SCOPECACHE_SUBSCRIBER_COMMAND is set. Stopped explicitly after
-	// server.Serve returns so subscribers are torn down once the HTTP
-	// layer is no longer accepting writes — otherwise an in-flight
-	// command invocation could outlive the cache.
-	stopSubscribers := gw.StartReservedSubscribers(subscriberCommandFromEnv(), log.Printf)
-	defer stopSubscribers()
-
 	// Timeouts sized for a local AF_UNIX cache. Budgets account for wire
 	// transfer AND stream JSON-decode of the bulk body (encoding/json runs
 	// ~100-500 MB/s on modern CPU; interleaved with reading so the slower
@@ -359,11 +385,33 @@ func main() {
 	// the configured socketPath during init get connection-refused —
 	// no half-populated responses leak out. Mirrors the Caddy module's
 	// runInitWithPrivateSocket pattern. See init_command.go.
+	//
+	// signalCtx is passed in so SIGINT/SIGTERM during a long init
+	// SIGKILLs the script's process group instead of leaving boot
+	// hung indefinitely.
 	if cmd := initCommandFromEnv(); cmd != "" {
-		if err := runInitWithPrivateSocket(gw, mux, cmd); err != nil {
+		if err := runInitWithPrivateSocket(signalCtx, gw, mux, cmd, initTimeoutFromEnv()); err != nil {
 			log.Printf("scopecache init: %v (continuing with empty cache)", err)
 		}
 	}
+
+	// Subscribers start AFTER init. Reason: init writes auto-populate
+	// `_events` (when EventsMode != off) and may write to `_inbox`
+	// directly. If subscribers were already active during init, each
+	// of those writes would fire a wake-up — and the operator's drain
+	// command, when it tries to reach the cache via the configured
+	// socketPath, would hit connection-refused (we haven't bound it
+	// yet). The failed run consumes the wake-up, so the backlog sits
+	// until a later user-write triggers another wake-up.
+	//
+	// Starting subscribers AFTER init means no wake-ups fire while
+	// the public socket is still down. The matching wake-up that
+	// drains init's backlog is fired explicitly via
+	// WakeReservedSubscribers below, AFTER server.Serve has bound
+	// the public socket — so the drain command's curl reaches a
+	// listening cache.
+	stopSubscribers := gw.StartReservedSubscribers(subscriberCommandFromEnv(), log.Printf)
+	defer stopSubscribers()
 
 	ln, err := listenUnixSocket(socketPath)
 	if err != nil {

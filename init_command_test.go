@@ -1,5 +1,5 @@
 // Init-command tests use a real shell script in a temp dir, since
-// exec.Command + a real fork/exec is what the helper does in
+// exec.CommandContext + a real fork/exec is what the helper does in
 // production. We can't reasonably mock os/exec without making the
 // helper test-shaped instead of operator-shaped, so the tests run on
 // Unix only — Windows builds skip via the build tag.
@@ -9,10 +9,14 @@
 package scopecache
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // writeInitCommandHelper creates a `chmod +x` script in dir that
@@ -33,7 +37,7 @@ func writeInitCommandHelper(t *testing.T, dir, outFile string) string {
 func TestRunInitCommand_EmptyIsNoOp(t *testing.T) {
 	gw := NewGateway(Config{})
 	calls := 0
-	err := gw.RunInitCommand("", nil, func(string, ...any) { calls++ })
+	err := gw.RunInitCommand(context.Background(), "", nil, func(string, ...any) { calls++ })
 	if err != nil {
 		t.Errorf("err = %v, want nil for empty command", err)
 	}
@@ -52,6 +56,7 @@ func TestRunInitCommand_RunsScriptAndForwardsEnv(t *testing.T) {
 	gw := NewGateway(Config{})
 	var lines []string
 	err := gw.RunInitCommand(
+		context.Background(),
 		command,
 		[]string{"SCOPECACHE_SOCKET_PATH=/tmp/foo.sock"},
 		func(format string, args ...any) {
@@ -88,7 +93,7 @@ func TestRunInitCommand_FailureReturnsError(t *testing.T) {
 
 	gw := NewGateway(Config{})
 	var lines []string
-	err := gw.RunInitCommand(cmdPath, nil, func(format string, args ...any) {
+	err := gw.RunInitCommand(context.Background(), cmdPath, nil, func(format string, args ...any) {
 		lines = append(lines, format)
 	})
 	if err == nil {
@@ -107,7 +112,7 @@ func TestRunInitCommand_FailureReturnsError(t *testing.T) {
 func TestRunInitCommand_MissingPathReturnsError(t *testing.T) {
 	gw := NewGateway(Config{})
 	missing := filepath.Join(t.TempDir(), "does-not-exist.sh")
-	err := gw.RunInitCommand(missing, nil, nil)
+	err := gw.RunInitCommand(context.Background(), missing, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for missing executable; got nil")
 	}
@@ -124,7 +129,116 @@ func TestRunInitCommand_NilLogfDoesNotPanic(t *testing.T) {
 		t.Fatalf("write script: %v", err)
 	}
 	gw := NewGateway(Config{})
-	if err := gw.RunInitCommand(cmdPath, nil, nil); err != nil {
+	if err := gw.RunInitCommand(context.Background(), cmdPath, nil, nil); err != nil {
 		t.Errorf("RunInitCommand with nil logf: %v", err)
 	}
+}
+
+// Cancellation via context: a long-running script gets SIGKILL'd
+// when the parent context is cancelled, and RunInitCommand returns
+// promptly. Pre-fix the helper used exec.Command (no context), so
+// SIGINT/SIGTERM during init would leave the parent stuck in
+// cmd.Run() until the script exited voluntarily — a hung curl or
+// tarpitted DB query could block boot indefinitely.
+//
+// The asserted bound is generous (3s) so the test cannot flake on
+// CI load while still being orders of magnitude below the
+// "infinitely-hanging" failure mode the fix targets.
+func TestRunInitCommand_ContextCancelStopsHungScript(t *testing.T) {
+	dir := t.TempDir()
+	cmdPath := filepath.Join(dir, "hang.sh")
+	if err := os.WriteFile(cmdPath, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	gw := NewGateway(Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after 200ms — long enough that the script is definitely
+	// running (the sleep has begun) but short enough that the test
+	// doesn't drag.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	t0 := time.Now()
+	err := gw.RunInitCommand(ctx, cmdPath, nil, nil)
+	elapsed := time.Since(t0)
+
+	if err == nil {
+		t.Fatal("expected error after cancel; got nil")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("RunInitCommand returned after %v; want < 3s after cancel", elapsed)
+	}
+}
+
+// Process-group kill: a script that backgrounds children must have
+// its whole process group reaped on cancel. Pre-fix only the direct
+// child got SIGKILL'd; a script doing `sleep 60 &` would orphan the
+// sleep onto PID 1. configureProcessGroup wraps the cmd in a new
+// process group so the cancel kills the negative PID (whole group).
+//
+// Repro: shell that backgrounds `sleep 60`, writes its PID, waits.
+// After cancel, assert the PID is no longer running.
+func TestRunInitCommand_CancelReapsBackgroundedChildren(t *testing.T) {
+	dir := t.TempDir()
+	cmdPath := filepath.Join(dir, "fork.sh")
+	pidFile := filepath.Join(dir, "child.pid")
+	body := "#!/bin/sh\n" +
+		"sleep 60 &\n" +
+		"echo $! > " + pidFile + "\n" +
+		"wait\n"
+	if err := os.WriteFile(cmdPath, []byte(body), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	gw := NewGateway(Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.RunInitCommand(ctx, cmdPath, nil, nil)
+	}()
+
+	// Wait until the child PID has been written.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(pidFile); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		cancel()
+		t.Fatalf("read pid file: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		cancel()
+		t.Fatalf("parse pid %q: %v", string(pidBytes), err)
+	}
+
+	if !pidIsRunning(pid) {
+		cancel()
+		t.Fatalf("backgrounded child pid=%d not running before cancel — test setup did not reproduce orphan scenario", pid)
+	}
+
+	cancel()
+	<-done
+
+	// After cancel, the group kill should have hit the sleep too.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !pidIsRunning(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Best-effort cleanup so a regressed test doesn't leave a 60s sleep.
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	t.Errorf("backgrounded child pid=%d still running 2s after cancel — process group not reaped", pid)
 }

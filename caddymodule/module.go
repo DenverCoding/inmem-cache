@@ -77,14 +77,24 @@ type Handler struct {
 	// reserved scopes (`_events`, `_inbox`) are pre-created. Empty
 	// (default) = no init command. Set = the helper runs sync inside
 	// Provision, blocking the rest of Caddy's start-up until the
-	// command exits. Use case: rebuild the cache from a source of
-	// truth at boot. See scopecache.Gateway.RunInitCommand for the
-	// timing caveat — Caddy hasn't bound its HTTP listeners yet, so
-	// scripts that need to write into the cache via Caddy's listener
-	// either prepare external state, run via a separate ingestion
-	// path that comes up after Caddy, or live in the standalone
-	// adapter where AF_UNIX is already up at init time.
+	// command exits.
+	//
+	// The script is given SCOPECACHE_SOCKET_PATH pointing to a
+	// per-instance private Unix socket that the adapter binds for the
+	// duration of init. Inside the script, write into THIS Caddy
+	// instance's cache with `curl --unix-socket "$SCOPECACHE_SOCKET_PATH"`
+	// — Caddy's normal HTTP listeners aren't bound yet during
+	// Provision, but the private socket is. After the script exits the
+	// private socket is torn down and Caddy starts listening normally.
+	// Use case: rebuild the cache from a source of truth at boot. See
+	// scopecache.Gateway.RunInitCommand for the full contract.
 	InitCommand string `json:"init_command,omitempty"`
+	// InitTimeoutSec caps how long the init command may run before
+	// the helper SIGKILLs its process group. 0 (default) = no
+	// timeout — only Caddy reload / shutdown cancels the script.
+	// Recommended for production: a value high enough for your
+	// largest realistic source-of-truth rebuild, plus margin.
+	InitTimeoutSec int `json:"init_timeout_sec,omitempty"`
 
 	api             *scopecache.API
 	mux             *http.ServeMux
@@ -105,7 +115,7 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // internal mux. Called once per module instance at Caddy start / config
 // reload. Zero-valued numeric directives fall back to the core's
 // compile-time defaults via Config.WithDefaults inside NewStore.
-func (h *Handler) Provision(_ caddy.Context) error {
+func (h *Handler) Provision(ctx caddy.Context) error {
 	if err := h.validateConfig(); err != nil {
 		return err
 	}
@@ -128,10 +138,7 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	h.api = scopecache.NewAPI(gw, scopecache.APIConfig{})
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
-	h.stopSubscribers = gw.StartReservedSubscribers(
-		h.SubscriberCommand,
-		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
-	)
+
 	// Boot-time init command. We open a private Unix socket exposing
 	// the cache's HTTP routes ONLY for the duration of the init
 	// script, then run the script sync, then tear the socket down.
@@ -150,13 +157,32 @@ func (h *Handler) Provision(_ caddy.Context) error {
 	// the previous instance serving traffic during reload, so a
 	// long-running init script does not interrupt service; first
 	// boot waits for the cache to be populated before Caddy starts
-	// listening. A failure is logged and ignored: empty cache is
-	// still a working cache.
+	// listening. The ctx passed in is cancelled on Caddy reload /
+	// shutdown, which SIGKILLs the script's whole process group via
+	// configureProcessGroup so a hung script can never tarpit the
+	// reload. A failure is logged and ignored: empty cache is still
+	// a working cache.
 	if h.InitCommand != "" {
-		if err := h.runInitWithPrivateSocket(gw); err != nil {
+		if err := h.runInitWithPrivateSocket(ctx, gw); err != nil {
 			caddy.Log().Named("scopecache.init").Sugar().Warnf("init: %v", err)
 		}
 	}
+
+	// Subscribers start AFTER init. Init is cache-state restoration
+	// from a source of truth: its writes auto-populate `_events`
+	// with duplicates of state that already exists at the source,
+	// and forwarding those through a drain script would loop the
+	// data back where init pulled it from. RunInitCommand wipes
+	// `_events` itself when it returns, so by the time subscribers
+	// register there is nothing for them to drain — `_inbox` is
+	// untouched during init (no external writers can reach the
+	// public listener yet) and `_events` is empty. The first real
+	// wake-up fires on the first user-write after Caddy starts
+	// serving traffic.
+	h.stopSubscribers = gw.StartReservedSubscribers(
+		h.SubscriberCommand,
+		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
+	)
 	return nil
 }
 
@@ -166,11 +192,16 @@ func (h *Handler) Provision(_ caddy.Context) error {
 // curl --unix-socket "$SCOPECACHE_SOCKET_PATH" http://localhost/...
 // exactly like the standalone adapter.
 //
+// ctx is the caddy.Context from Provision, propagated into
+// RunInitCommand so Caddy reload / shutdown cancels a hung script
+// via SIGKILL on its whole process group. h.InitTimeoutSec > 0
+// wraps ctx with an additional hard deadline.
+//
 // The temp dir + socket are created with restrictive permissions
 // (the dir is 0o700 by default from MkdirTemp; the socket inherits
 // the dir's access control) so other users on the host can't read
 // or write through it.
-func (h *Handler) runInitWithPrivateSocket(gw *scopecache.Gateway) error {
+func (h *Handler) runInitWithPrivateSocket(ctx context.Context, gw *scopecache.Gateway) error {
 	logf := caddy.Log().Named("scopecache.init").Sugar().Infof
 	logger := caddy.Log().Named("scopecache.init").Sugar()
 
@@ -197,7 +228,15 @@ func (h *Handler) runInitWithPrivateSocket(gw *scopecache.Gateway) error {
 		_ = server.Serve(ln)
 	}()
 
+	runCtx := ctx
+	if h.InitTimeoutSec > 0 {
+		var cancelTimeout context.CancelFunc
+		runCtx, cancelTimeout = context.WithTimeout(ctx, time.Duration(h.InitTimeoutSec)*time.Second)
+		defer cancelTimeout()
+	}
+
 	runErr := gw.RunInitCommand(
+		runCtx,
 		h.InitCommand,
 		[]string{"SCOPECACHE_SOCKET_PATH=" + sockPath},
 		logf,
@@ -260,6 +299,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 //	    events_mode         off
 //	    subscriber_command  /usr/local/bin/drain.sh
 //	    init_command        /usr/local/bin/rebuild.sh
+//	    init_timeout_sec    600
 //	}
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -307,6 +347,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.InboxMaxItems = n
 			case "inbox_max_item_kb":
 				h.InboxMaxItemKB = n
+			case "init_timeout_sec":
+				h.InitTimeoutSec = n
 			default:
 				return d.Errf("unrecognized option: %s", key)
 			}
@@ -338,14 +380,16 @@ func (h *Handler) validateConfig() error {
 		upper    int
 		upperFmt string
 	}{
-		// scope_max_items / inbox_max_items are item-count caps —
-		// stored as plain ints, no shift, so no upper bound check.
-		// upper == 0 disables the bound check for those rows.
+		// scope_max_items / inbox_max_items / init_timeout_sec are
+		// plain int counts/seconds — no shift, no upper bound check
+		// beyond non-negative. upper == 0 disables the bound check
+		// for those rows.
 		{"scope_max_items", h.ScopeMaxItems, 0, ""},
 		{"max_store_mb", h.MaxStoreMB, maxConfigMB, "MiB"},
 		{"max_item_mb", h.MaxItemMB, maxConfigMB, "MiB"},
 		{"inbox_max_items", h.InboxMaxItems, 0, ""},
 		{"inbox_max_item_kb", h.InboxMaxItemKB, maxConfigKB, "KiB"},
+		{"init_timeout_sec", h.InitTimeoutSec, 0, ""},
 	} {
 		if e.value < 0 {
 			return fmt.Errorf("%s must be zero or a positive integer (got %d); 0 falls back to the compile-time default", e.key, e.value)

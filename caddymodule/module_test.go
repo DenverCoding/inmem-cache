@@ -205,6 +205,31 @@ func TestUnmarshalCaddyfile_InitCommand(t *testing.T) {
 	})
 }
 
+// init_timeout_sec parses as a non-negative integer onto
+// InitTimeoutSec. 0 (default) = no timeout. Used by Provision to
+// wrap the init context with a hard deadline before exec.
+func TestUnmarshalCaddyfile_InitTimeoutSec(t *testing.T) {
+	t.Run("set", func(t *testing.T) {
+		input := `scopecache {
+			init_timeout_sec 600
+		}`
+		var h Handler
+		if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input)); err != nil {
+			t.Fatalf("UnmarshalCaddyfile: %v", err)
+		}
+		if h.InitTimeoutSec != 600 {
+			t.Errorf("InitTimeoutSec=%d, want 600", h.InitTimeoutSec)
+		}
+	})
+
+	t.Run("rejects negative", func(t *testing.T) {
+		h := &Handler{InitTimeoutSec: -1}
+		if err := h.validateConfig(); err == nil {
+			t.Fatal("expected error for negative init_timeout_sec; got nil")
+		}
+	})
+}
+
 // events_mode must accept "", "off", "notify", "full" and reject
 // anything else. The empty string is the documented sentinel for
 // "use the compile-time default" (= off), same shape as the integer

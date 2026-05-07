@@ -3,6 +3,7 @@
 *.test
 /sock/
 /CLAUDE.md
+/CLAUDE_TODO.md
 /_phase4/
 /init.txt
 /caddy-module-plan.md
