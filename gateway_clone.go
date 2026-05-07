@@ -1,7 +1,3 @@
-package scopecache
-
-import "encoding/json"
-
 // Defensive payload-byte cloning at the Gateway boundary.
 //
 // Item.Payload is json.RawMessage (= []byte). Without a defensive copy,
@@ -31,6 +27,10 @@ import "encoding/json"
 // the supplied payload. Output-side clearing alone closes the hazard
 // (callers can never have set these fields themselves), but we clear
 // on input too as belt-and-braces.
+
+package scopecache
+
+import "encoding/json"
 
 // clonePayload returns a fresh copy of p with a newly allocated
 // backing array. nil input → nil output (preserves the "no payload"

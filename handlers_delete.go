@@ -1,11 +1,3 @@
-package scopecache
-
-import (
-	"errors"
-	"net/http"
-	"time"
-)
-
 // Delete handlers on the public mux:
 //
 //   - /delete         — single-item delete by scope+id or scope+seq
@@ -16,6 +8,14 @@ import (
 // All four live on the public mux. There is no in-core admin-tier or
 // reserved-scope check; access is the operator's responsibility (gated
 // at the proxy/socket layer or by an addon access-policy).
+
+package scopecache
+
+import (
+	"errors"
+	"net/http"
+	"time"
+)
 
 func (api *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()

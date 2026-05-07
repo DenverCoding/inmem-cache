@@ -1,9 +1,3 @@
-package scopecache
-
-import (
-	"errors"
-)
-
 // Subscribe primitive — operator-facing contract is documented in
 // docs/scopecache-core-rfc.md §7.4. In short: a Go-only, in-process
 // mechanism by which a subscriber gets coalesced wake-up signals
@@ -44,6 +38,12 @@ import (
 // b.mu and subsMu are independent — the notify hook in Store.appendOne
 // fires AFTER buf.appendItem returns (b.mu already released). No path
 // nests one inside the other.
+
+package scopecache
+
+import (
+	"errors"
+)
 
 // ErrInvalidSubscribeScope is returned by Store.Subscribe when the
 // supplied scope is not one of the cache's reserved scope names

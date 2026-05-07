@@ -1,15 +1,3 @@
-package scopecache
-
-import (
-	"bytes"
-	"encoding/json"
-	"errors"
-	"io"
-	"net/http"
-	"strconv"
-	"time"
-)
-
 // handlers.go is the shared HTTP-layer infrastructure for *API:
 //
 //   - error-class mapping (writeStoreCapacityError + the 4xx/5xx
@@ -28,6 +16,18 @@ import (
 //   handlers_delete.go   — /delete, /delete_up_to, /delete_scope, /wipe
 //   handlers_bulk.go     — /warm, /rebuild
 //   handlers_observe.go  — /stats, /help
+
+package scopecache
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+)
 
 // writeStoreCapacityError dispatches the three capacity-class
 // errors the store returns on write paths:

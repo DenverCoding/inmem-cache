@@ -1,11 +1,3 @@
-package scopecache
-
-import (
-	"encoding/json"
-	"strconv"
-	"time"
-)
-
 // /counter_add is the cache's one and only payload-aware mutation:
 // every other write path treats the payload as opaque bytes, but
 // counterAdd reads it as a JSON integer and rewrites it with the
@@ -45,6 +37,14 @@ import (
 // Consumers who need "did this counter just change?" read cell.ts
 // via /get?id=X and observe item.Ts directly — that's the
 // granularity counters are observable at, by design.
+
+package scopecache
+
+import (
+	"encoding/json"
+	"strconv"
+	"time"
+)
 
 // counterAdd atomically adds `by` to the integer stored at scope+id, or
 // creates a fresh counter with starting value `by` if no item exists.

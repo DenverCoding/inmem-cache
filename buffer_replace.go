@@ -1,10 +1,3 @@
-package scopecache
-
-import (
-	"errors"
-	"time"
-)
-
 // Bulk prepare-then-commit pipeline used by /warm and /rebuild.
 //
 // The shape is: build a complete replacement state OFF the buffer
@@ -30,6 +23,13 @@ import (
 // subtlest correctness point in the cache; if you find yourself
 // editing it, run TestStore_ReplaceScopes_RaceVsWipe and
 // TestStore_ReplaceScopes_RaceVsRebuild repeatedly under stress.
+
+package scopecache
+
+import (
+	"errors"
+	"time"
+)
 
 // scopeReplacement holds a fully built scope state ready to be atomically
 // swapped into a scopeBuffer. Separating "prepare" from "commit" lets callers

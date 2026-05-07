@@ -1,11 +1,3 @@
-package scopecache
-
-import (
-	"net/http"
-	"strconv"
-	"time"
-)
-
 // Read handlers on the public mux:
 //
 //   - /head      — oldest-first window, optional after_seq cursor
@@ -20,6 +12,14 @@ import (
 // per-response cap before marshal-and-write; the read-heat stamp
 // (only on non-empty results) lives one layer down in Store.head /
 // Store.tail.
+
+package scopecache
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+)
 
 // writeItemsHit assembles and writes the success response for a
 // list-returning read endpoint (/head, /tail). HTTP shape + per-

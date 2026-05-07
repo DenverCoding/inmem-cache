@@ -1,11 +1,3 @@
-package scopecache
-
-import (
-	"bytes"
-	"encoding/json"
-	"sort"
-)
-
 // Cross-cutting helpers shared by scopeBuffer's mutation paths. The
 // `*Locked` suffix signals: caller MUST hold b.mu. Calling without
 // the lock is a race; calling with the lock then re-acquiring is a
@@ -16,6 +8,14 @@ import (
 // across parallel call-sites: bytes-accounting, secondary-index
 // sync, and GC-zeroing of removed payloads. Forgetting any of them
 // leaks state silently.
+
+package scopecache
+
+import (
+	"bytes"
+	"encoding/json"
+	"sort"
+)
 
 // precomputeRenderBytes returns the JSON-string-decoded form of payload
 // when payload's first non-whitespace byte is `"`, or nil otherwise.

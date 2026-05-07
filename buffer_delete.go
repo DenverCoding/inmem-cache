@@ -1,7 +1,3 @@
-package scopecache
-
-import "sort"
-
 // Delete paths on *scopeBuffer:
 //
 //   - deleteByID     — single-item delete by id
@@ -13,6 +9,10 @@ import "sort"
 // low-level helper deleteIndexLocked centralises the GC-zeroing,
 // secondary-index sync, and counter update so the three callers cannot
 // drift.
+
+package scopecache
+
+import "sort"
 
 // deleteIndexLocked removes items[i] in O(n) tail-shift, GC-zeroes
 // the now-duplicate last slot, syncs bySeq + byID, and releases the

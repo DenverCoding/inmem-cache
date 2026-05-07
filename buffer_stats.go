@@ -1,3 +1,8 @@
+// buffer_stats.go owns per-scope observability primitives: the
+// O(1) approxSizeBytes memory estimate (richer than admission
+// control's totalBytes — folds in Go map/slice overhead) and the
+// scopeStats snapshot returned to /stats and /scopelist.
+
 package scopecache
 
 // approxSizeBytesLocked is a richer per-scope memory estimate than

@@ -1,7 +1,3 @@
-package scopecache
-
-import "encoding/json"
-
 // Auto-populate of the reserved `_events` scope.
 //
 // On every successful mutation to a non-`_events` scope, the cache
@@ -32,6 +28,10 @@ import "encoding/json"
 // Single-level recursion: emitAppendEvent → appendOne(_events) →
 // emitAppendEvent short-circuits on the guard. Two stack frames, no
 // loop.
+
+package scopecache
+
+import "encoding/json"
 
 // writeEvent is the JSON shape of an entry's payload in the
 // reserved `_events` scope. The cache marshals one writeEvent per

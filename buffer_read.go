@@ -1,7 +1,3 @@
-package scopecache
-
-import "sort"
-
 // Read paths on *scopeBuffer:
 //
 //   - tailOffset  — newest-first window with offset (drives /tail)
@@ -19,6 +15,10 @@ import "sort"
 // consumers see the cell's current value/ts rather than the stored
 // (stale-by-design) Payload bytes. A single atomic load + fresh
 // strconv on counters, no-op otherwise.
+
+package scopecache
+
+import "sort"
 
 func materialiseCounter(item Item) Item {
 	if item.counter == nil {

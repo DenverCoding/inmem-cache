@@ -1,3 +1,10 @@
+// gateway.go owns *Gateway, the public Go-API for the cache. Every
+// in-process caller (adapters, addons, tests) talks to scopecache
+// through it; the underlying *store and its lowercase methods are
+// NOT part of the public contract. The per-type docstring below
+// carries the boundary contract (defensive cloning + counter-pointer
+// blocking); per-method comments do not repeat it.
+
 package scopecache
 
 // Gateway is the public Go-API for the cache. ALL in-process callers

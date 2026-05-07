@@ -1,3 +1,8 @@
+// buffer_heat.go owns the lock-free read-bookkeeping atomics on
+// *scopeBuffer (readCountTotal, lastAccessTS). Hot-path adjacent —
+// recordRead runs on every successful read endpoint hit and must
+// stay outside b.mu so concurrent readers do not serialise.
+
 package scopecache
 
 // recordRead bumps the read-bookkeeping atomics on every successful

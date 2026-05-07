@@ -1,3 +1,8 @@
+// api.go owns the HTTP layer (*API + APIConfig) in front of *store.
+// Request-shape concerns the core deliberately knows nothing about
+// (per-request body cap, per-response byte cap) live here; cache
+// semantics live in store.go and the buffer family.
+
 package scopecache
 
 // APIConfig bundles the HTTP/transport-layer knobs adapters supply

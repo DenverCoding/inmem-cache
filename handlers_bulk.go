@@ -1,10 +1,3 @@
-package scopecache
-
-import (
-	"net/http"
-	"time"
-)
-
 // Bulk write handlers on the public mux:
 //
 //   - /warm     — replace the scopes in the request, leave others alone
@@ -18,6 +11,13 @@ import (
 // almost always a client bug rather than an intentional clear-
 // everything request — endpoint-specific HTTP policy, not a per-item
 // shape rule.
+
+package scopecache
+
+import (
+	"net/http"
+	"time"
+)
 
 func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()

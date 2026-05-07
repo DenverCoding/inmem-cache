@@ -1,10 +1,3 @@
-package scopecache
-
-import (
-	"net/http"
-	"time"
-)
-
 // Observability + meta handlers:
 //
 //   - /stats     — store-wide aggregate snapshot
@@ -26,6 +19,13 @@ import (
 // depth) that operators monitor independently of user scopes. The set
 // is bounded by the reserved-scope list (currently 2 entries), so
 // /stats stays O(1) regardless of total scope count.
+
+package scopecache
+
+import (
+	"net/http"
+	"time"
+)
 
 func (api *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()

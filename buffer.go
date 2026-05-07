@@ -1,10 +1,3 @@
-package scopecache
-
-import (
-	"sync"
-	"sync/atomic"
-)
-
 // Locking invariants for *scopeBuffer
 // -----------------------------------
 //
@@ -45,6 +38,14 @@ import (
 //	buffer_replace.go  — scopeReplacement type, build / commit pipeline, replaceAll
 //	buffer_read.go     — tailOffset, sinceSeq, getByID, getBySeq
 //	buffer_stats.go    — approxSizeBytes, scopeStats type, stats()
+
+package scopecache
+
+import (
+	"sync"
+	"sync/atomic"
+)
+
 type scopeBuffer struct {
 	mu sync.RWMutex
 	// store is set when the buffer is owned by a Store. When nil (orphan

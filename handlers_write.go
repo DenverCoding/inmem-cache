@@ -1,11 +1,3 @@
-package scopecache
-
-import (
-	"errors"
-	"net/http"
-	"time"
-)
-
 // Single-item write handlers on the public mux:
 //
 //   - /append       — insert; rejects on dup id, capacity, or byte cap
@@ -21,6 +13,14 @@ import (
 // capacity → 507, else 409. /counter_add stays inline because it has
 // two extra error types (*CounterPayloadError → 409,
 // *CounterOverflowError → 400) that don't fit the helper's vocabulary.
+
+package scopecache
+
+import (
+	"errors"
+	"net/http"
+	"time"
+)
 
 // writeAck is the response shape /append and /upsert nest under
 // "item". Mirrors Item's JSON layout for scope/id/seq/ts but

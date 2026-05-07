@@ -1,12 +1,3 @@
-package scopecache
-
-import (
-	"encoding/json"
-	"errors"
-	"fmt"
-	"time"
-)
-
 // Single-item write paths on *scopeBuffer:
 //
 //   - appendItem    — insert a fresh item; rejects on dup id, capacity, or byte cap
@@ -25,6 +16,15 @@ import (
 // Every path stamps time.Now().UnixMicro() onto Item.Ts under b.mu
 // before storing or replacing — Ts contract lives on the Item type
 // in types.go.
+
+package scopecache
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
 
 func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 	b.mu.Lock()
