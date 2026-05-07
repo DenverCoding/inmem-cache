@@ -1,16 +1,16 @@
-// Package caddymodule exposes scopecache as a Caddy HTTP handler module.
+// Package caddymodule exposes scopecache as a Caddy HTTP handler.
 //
-// The core scopecache package stays stdlib-only (no Caddy imports) and owns
-// every cache semantic. This adapter:
+// The core scopecache package stays stdlib-only (no Caddy imports)
+// and owns every cache semantic. This adapter:
 //
-//   - translates Caddy's JSON config into scopecache.Config,
+//   - translates Caddy's JSON / Caddyfile config into scopecache.Config,
 //   - wires the core's route table onto an internal http.ServeMux, and
 //   - delegates each matched request to that mux from ServeHTTP.
 //
-// Cross-cutting concerns that require request context — auth, identity,
-// per-tenant scope-prefix enforcement, rate-limit hooks — belong in this
-// adapter layer (see CLAUDE.md "boundary rule") or in addon sub-packages
-// built on top of the public *API surface.
+// Cross-cutting concerns that require request context — auth,
+// identity, per-tenant scope-prefix rewrites, rate-limit hooks —
+// belong in this adapter layer or in addon sub-packages built on
+// top of the public *scopecache.API surface, not in core.
 package caddymodule
 
 import (
@@ -139,46 +139,22 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.mux = http.NewServeMux()
 	h.api.RegisterRoutes(h.mux)
 
-	// Boot-time init command. We open a private Unix socket exposing
-	// the cache's HTTP routes ONLY for the duration of the init
-	// script, then run the script sync, then tear the socket down.
-	// This solves the timing problem that Caddy's own HTTP listeners
-	// aren't bound yet during Provision: by binding our own listener
-	// we give the script a way to write into THIS instance's cache
-	// even though Caddy isn't accepting traffic.
-	//
-	// The same in-memory Gateway powers both this temporary socket
-	// and the eventual Caddy ServeHTTP path; the script and later
-	// Caddy traffic see the same data. The socket is private (per-
-	// instance temp dir, removed on shutdown) so it doesn't become
-	// a separate operator-facing surface.
-	//
-	// Sync — Provision blocks until the script exits. Caddy keeps
-	// the previous instance serving traffic during reload, so a
-	// long-running init script does not interrupt service; first
-	// boot waits for the cache to be populated before Caddy starts
-	// listening. The ctx passed in is cancelled on Caddy reload /
-	// shutdown, which SIGKILLs the script's whole process group via
-	// configureProcessGroup so a hung script can never tarpit the
-	// reload. A failure is logged and ignored: empty cache is still
-	// a working cache.
+	// Boot-time init command (private-socket adapter contract +
+	// subscribers-AFTER-init rationale live in init_command.go's
+	// file-header). Provision blocks until the script exits — Caddy
+	// keeps the previous instance serving during reload, so a long
+	// init does not interrupt service. ctx cancellation on reload /
+	// shutdown SIGKILLs the script's whole process group; a failure
+	// is logged and ignored (empty cache is still a working cache).
 	if h.InitCommand != "" {
 		if err := h.runInitWithPrivateSocket(ctx, gw); err != nil {
 			caddy.Log().Named("scopecache.init").Sugar().Warnf("init: %v", err)
 		}
 	}
 
-	// Subscribers start AFTER init. Init is cache-state restoration
-	// from a source of truth: its writes auto-populate `_events`
-	// with duplicates of state that already exists at the source,
-	// and forwarding those through a drain script would loop the
-	// data back where init pulled it from. RunInitCommand wipes
-	// `_events` itself when it returns, so by the time subscribers
-	// register there is nothing for them to drain — `_inbox` is
-	// untouched during init (no external writers can reach the
-	// public listener yet) and `_events` is empty. The first real
-	// wake-up fires on the first user-write after Caddy starts
-	// serving traffic.
+	// Subscribers start AFTER init — RunInitCommand wipes `_events`
+	// itself, and `_inbox` was unreachable to external writers during
+	// init, so subscribers register against an empty stream.
 	h.stopSubscribers = gw.StartReservedSubscribers(
 		h.SubscriberCommand,
 		caddy.Log().Named("scopecache.subscriber").Sugar().Infof,
@@ -186,21 +162,16 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// runInitWithPrivateSocket binds a temp Unix socket serving the cache
-// routes, runs the init command (which is told the socket path via
-// SCOPECACHE_SOCKET_PATH), then tears the socket down. The script can
-// curl --unix-socket "$SCOPECACHE_SOCKET_PATH" http://localhost/...
-// exactly like the standalone adapter.
+// runInitWithPrivateSocket implements the standalone-symmetric
+// init contract (init_command.go file-header): bind a per-instance
+// temp Unix socket serving the cache routes, run the init command
+// with SCOPECACHE_SOCKET_PATH pointing at it, tear the socket down.
 //
-// ctx is the caddy.Context from Provision, propagated into
-// RunInitCommand so Caddy reload / shutdown cancels a hung script
-// via SIGKILL on its whole process group. h.InitTimeoutSec > 0
-// wraps ctx with an additional hard deadline.
-//
-// The temp dir + socket are created with restrictive permissions
-// (the dir is 0o700 by default from MkdirTemp; the socket inherits
-// the dir's access control) so other users on the host can't read
-// or write through it.
+// ctx propagates into RunInitCommand so Caddy reload / shutdown
+// SIGKILLs a hung script's whole process group. h.InitTimeoutSec
+// > 0 wraps ctx with an additional hard deadline. Temp dir is
+// 0o700 (MkdirTemp default) so other users on the host can't reach
+// the socket.
 func (h *Handler) runInitWithPrivateSocket(ctx context.Context, gw *scopecache.Gateway) error {
 	logf := caddy.Log().Named("scopecache.init").Sugar().Infof
 	logger := caddy.Log().Named("scopecache.init").Sugar()

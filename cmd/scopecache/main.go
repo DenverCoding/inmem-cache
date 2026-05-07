@@ -1,3 +1,41 @@
+// Standalone scopecache binary. Reads operator config from env vars,
+// opens an AF_UNIX socket, runs the optional init command behind a
+// private temp socket, then serves the cache routes until SIGTERM /
+// SIGINT.
+//
+// Boot sequence (matters for the init/subscriber contract):
+//
+//  1. Build *Gateway + *API from env-driven Config.
+//  2. If SCOPECACHE_INIT_COMMAND is set, runInitWithPrivateSocket
+//     binds a private temp socket exposing the cache routes,
+//     execs the script with SCOPECACHE_SOCKET_PATH pointing at it,
+//     then tears the temp socket down. The PUBLIC socket is NOT
+//     bound during this phase — external clients hitting it get
+//     connection-refused, not a half-populated cache.
+//  3. Start subscribers (StartReservedSubscribers). RunInitCommand
+//     has wiped `_events` already, and `_inbox` was unreachable to
+//     external writers, so subscribers see an empty stream.
+//  4. Bind the public socket and start serving.
+//  5. SIGINT/SIGTERM cancels signalCtx → graceful shutdown.
+//
+// Recognised env vars (operator interface):
+//
+//	SCOPECACHE_SOCKET_PATH         AF_UNIX socket path (default platform-specific)
+//	SCOPECACHE_SCOPE_MAX_ITEMS     per-scope item cap
+//	SCOPECACHE_MAX_STORE_MB        store-wide byte cap (MiB)
+//	SCOPECACHE_MAX_ITEM_MB         per-item byte cap (MiB)
+//	SCOPECACHE_INBOX_MAX_ITEMS     per-scope item cap on `_inbox`
+//	SCOPECACHE_INBOX_MAX_ITEM_KB   per-item byte cap on `_inbox` (KiB)
+//	SCOPECACHE_EVENTS_MODE         off | notify | full
+//	SCOPECACHE_SUBSCRIBER_COMMAND  drain-script path (empty = disabled)
+//	SCOPECACHE_INIT_COMMAND        boot-init-script path (empty = disabled)
+//	SCOPECACHE_INIT_TIMEOUT_SEC    hard cap on init script (0 = no timeout)
+//
+// Every parser follows the same shape: empty env var → compile-time
+// default; malformed / out-of-range / negative → log warning and fall
+// back to the default. A fat-fingered env var never prevents the
+// server from starting.
+
 package main
 
 import (
@@ -33,25 +71,23 @@ const (
 	maxEnvConfigSec = math.MaxInt64 / int64(time.Second)
 )
 
-// UnixSocketPerm is applied to the listening socket file on POSIX systems
-// so the Caddy / scopecache group can connect without the file being
-// world-readable. It is a no-op on Windows (Chmod there only toggles the
-// read-only attribute), which is harmless: Windows AF_UNIX access is
-// already gated by NTFS ACLs on the containing directory.
+// UnixSocketPerm is the mode applied to the listening socket file on
+// POSIX systems — operator-group writable, not world-readable. No-op
+// on Windows; AF_UNIX access is gated by NTFS ACLs there.
 const UnixSocketPerm = 0660
 
 // DefaultSocketPath is the platform-specific default for the listening
-// AF_UNIX socket. Linux uses /run/scopecache.sock (a tmpfs that vanishes on
-// reboot, which matches the cache's disposable semantics); other OSes fall
-// back to os.TempDir() because /run does not exist or is not user-writable
-// there. Per-platform definitions live in socket_linux.go and socket_other.go.
-// The value can be overridden at runtime via the SCOPECACHE_SOCKET_PATH env var.
+// AF_UNIX socket. Linux uses /run/scopecache.sock (tmpfs, vanishes on
+// reboot — matches the cache's disposable semantics); other OSes fall
+// back to os.TempDir(). Per-platform definitions live in socket_linux.go
+// / socket_other.go. Override at runtime via SCOPECACHE_SOCKET_PATH.
 var DefaultSocketPath string
 
-// scopeMaxItemsFromEnv returns SCOPECACHE_SCOPE_MAX_ITEMS if set to a positive
-// integer, otherwise the compile-time default. A malformed or non-positive
-// value is ignored with a warning — the server still starts rather than
-// failing on a fat-fingered env var.
+const shutdownGracePeriod = 5 * time.Second
+
+// --- Env-var parsers ------------------------------------------------
+
+// scopeMaxItemsFromEnv reads SCOPECACHE_SCOPE_MAX_ITEMS.
 func scopeMaxItemsFromEnv() int {
 	raw := os.Getenv("SCOPECACHE_SCOPE_MAX_ITEMS")
 	if raw == "" {
@@ -65,11 +101,8 @@ func scopeMaxItemsFromEnv() int {
 	return n
 }
 
-// socketPathFromEnv returns SCOPECACHE_SOCKET_PATH if set to a non-empty value,
-// otherwise the platform-specific DefaultSocketPath (see socket_linux.go /
-// socket_other.go). Letting operators override the path keeps the binary
-// usable on systems where /run is not writable (macOS dev boxes) or where
-// multiple cache instances need distinct sockets.
+// socketPathFromEnv reads SCOPECACHE_SOCKET_PATH, defaulting to the
+// platform-specific DefaultSocketPath.
 func socketPathFromEnv() string {
 	if p := os.Getenv("SCOPECACHE_SOCKET_PATH"); p != "" {
 		return p
@@ -77,11 +110,9 @@ func socketPathFromEnv() string {
 	return DefaultSocketPath
 }
 
-// maxStoreBytesFromEnv returns SCOPECACHE_MAX_STORE_MB (in MiB, converted to bytes)
-// if set to a positive integer, otherwise the compile-time default.
-// Values above maxEnvConfigMB would overflow int64 after the shift; we
-// log + fall back to the default rather than letting a wrap silently
-// produce a tiny or negative cap.
+// maxStoreBytesFromEnv reads SCOPECACHE_MAX_STORE_MB and converts to
+// bytes. Above maxEnvConfigMB the shift would overflow int64; falls
+// back to the compile-time default in that case.
 func maxStoreBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_STORE_MB")
 	if raw == "" {
@@ -99,9 +130,8 @@ func maxStoreBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
-// maxItemBytesFromEnv returns SCOPECACHE_MAX_ITEM_MB (in MiB, converted to bytes)
-// if set to a positive integer, otherwise the compile-time default.
-// See maxStoreBytesFromEnv for the upper-bound rationale.
+// maxItemBytesFromEnv reads SCOPECACHE_MAX_ITEM_MB and converts to
+// bytes. Same overflow contract as maxStoreBytesFromEnv.
 func maxItemBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_MAX_ITEM_MB")
 	if raw == "" {
@@ -119,10 +149,9 @@ func maxItemBytesFromEnv() int64 {
 	return int64(n) << 20
 }
 
-// inboxMaxItemsFromEnv returns SCOPECACHE_INBOX_MAX_ITEMS if set to a
-// positive integer, otherwise 0 — the sentinel that lets
-// Config.WithDefaults fall back to ScopeMaxItems for the `_inbox`
-// scope. A malformed or non-positive value is ignored with a warning.
+// inboxMaxItemsFromEnv reads SCOPECACHE_INBOX_MAX_ITEMS.
+// Returns 0 (sentinel for Config.WithDefaults to fall back to
+// ScopeMaxItems) on missing / invalid input.
 func inboxMaxItemsFromEnv() int {
 	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEMS")
 	if raw == "" {
@@ -136,14 +165,10 @@ func inboxMaxItemsFromEnv() int {
 	return n
 }
 
-// inboxMaxItemBytesFromEnv returns SCOPECACHE_INBOX_MAX_ITEM_KB
-// (in KiB, converted to bytes) if set to a positive integer, otherwise
-// 0 — the sentinel that lets Config.WithDefaults fall back to
-// InboxMaxItemBytes (64 KiB) for the `_inbox` scope. A malformed or
-// non-positive value is ignored with a warning. KiB is the configured
-// unit because the default (64 KiB) reads awkwardly as MiB (0.0625).
-// Values above maxEnvConfigKB would overflow int64 after the shift;
-// see maxStoreBytesFromEnv for the upper-bound rationale.
+// inboxMaxItemBytesFromEnv reads SCOPECACHE_INBOX_MAX_ITEM_KB and
+// converts to bytes. KiB rather than MiB because the default (64 KiB)
+// reads awkwardly as MiB. Returns 0 (Config.WithDefaults sentinel)
+// on missing / invalid / overflow input.
 func inboxMaxItemBytesFromEnv() int64 {
 	raw := os.Getenv("SCOPECACHE_INBOX_MAX_ITEM_KB")
 	if raw == "" {
@@ -161,44 +186,23 @@ func inboxMaxItemBytesFromEnv() int64 {
 	return int64(n) << 10
 }
 
-// subscriberCommandFromEnv returns SCOPECACHE_SUBSCRIBER_COMMAND if
-// set to a non-empty value, otherwise the empty string. Empty = no
-// subscriber spawned (default). Set = the cache spawns one
-// subscriber goroutine per reserved scope (`_events`, `_inbox`),
-// each invoking the same command on every wake-up. The command
-// branches on SCOPECACHE_SCOPE to know which scope fired.
-//
-// The path is not stat'd here; missing-executable errors surface
-// per-invocation (see subscriber_command.go in the core package).
+// subscriberCommandFromEnv reads SCOPECACHE_SUBSCRIBER_COMMAND.
+// Empty = no subscriber spawned.
 func subscriberCommandFromEnv() string {
 	return os.Getenv("SCOPECACHE_SUBSCRIBER_COMMAND")
 }
 
-// initCommandFromEnv returns SCOPECACHE_INIT_COMMAND if set to a
-// non-empty value, otherwise the empty string. Empty = no init
-// command (default). Set = the cache invokes the command once at
-// boot, after the AF_UNIX listener is up and after subscribers have
-// started, but before main blocks on the shutdown signal.
-// SCOPECACHE_SOCKET_PATH is exported into the script's environment
-// so it can curl --unix-socket back into the cache.
-//
-// The path is not stat'd here; missing-executable errors surface at
-// invocation time (see init_command.go in the core package).
+// initCommandFromEnv reads SCOPECACHE_INIT_COMMAND.
+// Empty = no init script.
 func initCommandFromEnv() string {
 	return os.Getenv("SCOPECACHE_INIT_COMMAND")
 }
 
-// initTimeoutFromEnv returns SCOPECACHE_INIT_TIMEOUT_SEC parsed as a
-// positive number of seconds, otherwise 0 (no timeout — only
-// SIGINT/SIGTERM cancels the running script). Negative, malformed,
-// or above-bound values fall back to 0 with a warning.
-//
-// 0 is the default because "rebuild from source of truth at boot"
-// can legitimately take many minutes on a large dataset; a
-// surprise-default would cut off real workloads. Operators who want
-// a hard ceiling opt in. Above maxEnvConfigSec the multiplication
-// would overflow int64 and silently wrap to a tiny or negative
-// timeout — rejected loudly so the operator notices.
+// initTimeoutFromEnv reads SCOPECACHE_INIT_TIMEOUT_SEC.
+// 0 (default) = no timeout, only SIGINT/SIGTERM cancels the script.
+// "Rebuild from source of truth at boot" can legitimately take many
+// minutes; a surprise default would cut off real workloads. Above
+// maxEnvConfigSec the multiplication would overflow int64.
 func initTimeoutFromEnv() time.Duration {
 	raw := os.Getenv("SCOPECACHE_INIT_TIMEOUT_SEC")
 	if raw == "" {
@@ -216,11 +220,8 @@ func initTimeoutFromEnv() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
-// eventsModeFromEnv returns the SCOPECACHE_EVENTS_MODE setting parsed
-// into the typed scopecache.EventsMode. Empty string maps to
-// EventsModeOff (the default — auto-populate disabled). Any other
-// invalid value logs a warning and falls back to EventsModeOff so a
-// fat-fingered env var doesn't prevent the server from starting.
+// eventsModeFromEnv reads SCOPECACHE_EVENTS_MODE.
+// Empty / invalid = EventsModeOff. Valid: off | notify | full.
 func eventsModeFromEnv() scopecache.EventsMode {
 	raw := os.Getenv("SCOPECACHE_EVENTS_MODE")
 	mode, err := scopecache.ParseEventsMode(raw)
@@ -231,22 +232,17 @@ func eventsModeFromEnv() scopecache.EventsMode {
 	return mode
 }
 
-const shutdownGracePeriod = 5 * time.Second
+// --- Boot helpers ---------------------------------------------------
 
 // runInitWithPrivateSocket binds a private temp Unix socket serving
-// the cache routes, runs the init command (which is told the socket
-// path via SCOPECACHE_SOCKET_PATH), then tears the socket down. The
-// public socketPath stays unbound throughout, so external clients
-// hitting it during init get connection-refused instead of hitting
-// a partially-populated cache.
+// the cache routes, runs the init command (told the socket path via
+// SCOPECACHE_SOCKET_PATH), then tears the socket down. Mirrors
+// caddymodule's runInitWithPrivateSocket so the same script body
+// works in both adapters.
 //
-// ctx is propagated into RunInitCommand: SIGINT/SIGTERM at the
-// signal handler cancels the in-flight script via SIGKILL on the
-// whole process group. timeout > 0 wraps ctx with a hard deadline.
-//
-// Mirrors caddymodule's runInitWithPrivateSocket — the standalone
-// and Caddy adapters share the same "init runs behind a private
-// channel" contract so the same script body works in both.
+// ctx is propagated into RunInitCommand: SIGINT/SIGTERM cancels the
+// in-flight script via SIGKILL on the whole process group. timeout
+// > 0 wraps ctx with a hard deadline.
 func runInitWithPrivateSocket(ctx context.Context, gw *scopecache.Gateway, mux *http.ServeMux, command string, timeout time.Duration) error {
 	dir, err := os.MkdirTemp("", "scopecache-init-")
 	if err != nil {
@@ -295,6 +291,11 @@ func runInitWithPrivateSocket(ctx context.Context, gw *scopecache.Gateway, mux *
 	return runErr
 }
 
+// listenUnixSocket binds an AF_UNIX listener at path with
+// UnixSocketPerm, removing a stale socket file from a prior crash if
+// one exists. Refuses to remove anything that is not a socket — a
+// misconfigured SCOPECACHE_SOCKET_PATH must not become a foot-gun
+// against arbitrary system files.
 func listenUnixSocket(path string) (net.Listener, error) {
 	dir := filepath.Dir(path)
 
@@ -302,14 +303,6 @@ func listenUnixSocket(path string) (net.Listener, error) {
 		return nil, err
 	}
 
-	// Unix socket files persist after a crash or non-graceful shutdown; a new
-	// listen() on the same path would fail with "address already in use", so we
-	// remove any stale file first. Only socket files are removed: if the path
-	// resolves to anything else (regular file, directory, symlink to non-socket)
-	// we refuse to start instead of obliterating it. The standalone binary
-	// commonly runs as root to write into /run/, so a misconfigured
-	// SCOPECACHE_SOCKET_PATH would otherwise be a foot-gun against arbitrary
-	// system files. ErrNotExist is the normal first-boot case.
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf(
@@ -364,18 +357,10 @@ func main() {
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux)
 
-	// Timeouts sized for a local AF_UNIX cache. Budgets account for wire
-	// transfer AND stream JSON-decode of the bulk body (encoding/json runs
-	// ~100-500 MB/s on modern CPU; interleaved with reading so the slower
-	// of the two dominates).
-	//   ReadTimeout  — accept → body fully read. A 1 GiB store config
-	//                  (~1.14 GiB bulk body cap) takes ~15-40s on a slow
-	//                  CPU-constrained host; 60s gives comfortable margin.
-	//                  Configs beyond ~2 GiB may need tuning.
-	//   WriteTimeout — must exceed ReadTimeout; covers body-read + handler
-	//                  + response write. Handlers are sub-ms, so the 15s
-	//                  overhead is pure slack.
-	//   IdleTimeout  — keep-alive idle-kill; standard Go default shape.
+	// HTTP timeouts sized for a local AF_UNIX cache. ReadTimeout
+	// covers a worst-case bulk body decode (~15-40s on a 1 GiB store
+	// at slow CPU); WriteTimeout must exceed it; IdleTimeout is the
+	// standard keep-alive kill.
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
@@ -386,42 +371,29 @@ func main() {
 
 	socketPath := socketPathFromEnv()
 
-	// SIGINT/SIGTERM triggers Shutdown, which drains in-flight requests.
-	// Using log.Fatal here would bypass the shutdown path entirely because it
-	// calls os.Exit and skips deferred cleanup.
+	// SIGINT/SIGTERM triggers Shutdown via the goroutine below.
+	// log.Fatal would skip deferred cleanup; we route through the
+	// signal context instead.
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	// Boot-time init command runs BEFORE the public socket is bound,
-	// behind a private temp socket. External clients trying to reach
-	// the configured socketPath during init get connection-refused —
-	// no half-populated responses leak out. Mirrors the Caddy module's
-	// runInitWithPrivateSocket pattern. See init_command.go.
-	//
-	// signalCtx is passed in so SIGINT/SIGTERM during a long init
-	// SIGKILLs the script's process group instead of leaving boot
-	// hung indefinitely.
+	// Boot-time init runs behind a private temp socket BEFORE the
+	// public socket is bound. External clients hitting socketPath
+	// during init get connection-refused — no half-populated
+	// responses leak out. signalCtx propagates to the script so a
+	// SIGTERM during a long init kills the whole process group.
 	if cmd := initCommandFromEnv(); cmd != "" {
 		if err := runInitWithPrivateSocket(signalCtx, gw, mux, cmd, initTimeoutFromEnv()); err != nil {
 			log.Printf("scopecache init: %v (continuing with empty cache)", err)
 		}
 	}
 
-	// Subscribers start AFTER init. Reason: init writes auto-populate
-	// `_events` (when EventsMode != off) and may write to `_inbox`
-	// directly. If subscribers were already active during init, each
-	// of those writes would fire a wake-up — and the operator's drain
-	// command, when it tries to reach the cache via the configured
-	// socketPath, would hit connection-refused (we haven't bound it
-	// yet). The failed run consumes the wake-up, so the backlog sits
-	// until a later user-write triggers another wake-up.
-	//
-	// Starting subscribers AFTER init means no wake-ups fire while
-	// the public socket is still down. The matching wake-up that
-	// drains init's backlog is fired explicitly via
-	// WakeReservedSubscribers below, AFTER server.Serve has bound
-	// the public socket — so the drain command's curl reaches a
-	// listening cache.
+	// Subscribers start AFTER init. RunInitCommand wipes `_events`
+	// itself when it returns (init is restoration, not a domain
+	// action) and `_inbox` was unreachable to external writers, so
+	// subscribers register against an empty stream. The first
+	// wake-up fires on the first user-write after the public socket
+	// is up.
 	stopSubscribers := gw.StartReservedSubscribers(subscriberCommandFromEnv(), log.Printf)
 	defer stopSubscribers()
 
@@ -430,25 +402,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Shutdown order on signal: stop subscribers FIRST while the
+	// HTTP server is still up — exec.CommandContext SIGKILLs the
+	// whole drain-script process group, bounded by OS-kill latency
+	// rather than the script's voluntary completion. Then Shutdown
+	// drains in-flight HTTP requests. Both stops are idempotent, so
+	// the deferred backstops above are no-ops if this goroutine
+	// fires first.
 	go func() {
 		<-signalCtx.Done()
 		log.Print("scopecache shutting down")
-		// Stop subscribers FIRST, while the HTTP server is still up.
-		// stopSubscribers cancels each goroutine's per-subscriber
-		// context, which makes exec.CommandContext SIGKILL the
-		// in-flight drain command (the entire process group via
-		// configureProcessGroup, so script-spawned children die
-		// alongside their parent). The call then blocks until each
-		// goroutine has fully exited, bounded by OS kill latency
-		// rather than the command's voluntary completion — a stuck
-		// curl or tarpitted endpoint cannot stall shutdown past the
-		// 5s grace period. The cache socket stays open during the
-		// kill window, so any HTTP roundtrip the killed command had
-		// in flight produces a "connection reset" client-side rather
-		// than hitting a torn-down socket; the cache treats it as
-		// any other client crash. unsubscribe is idempotent
-		// (subscribe.go), so the deferred stopSubscribers() at the
-		// outer scope is a safe no-op backstop.
 		stopSubscribers()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 		defer cancel()
@@ -464,9 +427,6 @@ func main() {
 		serveDone <- server.Serve(ln)
 	}()
 
-	// Block on Serve's exit. The signal goroutine triggers
-	// server.Shutdown on SIGINT/SIGTERM, which makes Serve return
-	// http.ErrServerClosed; any other exit is logged.
 	if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("serve error: %v", err)
 	}

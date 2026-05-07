@@ -1,3 +1,23 @@
+// types.go owns cross-cutting type definitions: Config + EventsMode +
+// {Events,Inbox}Config (operator knobs every adapter fills), Item
+// (the on-the-wire shape, with Ts contract, renderBytes optimisation,
+// and counter side-channel), the error types handlers convert to
+// 4xx/5xx responses, and the package-level capacity constants
+// (ScopeMaxItems, MaxStoreMiB, MaxItemBytes, …).
+//
+// Cross-cutting invariants other files inherit from here:
+//
+//   - Bytes are the core arithmetic unit. Adapters convert their
+//     MiB/KiB-facing operator config to bytes at the boundary; the
+//     core never re-converts. The MB JSON helper renders bytes back
+//     to MiB-with-4-decimals on observability surfaces.
+//   - Reserved scopes (`_events`, `_inbox`) have their names defined
+//     here; the rejection-and-recreation contract lives in store.go.
+//   - approxItemSize is the single byte-cost function admission
+//     control consults. Counters charge counterCellOverhead instead
+//     of len(Payload) so increments stay lock-free; renderBytes is
+//     counted so HTML-rendered stores report their real footprint.
+
 package scopecache
 
 import (
@@ -38,22 +58,19 @@ const (
 	// follows.
 	eventsItemEnvelopeOverhead = 1024
 
-	// EventsScopeName is the well-known scope name for the
-	// auto-populated write-event stream (Phase A "Subscribe + event
-	// drain architecture"). Pre-created at NewStore time and
-	// re-created at /wipe / /rebuild time. Scope-level destructive
-	// operations (/delete_scope, /warm-target, /rebuild-input) reject
-	// this name; item-level operations (/append, /delete,
-	// /delete_up_to, /get, /head, /tail, /render) work normally so
-	// the drainer pattern (subscribe → tail → process →
-	// delete_up_to) functions.
+	// EventsScopeName is the reserved scope name for the auto-populated
+	// write-event stream. Pre-created at newStore time and re-created
+	// at /wipe / /rebuild time. Scope-level destructive ops
+	// (/delete_scope, /warm-target, /rebuild-input) reject the name;
+	// item-level ops (/append, /delete, /delete_up_to, /get, /head,
+	// /tail, /render) pass through so the drainer pattern (subscribe
+	// → tail → process → delete_up_to) keeps working.
 	EventsScopeName = "_events"
 
-	// InboxScopeName is the well-known scope name for application-side
-	// fan-in ingestion. Pre-created and re-created the same way as
-	// EventsScopeName, with the same scope-level reservation. Apps may
-	// freely /append into _inbox; the cache itself never auto-writes
-	// to it.
+	// InboxScopeName is the reserved scope name for application-side
+	// fan-in ingestion. Same pre-creation + reservation contract as
+	// EventsScopeName. Apps /append into _inbox; the cache itself
+	// never auto-writes to it.
 	InboxScopeName = "_inbox"
 
 	// singleRequestBytesOverhead is the headroom added on top of the configured
@@ -79,33 +96,16 @@ const (
 	MaxCounterValue int64 = (1 << 53) - 1 // 9,007,199,254,740,991
 )
 
-// Config bundles the cache-internal capacity knobs into one value that
-// every adapter (standalone, Caddy module) fills in its own way — env vars
-// for the standalone binary, JSON config for the Caddy module — and hands
-// to NewStore. Keeping the shape in one place means new cache knobs land
-// in a single file instead of rippling through every adapter's call site.
+// Config bundles the cache-internal capacity knobs every adapter
+// fills before constructing a Gateway. WithDefaults replaces non-
+// positive fields with the compile-time defaults; `Config{}` is "all
+// defaults".
 //
-// HTTP/transport-layer knobs live on APIConfig in api.go and are passed
-// to NewAPI separately. The split matches the boundary rule in
-// CLAUDE.md: the core stays transport-agnostic; HTTP concerns are an
-// adapter-layer concept.
-//
-// Fields:
-//   - ScopeMaxItems: per-scope item cap; 507 on overflow. Default ScopeMaxItems (100_000).
-//     Does NOT apply to the reserved `_events` scope (best-effort observability;
-//     bytes-cap on MaxStoreBytes is the only real begrenzer there).
-//   - MaxStoreBytes: aggregate approxItemSize cap, in bytes. Default MaxStoreMiB << 20.
-//   - MaxItemBytes:  per-item approxItemSize cap, in bytes. Default MaxItemBytes (1 MiB).
-//     Applies to user-scopes; `_events` derives `MaxItemBytes + eventsItemEnvelopeOverhead`,
-//     `_inbox` uses the operator-tunable Inbox.MaxItemBytes instead.
-//   - Events:        reserved-scope settings for `_events` (write-event
-//     auto-populate mode; cap is derived, not configurable).
-//   - Inbox:         reserved-scope settings for `_inbox` (per-item cap +
-//     item-count cap; both operator-tunable).
-//
-// Bytes (not MiB) are the core unit because admission control arithmetic
-// lives in bytes; adapters convert their MiB/KiB-facing configuration at
-// the boundary.
+// `_events` is exempt from ScopeMaxItems (observability; byte-cap
+// only) and derives its per-item cap from
+// MaxItemBytes + eventsItemEnvelopeOverhead. `_inbox` uses the
+// operator-tunable Inbox.{MaxItems,MaxItemBytes} independently of
+// the user-scope caps.
 type Config struct {
 	ScopeMaxItems int
 	MaxStoreBytes int64
@@ -115,28 +115,20 @@ type Config struct {
 	Inbox  InboxConfig
 }
 
-// EventsMode controls whether the cache auto-populates the reserved
-// `_events` scope on every successful mutation, and how much each
-// event entry contains.
+// EventsMode controls auto-populate of the reserved `_events` scope
+// on every successful mutation:
 //
-//   - EventsModeOff      — auto-populate disabled. Zero overhead on
-//     the write path; default. Operators opt in
-//     when they have a drainer ready.
-//   - EventsModeNotify   — every committed mutation produces a metadata
-//     event (op, scope, id?, seq, ts) with NO
-//     payload. Smallest log entries; sufficient
-//     for drainers that re-fetch from cache state
-//     on wake-up.
-//   - EventsModeFull     — every committed mutation produces a full
-//     event including the action-payload. Largest
-//     log entries; sufficient for drainers that
-//     replicate state without re-querying.
+//   - EventsModeOff    (default) — no auto-populate; zero write-path
+//     overhead. Opt in when a drainer is ready.
+//   - EventsModeNotify           — metadata only (op, scope, id?, seq,
+//     ts). Smallest entries; sufficient for drainers that re-fetch
+//     from cache state on wake-up.
+//   - EventsModeFull             — metadata + action-payload.
+//     Sufficient for drainers that replicate state without re-querying.
 //
-// "Action-payload" here means the inputs the caller sent — for
-// /counter_add it's `by` (the increment), not the new value. The
-// cache logs what was REQUESTED, not what was COMPUTED. This makes
-// the event stream replay-able and matches the WAL discipline most
-// downstream sinks expect.
+// "Action-payload" = the inputs the caller sent. /counter_add logs
+// `by`, not the post-add value — the event stream stays replay-able
+// and matches the WAL discipline downstream sinks expect.
 type EventsMode int
 
 const (
@@ -145,11 +137,10 @@ const (
 	EventsModeFull                     // 2 — events with payload
 )
 
-// String returns the canonical lowercase string form of m, matching
-// the values accepted by SCOPECACHE_EVENTS_MODE / Caddyfile events_mode.
-// Unknown values render as "unknown(N)" so a forgotten new mode is
-// visible in /help and stats output rather than silently rendering
-// as "off".
+// String returns the canonical lowercase form (off | notify | full),
+// matching the values SCOPECACHE_EVENTS_MODE / events_mode accept.
+// Unknown values render as "unknown" so a forgotten new mode shows up
+// in observability output rather than silently rendering as "off".
 func (m EventsMode) String() string {
 	switch m {
 	case EventsModeOff:
@@ -163,11 +154,9 @@ func (m EventsMode) String() string {
 	}
 }
 
-// ParseEventsMode parses the string form (off / notify / full) into
-// the typed enum. The empty string maps to EventsModeOff so adapter
-// code can pass through "unset" without special-casing. Used by
-// SCOPECACHE_EVENTS_MODE parsing in cmd/scopecache and by the Caddy
-// module's events_mode directive.
+// ParseEventsMode parses the string form (off | notify | full) into
+// the typed enum. Empty maps to EventsModeOff so adapter code passes
+// through "unset" without special-casing.
 func ParseEventsMode(s string) (EventsMode, error) {
 	switch s {
 	case "", "off":
@@ -181,50 +170,38 @@ func ParseEventsMode(s string) (EventsMode, error) {
 	}
 }
 
-// EventsConfig holds reserved-scope settings for `_events`.
-//
-// Mode controls auto-populate (off / notify / full); see EventsMode.
-// Per-item byte cap and item-count cap are NOT configurable here —
-// they're derived from `Config.MaxItemBytes` (+ envelope slack) and
-// fully exempt respectively, because per-event cap arithmetic must
-// stay coupled to the user-write that produced the event. See
-// eventsItemEnvelopeOverhead for the rationale.
+// EventsConfig holds the operator knob for the `_events` scope. Per-
+// item cap and item-count cap are intentionally NOT configurable: the
+// per-event cap stays coupled to MaxItemBytes (+ envelope slack) so
+// large user-writes never 507 on the auto-populate path, and the item
+// count cap is exempt because `_events` is observability, not user
+// state.
 type EventsConfig struct {
 	Mode EventsMode
 }
 
-// InboxConfig holds operator-tunable settings for the reserved `_inbox`
-// scope. `_inbox` is app-populated fan-in storage; its per-item cap is
-// independent of the global MaxItemBytes (which targets user-scopes
-// with potentially much larger payloads), and its item-count cap stays
-// tunable so operators can give `_inbox` a different ceiling than the
-// global ScopeMaxItems if their drainer cadence demands it.
-//
-// Fields:
-//   - MaxItems:     per-scope item cap on `_inbox`. Default ScopeMaxItems.
-//   - MaxItemBytes: per-item approxItemSize cap on `_inbox`. Default
-//     InboxMaxItemBytes (64 KiB).
+// InboxConfig holds operator knobs for the reserved `_inbox` scope
+// (app-populated fan-in). Both caps are independent of the user-
+// scope globals: per-item is typically 64 KiB (small structured
+// records) where user-scopes may be MiB; item-count stays tunable so
+// drainer cadence sets the ceiling, not user-scope economics.
 type InboxConfig struct {
 	MaxItems     int
 	MaxItemBytes int64
 }
 
 // WithDefaults returns a copy of c with non-positive numeric fields
-// replaced by the package-level compile-time defaults. NewStore calls
-// this internally so library users can pass a partially-filled Config
-// (or `Config{}` for "all defaults") and still get a working Store —
-// without it, every cap would be zero and every positive write would
-// be rejected with 507.
+// replaced by the compile-time defaults. Called by NewGateway so
+// `Config{}` is a valid "all defaults" input.
 //
-// MaxStoreBytes also has a floor: it must be large enough to hold the
-// reserved scopes' overhead (reservedScopesOverhead). Without the
-// floor, a tiny configured cap silently skips reserved-scope creation
-// at boot (initReservedScopes' reserveBytes gate fails) but post-wipe
-// re-init bypasses the cap unconditionally — leaving totalBytes past
-// the configured ceiling and Subscribe on `_events` failing on a
-// fresh cache. The clamp only fires for absurdly small caps (under
-// 2 KiB on the default reserved-scope set); realistic MB/GB caps are
-// untouched.
+// MaxStoreBytes also has a floor: it must hold the reserved scopes'
+// overhead (reservedScopesOverhead). Without the floor, a tiny
+// configured cap silently skips reserved-scope creation at boot
+// (initReservedScopes' reserveBytes gate fails) but post-wipe re-init
+// bypasses the cap unconditionally — leaving totalBytes past the
+// configured ceiling and Subscribe on `_events` failing on a fresh
+// cache. Only fires for absurdly small caps (under 2 KiB on the
+// default reserved-scope set); realistic MB/GB caps are untouched.
 func (c Config) WithDefaults() Config {
 	if c.ScopeMaxItems <= 0 {
 		c.ScopeMaxItems = ScopeMaxItems
@@ -257,24 +234,17 @@ func (m MB) MarshalJSON() ([]byte, error) {
 	return []byte(fmt.Sprintf("%.4f", float64(m)/1048576.0)), nil
 }
 
-// Payload is opaque application data. json.RawMessage defers decoding and
-// keeps the raw bytes as the client sent them, which both honors the
-// "cache must not inspect payload" contract and avoids a recursive walk
-// every time we need to estimate an item's size.
+// Item is the on-the-wire shape of a cached entry. Payload is
+// json.RawMessage so the cache never inspects user bytes (contract)
+// and never walks the JSON tree to estimate item size (perf).
 //
-// Ts is a cache-owned microsecond timestamp (time.Now().UnixMicro())
-// set on every write that touches the item: /append, /upsert (create +
-// replace), /update, /counter_add (create + increment), /warm, /rebuild,
-// /inbox. Clients MUST NOT supply ts on writes — every write endpoint
-// rejects a client-supplied ts with 400. The field is observability
-// only: not searchable, not indexed, not used for ordering. It captures
-// "when did the cache last write this item" — useful for logging,
-// last-activity stamping on counters, and drainer telemetry on /inbox.
-// Microsecond granularity (not milliseconds) keeps two writes inside
-// the same millisecond distinguishable, which matters for ordered
-// /inbox draining and for "last activity" stamping on counters under
-// burst load. Cross-instance arrival time lives in the source of truth;
-// the cache only knows when it itself wrote the bytes.
+// Ts is cache-owned (time.Now().UnixMicro()) and refreshed on every
+// write that touches the item; clients MUST NOT supply ts (400 on
+// any write endpoint). The field is observability only — not
+// searchable, not indexed, not used for ordering. Microsecond (not
+// millisecond) granularity keeps two writes inside the same ms
+// distinguishable, which matters for ordered /inbox draining and
+// counter "last activity" stamping under burst load.
 type Item struct {
 	Scope   string          `json:"scope,omitempty"`
 	ID      string          `json:"id,omitempty"`
@@ -282,48 +252,39 @@ type Item struct {
 	Ts      int64           `json:"ts"`
 	Payload json.RawMessage `json:"payload"`
 
-	// renderBytes is the JSON-string-decoded form of Payload, populated
-	// at write-time (appendItem / upsertByID / updateByID /
-	// counterAdd / buildReplacementState) for payloads whose first
-	// non-whitespace byte is `"`. Nil for any other payload kind
-	// (object/array/number/bool/null), in which case /render writes
-	// Payload as-is. This trades a one-shot Unmarshal + alloc at write
-	// for a per-hit Unmarshal + []byte cast at read on the /render
-	// path — measured ~2.4× faster /render on JSON-string payloads.
+	// renderBytes is the JSON-string-decoded form of Payload, set at
+	// write-time for payloads whose first non-whitespace byte is `"`,
+	// nil otherwise (object/array/number/bool/null pass through to
+	// /render verbatim). Trades a one-shot Unmarshal + alloc at write
+	// for a saved Unmarshal at every /render hit (~2.4× faster on
+	// JSON-string payloads).
 	//
-	// Unexported, so encoding/json never marshals it: it is in-process
-	// state, not part of the wire format that /append, /get, /head,
-	// /tail and friends serialise.
+	// Unexported so encoding/json never marshals it: in-process state,
+	// not part of the wire format.
 	renderBytes []byte
 
 	// counter is non-nil iff this item was created or promoted by
-	// /counter_add. When set, cell.value and cell.ts are the source of
-	// truth for the counter's value and "last increment" timestamp;
-	// Payload and Ts on the surrounding Item are stale by construction
-	// and are re-rendered from the cell at read time
-	// (materialiseCounter in buffer_read.go).
+	// /counter_add. cell.{value,ts} are the source of truth; Payload
+	// and Ts on the surrounding Item are stale by construction and
+	// re-rendered from the cell at read time (materialiseCounter in
+	// buffer_read.go).
 	//
-	// Counters use this side-channel instead of mutating Payload bytes
-	// in place because counter_add's fast path runs under b.mu.RLock —
-	// rewriting a []byte under a read lock would race with concurrent
-	// readers on the same RLock. atomic.Int64 fields on the cell give
-	// us lock-free increment + CAS-max ts under RLock; the Payload
-	// bytes are only ever produced fresh on the read boundary, never
-	// mutated in place.
+	// Side-channel rather than in-place Payload mutation because the
+	// fast path runs under b.mu.RLock — rewriting []byte under a read
+	// lock would race with concurrent readers. atomic.Int64 fields on
+	// the cell give us lock-free increment + CAS-max ts under RLock;
+	// Payload bytes are only ever produced fresh on the read boundary.
 	counter *counterCell
 }
 
-// counterCell is the lock-free state for a counter item. value is the
-// current integer; ts is the microsecond timestamp of the most recent
-// increment. Both are atomic so /counter_add's fast path can run under
-// b.mu.RLock without serialising on the scope's exclusive write lock —
-// see counterAdd in buffer_counter.go. The cell is allocated on counter
-// creation or promotion and lives as long as the surrounding Item.
+// counterCell is the lock-free state for a counter item. value is
+// the current integer, ts the microsecond timestamp of the most
+// recent increment. Both atomic so /counter_add's fast path runs
+// under b.mu.RLock without serialising on the scope's write lock.
 //
-// counterCell uses atomic.Int64 (which is non-copyable per `go vet`),
-// so Item.counter is a pointer, not an embedded value. Map / slice
-// copies of Item share the same cell — that's the point: an increment
-// on any copy is observed by every reader.
+// atomic.Int64 is non-copyable per `go vet`, so Item.counter is a
+// pointer: map/slice copies of Item share the same cell. That's the
+// point — an increment on any copy is observed by every reader.
 type counterCell struct {
 	value atomic.Int64
 	ts    atomic.Int64
@@ -361,9 +322,9 @@ type deleteUpToRequest struct {
 	MaxSeq uint64 `json:"max_seq"`
 }
 
-// CounterAddRequest is the body of the `/counter_add` endpoint. `By` is a
-// pointer so the handler can distinguish a missing field from an explicit
-// zero — the latter is a client bug and is rejected with 400.
+// counterAddRequest is the body of /counter_add. By is a pointer so
+// the handler can distinguish a missing field from an explicit zero
+// — the latter is a client bug and rejected with 400.
 type counterAddRequest struct {
 	Scope string `json:"scope"`
 	ID    string `json:"id"`
@@ -493,18 +454,16 @@ func approxItemSize(item Item) int64 {
 }
 
 // Multi-item read pre-flight constants. Used to short-circuit /head
-// and /tail with a 507 BEFORE writeJSONWithMeta calls
-// json.Marshal on the full payload — the post-flight cappedResponseWriter
-// catches the same case but only after the body has been built in
-// memory. Without pre-flight, an operator who raises
-// SCOPECACHE_MAX_RESPONSE_MB to a large value (or a misbehaving client
-// hitting /tail?limit=10000 against 1 MiB items) lets the marshaller
-// allocate the full body before the cap fires.
+// and /tail with a 507 BEFORE the marshaller allocates the full
+// response body — writeJSONWithMetaCap is the post-flight authoritative
+// cap, but it only fires after the body is in memory. A misbehaving
+// client hitting /tail?limit=10000 against 1 MiB items would otherwise
+// allocate the entire body before the cap rejects it.
 //
 // Both constants are STRICT lower bounds — overestimating per-item or
-// envelope cost would reject legitimate calls. The post-flight
-// cappedResponseWriter remains the authoritative cap; pre-flight is
-// a memory optimisation, not a correctness gate.
+// envelope cost would reject legitimate calls. The post-flight cap
+// remains authoritative; pre-flight is a memory optimisation, not a
+// correctness gate.
 const (
 	// multiItemEnvelopeMinBytes is the minimum byte cost of the outer
 	// JSON envelope ({ok, hit, count, truncated, items, duration_us,

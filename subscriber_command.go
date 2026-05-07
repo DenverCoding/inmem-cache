@@ -43,40 +43,32 @@ import (
 	"os/exec"
 )
 
-// StartSubscriber spawns a subscriber goroutine that subscribes to
-// scope, then invokes command + waits for it to exit on every
-// wake-up. Returns a stop function that:
+// StartSubscriber spawns a goroutine that subscribes to scope, then
+// invokes command + waits for it to exit on every wake-up. Returns
+// a stop function that:
 //
-//  1. closes the subscription (which closes the wake-up channel,
-//     which exits the goroutine's `for range` loop),
-//  2. cancels the per-subscriber context — the in-flight cmd.Run
-//     was started via exec.CommandContext, so cancellation
-//     SIGKILLs the running process and cmd.Run returns immediately,
-//     and
+//  1. cancels the per-subscriber context — the in-flight cmd.Run
+//     was started via exec.CommandContext, so cancellation SIGKILLs
+//     the running process and cmd.Run returns immediately,
+//  2. closes the subscription (which closes the wake-up channel,
+//     which exits the goroutine's `for range` loop), and
 //  3. blocks until the goroutine has fully exited.
 //
-// Step 2 is what bounds shutdown latency. Pre-step-2 the contract was
-// "stop blocks until the in-flight command finishes" — fine if the
-// command always finishes promptly, catastrophic if it doesn't. A
-// stuck curl, a tarpitted network endpoint, or a buggy script with
-// an infinite loop would block stop forever, blocking standalone
-// shutdown before its 5s grace period and stalling Caddy reload via
-// Cleanup. Cancel-on-stop trades graceful in-flight completion for
-// a hard upper bound: stop returns within OS-process-kill latency,
-// regardless of what the command was doing.
+// Step 1 bounds shutdown latency. Without it a stuck curl, tarpitted
+// endpoint, or infinite-loop script would block stop forever —
+// stalling standalone shutdown past its 5s grace and stalling Caddy
+// reload via Cleanup. Cancel-on-stop trades graceful in-flight
+// completion for a hard upper bound: stop returns within OS-process-
+// kill latency regardless of what the command was doing. The HTTP-
+// roundtrip-orphan concern is addressed by ordering — adapters call
+// stopSubscribers BEFORE shutting the listener, so a killed curl
+// mid-request sees a normal "connection reset" against an open
+// socket, same as any other client crash.
 //
-// The HTTP-roundtrip-orphan concern that motivated the original
-// blocking stop is addressed differently: the standalone main()
-// still calls stopSubscribers() before server.Shutdown, so the
-// cache socket stays open while the goroutine tears down. A killed
-// curl mid-request just produces a "connection reset" client-side;
-// the cache sees a closed connection and handles gracefully — same
-// as any other client crash.
-//
-// stop is idempotent (Subscribe's unsub is, calling cancel on an
-// already-cancelled context is a no-op, and reading from a closed
-// `done` channel returns immediately) so it's safe to wire both
-// into a signal-handler AND a `defer` backstop.
+// stop is idempotent (Subscribe's unsub is, cancel-on-cancelled-
+// context is a no-op, reading from a closed `done` returns
+// immediately) so it's safe to wire both into a signal-handler AND
+// a `defer` backstop.
 //
 // Errors at start-up:
 //   - empty scope or command -> validation error

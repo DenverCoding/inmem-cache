@@ -7,18 +7,16 @@ import (
 
 // Bulk write handlers on the public mux:
 //
-//   - /warm     — replace the scopes carried in the request, leave others alone
+//   - /warm     — replace the scopes in the request, leave others alone
 //   - /rebuild  — atomically replace the entire store
 //
-// Both decode an ItemsRequest and route through Store.replaceScopes /
-// Store.rebuildAll. Per-item shape validation lives at the top of those
-// Store methods (step 6.7 onwards), so handlers no longer iterate the
-// items themselves — they decode, delegate, and map errors.
+// Both decode an itemsRequest and route through Store.replaceScopes /
+// Store.rebuildAll. Per-item shape validation lives in those Store
+// methods, so handlers decode, delegate, and map errors.
 //
 // /rebuild explicitly refuses an empty items array because that is
 // almost always a client bug rather than an intentional clear-
-// everything request; the empty-input check stays in the handler
-// because it is a /rebuild-endpoint-specific policy, not a per-item
+// everything request — endpoint-specific HTTP policy, not a per-item
 // shape rule.
 
 func (api *API) handleWarm(w http.ResponseWriter, r *http.Request) {

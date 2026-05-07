@@ -29,29 +29,22 @@ import (
 //   handlers_bulk.go     — /warm, /rebuild
 //   handlers_observe.go  — /stats, /help
 
-// writeStoreCapacityError centralises the per-handler error-handling
-// for the three capacity-class errors the store can return on a write
-// path: *ScopeFullError (single-item over per-scope cap), the bulk
-// equivalent *ScopeCapacityError (carries an offender list), and
-// *StoreFullError (over the store-wide byte cap). All seven write
-// handlers (/append, /upsert, /counter_add, /inbox single-item +
-// /warm, /rebuild bulk + /update which only sees stfe) call this
-// before doing any handler-specific error dispatch.
+// writeStoreCapacityError dispatches the three capacity-class
+// errors the store returns on write paths:
 //
-// Returns true when one of the three was matched and the response
-// has been written — the caller should `return` immediately. Returns
-// false otherwise; the caller falls back to its own error handling
-// (typically `conflict(...)`, plus counter-specific errors for
-// /counter_add).
+//   - *ScopeFullError    — single-item over per-scope cap
+//   - *ScopeCapacityError — bulk equivalent (carries offender list)
+//   - *StoreFullError    — over the store-wide byte cap
 //
-// `scopeForSFE` is the scope name plumbed into the single-element
-// offenders list on the *ScopeFullError path. It is **unused** for
-// callers that cannot produce sfe — /warm and /rebuild produce
-// *ScopeCapacityError (which carries its own offender list) and
-// /update produces only *StoreFullError. Those callers pass "".
-// The unused-param wart is preferable to splitting into two helpers
-// that would duplicate the stfe block (the most likely candidate
-// for future drift).
+// Returns true when matched + response written; caller should
+// `return` immediately. Returns false on no match; caller falls
+// back to handler-specific error handling.
+//
+// `scopeForSFE` is plumbed into the single-element offenders list
+// on the *ScopeFullError path; pass "" for callers that cannot
+// produce sfe (/warm, /rebuild produce *ScopeCapacityError;
+// /update produces only *StoreFullError). The unused-param wart
+// beats splitting helpers that would duplicate the stfe block.
 func writeStoreCapacityError(w http.ResponseWriter, started time.Time, err error, scopeForSFE string) bool {
 	var sfe *ScopeFullError
 	if errors.As(err, &sfe) {
@@ -73,31 +66,23 @@ func writeStoreCapacityError(w http.ResponseWriter, started time.Time, err error
 	return false
 }
 
-// writeMutationError centralises the error-mapping pattern shared by
+// writeMutationError dispatches the error-mapping pattern shared by
 // /append, /upsert, /update, /warm, and /rebuild:
 //
 //   - ErrInvalidInput  → 400 with the wrapped message
 //   - capacity classes → 507 via writeStoreCapacityError
-//     (*ScopeFullError / *ScopeCapacityError / *StoreFullError)
-//   - anything else    → 409 conflict (the orphan/race shape:
-//     *ScopeDetachedError, *ScopeFullError races resolved by detach,
+//   - anything else    → 409 (orphan/race shape: *ScopeDetachedError,
 //     etc.)
 //
-// `scopeForSFE` plumbs into the single-element offenders list on the
-// *ScopeFullError path; pass "" for callers that cannot produce sfe
-// (/warm, /rebuild produce *ScopeCapacityError; /update produces only
-// *StoreFullError). See writeStoreCapacityError for the rationale on
-// keeping the unused-param shape over splitting helpers.
+// `scopeForSFE` plumbs into writeStoreCapacityError's offender list
+// — pass "" when the caller cannot produce *ScopeFullError.
 //
-// /counter_add does NOT use this helper — it has two extra
-// counter-specific error types (*CounterPayloadError → 409,
-// *CounterOverflowError → 400) that don't fit the helper's vocabulary
-// without coupling it to counter semantics. Delete handlers don't use
-// it either: deletes never produce capacity errors, so the
-// writeStoreCapacityError hop would be dead code on every call.
+// /counter_add and the delete handlers do NOT route through this
+// helper: counter has its own *CounterPayloadError / *CounterOverflowError
+// vocabulary, and deletes never produce capacity errors.
 //
 // Caller invariant: err is non-nil. The helper writes exactly one
-// response and the caller must `return` immediately afterward.
+// response; caller must `return` immediately afterward.
 func writeMutationError(w http.ResponseWriter, started time.Time, err error, scopeForSFE string) {
 	if errors.Is(err, ErrInvalidInput) {
 		badRequest(w, started, err.Error())

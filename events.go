@@ -7,36 +7,31 @@ import "encoding/json"
 // On every successful mutation to a non-`_events` scope, the cache
 // emits a write-event entry to `_events` whose payload is a JSON
 // object describing the action that just committed. Drainers
-// subscribe to `_events` (Phase A "Subscribe + events drain
-// architecture") and stream entries to whatever sink they prefer:
-// JSONL files, SQLite, external DB, Kafka, webhook, …
+// subscribe to `_events` and stream entries to whatever sink they
+// prefer (JSONL, SQLite, external DB, Kafka, webhook, …).
 //
 // Three behaviour gates, in order:
 //
 //  1. Config.Events.Mode (off / notify / full). Default off — zero
-//     overhead on the write path. Notify omits the user payload from
-//     the event; Full includes it.
-//  2. Recursion guard. A /append to `_events` itself (allowed by the
-//     reservation contract — see RFC §2.6) does NOT trigger a second
-//     event. Without this guard the cache would loop on every event
-//     emit and saturate `_events` with self-referential entries.
-//  3. Best-effort drop on cap-overflow. The event-emit goes through
-//     the normal admission control (per-item cap on `_events`,
-//     store-wide byte cap). If the byte cap fires the user-write
-//     STILL succeeds; we just drop the event silently and bump
-//     Store.eventsDropsTotal. The user-visible result of the
-//     underlying mutation is never affected by an event drop.
+//     overhead on the write path. Notify omits the user payload;
+//     Full includes it.
+//  2. Recursion guard. A /append to `_events` itself does NOT
+//     trigger a second event. Without this the cache would loop on
+//     every emit and saturate `_events` with self-referential entries.
+//  3. Best-effort drop on cap-overflow. The emit goes through normal
+//     admission control. If the byte cap fires the user-write STILL
+//     succeeds; we drop the event and bump eventsDropsTotal. The
+//     user-visible result of the underlying mutation is never
+//     affected by an event drop.
 //
 // Capture-under-lock, emit-outside-lock: emit calls happen AFTER
-// the user-scope's b.mu has been released (the wrapping Store
-// method, e.g. appendOne, returns from buf.appendItem and only then
-// invokes the emit). Field values are passed in by value from the
-// returned Item snapshot; safe to use without re-locking.
+// the user-scope's b.mu has been released. Field values are passed
+// in by value from the returned Item snapshot; safe to use without
+// re-locking.
 //
-// Single-level recursion: emitAppendEvent calls s.appendOne with
-// scope=`_events`. That recursive call commits, then triggers
-// another emitAppendEvent — which short-circuits on the recursion
-// guard (scope == EventsScopeName). Two stack frames, no loop.
+// Single-level recursion: emitAppendEvent → appendOne(_events) →
+// emitAppendEvent short-circuits on the guard. Two stack frames, no
+// loop.
 
 // writeEvent is the JSON shape of an entry's payload in the
 // reserved `_events` scope. The cache marshals one writeEvent per
@@ -69,16 +64,11 @@ import "encoding/json"
 // detect wipe/rebuild via cursor-rewind (`_events.lastSeq` <
 // `lastSeenSeq`) and reset their state accordingly.
 //
-// Optional fields use `omitempty`: a zero Seq is absent (so /update
-// by-id and /delete by-id envelopes don't carry seq:0), a nil Payload
-// is absent (Notify mode strips it), a zero Ts is absent, a zero-
-// length Scope is absent (so /warm envelope is exactly {op, ts}).
-// By is *int64 so by:0 is representable (a literal "increment-by-
-// zero" action) while leaving the field absent for non-counter ops.
-// MaxSeq is uint64 with omitempty — collisions with a literal
-// max_seq=0 don't matter because /delete_up_to with max_seq=0 is a
-// no-op (nothing has seq <= 0 since assignments start at 1) and we
-// skip emitting on count=0 anyway.
+// Optional fields use `omitempty`. By is *int64 so by:0 (a no-op
+// counter action) is representable on the wire while non-counter
+// envelopes leave the field absent. MaxSeq=0 cannot collide because
+// /delete_up_to with max_seq=0 is a no-op (assignments start at 1)
+// and we skip emitting on count=0 anyway.
 type writeEvent struct {
 	Op      string          `json:"op"`
 	Scope   string          `json:"scope,omitempty"`
@@ -139,8 +129,7 @@ func (s *store) eventsEnabled(scope string) bool {
 	return s.eventsMode != EventsModeOff && scope != EventsScopeName
 }
 
-// emitAppendEvent — see file-level comment. Called by Store.appendOne
-// after a successful buf.appendItem commit.
+// emitAppendEvent fires after a successful Store.appendOne commit.
 func (s *store) emitAppendEvent(scope, id string, seq uint64, ts int64, payload json.RawMessage) {
 	if !s.eventsEnabled(scope) {
 		return
@@ -183,13 +172,8 @@ func (s *store) emitUpdateEvent(scope, id string, seq uint64, payload json.RawMe
 }
 
 // emitCounterAddEvent carries the action-input By (the increment),
-// not the post-add Value (the result). Replay against an empty cache
-// reconstructs the same value because counter_add is associative:
-// applying By repeatedly from zero produces the same total.
-//
-// By is *int64 so by:0 (a no-op action) is still representable on the
-// wire; a non-counter envelope leaves it nil and `omitempty` drops
-// the field entirely.
+// not the post-add Value. Replay against an empty cache reconstructs
+// the same total because counter_add is associative.
 func (s *store) emitCounterAddEvent(scope, id string, by int64) {
 	if !s.eventsEnabled(scope) {
 		return

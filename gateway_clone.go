@@ -46,15 +46,10 @@ func clonePayload(p json.RawMessage) json.RawMessage {
 }
 
 // cloneItemPayload returns a copy of item with item.Payload replaced
-// by a fresh allocation and the unexported renderBytes + counter fields
-// cleared. Other exported fields are value types (string, uint64, int64)
-// and don't alias caller-side state.
-//
-// The unexported-field clearing is what prevents the
-// "counter pointer rides on a returned Item back into Append" hazard
-// described in the package-level header above. Cheap (two assignments
-// to nil) and applied in both directions (input + output) so the
-// boundary is symmetric.
+// by a fresh allocation and the unexported renderBytes + counter
+// fields cleared. Other exported fields are value types and don't
+// alias caller-side state. Applied symmetrically on input and output
+// boundaries — the clearing closes the round-trip hazard.
 func cloneItemPayload(item Item) Item {
 	item.Payload = clonePayload(item.Payload)
 	item.renderBytes = nil

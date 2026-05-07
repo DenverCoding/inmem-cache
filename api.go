@@ -1,30 +1,20 @@
 package scopecache
 
-// APIConfig bundles the HTTP/transport-layer knobs that adapters supply
-// to NewAPI. The split between APIConfig and Config mirrors the
-// boundary rule: Config carries cache-internal limits (per-scope item
-// cap, store byte cap, per-item byte cap), APIConfig carries everything
-// that only makes sense once a request is being served.
+// APIConfig bundles the HTTP/transport-layer knobs adapters supply
+// to NewAPI. The split mirrors the boundary rule: Config carries
+// cache-internal limits, APIConfig carries everything that only
+// makes sense once a request is being served.
 //
-// Currently empty: the only HTTP-layer knob (response-byte cap) is now
-// derived from the store's MaxStoreBytes inside NewAPI rather than
-// configured separately — by construction no single scope can hold
-// more than the store, so the response cap that's "guaranteed to fit
-// every full-scope tail in one response" is simply equal to the store
-// cap. The struct is kept (rather than dropped) so the first new
-// HTTP-layer knob (CORS, request tracing, …) lands without breaking
-// every adapter's `NewAPI(store, scopecache.APIConfig{})` call site.
-//
-// Multi-tenancy, auth, batching and operator-policy concerns previously
-// in this struct have moved out of core; they belong in addons that
-// will reintroduce /guarded, /admin, /inbox and /multi_call as
-// separate sub-packages. See core-and-addons.md.
+// Currently empty — the response-byte cap is derived from the
+// store's MaxStoreBytes (no separate knob), and multi-tenancy / auth
+// / batching belong in addon packages, not core. Kept (rather than
+// dropped) so the first new HTTP-layer knob lands without breaking
+// every adapter's `NewAPI(gw, scopecache.APIConfig{})` call site.
 type APIConfig struct{}
 
-// API is the HTTP layer in front of *Store. It owns request-shape
-// concerns the core deliberately knows nothing about: response-size
-// caps. Multi-tenancy, batching and operator-policy concerns live in
-// addon packages built on top of the public *API surface.
+// API is the HTTP layer in front of *store. Owns the request-shape
+// concerns the core deliberately knows nothing about (request- and
+// response-byte caps).
 type API struct {
 	store *store
 	// maxBulkBytes is the per-request body cap for /warm and /rebuild,
@@ -55,21 +45,17 @@ type API struct {
 	maxResponseBytes int64
 }
 
-// NewAPI wires the HTTP API to a Gateway and an APIConfig. Adapters
-// (cmd/scopecache, caddymodule) call NewGateway(cfg) → NewAPI(gw, ...)
-// → RegisterRoutes(mux) to mount the HTTP surface. Every byte cap on
-// this layer is derived from the underlying store's configuration so
-// the HTTP guardrails always track the cache budget without the
+// NewAPI wires the HTTP API to a Gateway. Adapters call
+// NewGateway(cfg) → NewAPI(gw, ...) → RegisterRoutes(mux) to mount
+// the HTTP surface. Every byte cap is derived from the store's
+// config so HTTP guardrails track the cache budget without the
 // operator keeping two sets of knobs in sync.
 //
-// Why *Gateway, not *store: Gateway is the public type — addons,
-// adapters, tests, all hold *Gateway. NewAPI taking *store would
-// force every adapter to know the (private) store type or pass a
-// gateway-extracted store via a getter, both worse than just taking
-// the gateway directly. The HTTP layer reaches into gw.store for
-// validation-cap reads and dispatches every handler through
-// gw.store.* (post-step-6.6 the validator lives at the store entry,
-// so handlers don't validate themselves).
+// Takes *Gateway (the public type) rather than *store so adapters,
+// addons and tests don't need to know the private store type. The
+// HTTP layer reaches into gw.store for validation-cap reads and
+// dispatches handlers through gw.store.* — validation runs at the
+// store entry, not in the handlers.
 func NewAPI(gw *Gateway, _ APIConfig) *API {
 	return &API{
 		store:            gw.store,

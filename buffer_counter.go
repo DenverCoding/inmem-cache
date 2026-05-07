@@ -9,48 +9,41 @@ import (
 // /counter_add is the cache's one and only payload-aware mutation:
 // every other write path treats the payload as opaque bytes, but
 // counterAdd reads it as a JSON integer and rewrites it with the
-// updated value. The semantics live entirely in this file because
-// they are conceptually distinct from the other write paths — a
-// future contributor extending counter behaviour shouldn't have to
-// scroll past appendItem/upsertByID/updateByID to find the relevant
-// code, and the integer-payload contract (rejected non-integer,
-// ±MaxCounterValue range) belongs co-located with its enforcement.
+// updated value. The integer-payload contract (rejected non-integer,
+// ±MaxCounterValue range) lives co-located with its enforcement here.
 //
 // Lock discipline:
 //
 //   1. **Fast path — RLock + atomic.** When the target item already
-//      has a counterCell installed, increment runs under b.mu.RLock:
-//      a CAS loop on cell.value plus a CAS-max on cell.ts. No
-//      exclusive lock, no items-slice mutation, no byte accounting.
-//      Concurrent fast-path increments on the same scope run truly
-//      in parallel; only real mutations (append/upsert/delete on the
-//      same scope) serialise against them.
+//      has a counterCell, increment runs under b.mu.RLock: CAS loop
+//      on cell.value + CAS-max on cell.ts. No exclusive lock, no
+//      items-slice mutation, no byte accounting. Concurrent fast-
+//      path increments on the same scope run truly in parallel;
+//      only real mutations (append/upsert/delete on the same scope)
+//      serialise against them.
 //
 //   2. **Slow path — Lock.** When the target item does not exist
 //      (create) or exists without a cell (promote), counterAdd takes
 //      b.mu.Lock to install the cell and adjust byte accounting.
-//      Slow-path is rare: every counter incurs it exactly once
-//      (creation), or twice (creation + first /upsert + first
-//      /counter_add after the upsert). Subsequent increments are
-//      always fast-path.
+//      Slow-path is rare: every counter incurs it exactly once on
+//      creation, plus once more if a /upsert or /update strips the
+//      cell mid-life. Subsequent increments are always fast-path.
 //
 // lastWriteTS semantics:
 //
-//   - cell.ts (the per-counter atomic timestamp): bumped on every
-//     successful increment via CAS-max. Surfaced as item.Ts at read
-//     time by materialiseCounter.
-//   - b.lastWriteTS (per-scope): NOT bumped by any counter_add path —
-//     create, promote, or increment. Counter activity is intentionally
-//     invisible to the per-scope freshness signal so view-counter-
-//     style read-driven workloads do not pollute it.
-//   - s.lastWriteTS (store-wide): NOT bumped by counter_add either,
-//     for the same reason. Scope creation (which may happen
-//     incidentally when counter_add hits a brand-new scope) DOES
-//     bump via the getOrCreateScope path; that bump is structural
-//     (scope_count grew on /stats) and is not a counter_add concern.
+//   - cell.ts (per-counter atomic): bumped on every successful
+//     increment via CAS-max. Surfaced as item.Ts at read time by
+//     materialiseCounter.
+//   - b.lastWriteTS (per-scope) and s.lastWriteTS (store-wide): NOT
+//     bumped by any counter_add path — create, promote, or
+//     increment. Counter activity is intentionally invisible to the
+//     freshness signal so view-counter-style read-driven workloads
+//     do not pollute it. Scope creation does bump via
+//     getOrCreateScope (structural change, scope_count grew); the
+//     counter op itself is silent.
 //
-// Consumers who genuinely need "did this counter just change?" read
-// cell.ts via /get?id=X and observe item.Ts directly — that is the
+// Consumers who need "did this counter just change?" read cell.ts
+// via /get?id=X and observe item.Ts directly — that's the
 // granularity counters are observable at, by design.
 
 // counterAdd atomically adds `by` to the integer stored at scope+id, or
@@ -69,13 +62,9 @@ import (
 // The caller must have already rejected by==0 and by outside ±MaxCounterValue.
 func (b *scopeBuffer) counterAdd(scope, id string, by int64) (int64, bool, error) {
 	// Fast path: RLock-only, lock-free atomic add on an existing
-	// counter cell. Concurrent fast-path increments on the same scope
-	// share the RLock and never serialise on each other. The detached
-	// check is belt-and-braces — a detached buffer cannot have its
-	// b.byID mutated either, so any cell we observe is safe to
-	// increment, but the explicit check matches the slow path's
-	// observable error and avoids returning a misleading "success" on a
-	// buffer the caller no longer reaches.
+	// counter cell. The detached check matches the slow path's
+	// observable error so the caller does not see a misleading
+	// "success" on a buffer they no longer reach.
 	b.mu.RLock()
 	if !b.detached {
 		if existing, ok := b.byID[id]; ok && existing.counter != nil {
@@ -207,12 +196,9 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 			}
 		}
 
-		// Write the promoted item back into items + indexes. We do
-		// NOT bump b.lastWriteTS or s.lastWriteTS — promote is
-		// semantically an increment from the caller's perspective, and
-		// counter increments do not bump the scope / store freshness
-		// signals (see file header). The cell's own ts captures the
-		// "when did this counter last change" view directly.
+		// Promote keeps the per-scope / store freshness signals
+		// silent — see file-header rule on counter_add silence. The
+		// cell's ts captures "when did this counter last change".
 		b.items[i] = promoted
 		b.bySeq[promoted.Seq] = promoted
 		b.byID[id] = promoted
@@ -221,8 +207,7 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 		return newValue, false, nil
 	}
 
-	// Create: brand-new counter item. Sentinel-aware (maxItems == 0
-	// disables the check); see itemCapExceeded in buffer_locked.go.
+	// Create: brand-new counter item.
 	if b.itemCapExceeded(len(b.items) + 1) {
 		return 0, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
@@ -265,15 +250,9 @@ func (b *scopeBuffer) counterAddSlow(scope, id string, by int64) (int64, bool, e
 	b.bytes += size
 	if b.store != nil {
 		b.store.totalItems.Add(1)
-		// NOT bumping s.lastWriteTS here: counter creation is a
-		// structural change (total_items grew) but the rule "counter
-		// activity is silent vs the freshness signal" applies
-		// uniformly across create/promote/increment so consumers can
-		// reason about counter ops as a single category. Operators who
-		// need to size the cache should poll /stats periodically
-		// regardless. See file header.
 	}
-	// b.lastWriteTS likewise unchanged.
+	// Counter create stays silent vs b.lastWriteTS / s.lastWriteTS —
+	// see file-header rule.
 
 	return by, true, nil
 }
@@ -298,9 +277,8 @@ func parseCounterValue(payload json.RawMessage) (int64, error) {
 }
 
 // renderCounterPayload formats a counter cell's current value as the
-// bare-integer JSON bytes /get, /head, /tail and /render expect to find
-// in Item.Payload. Used by materialiseCounter at the read boundary —
-// see buffer_read.go for the call sites and rationale.
+// bare-integer JSON bytes /get, /head, /tail and /render expect in
+// Item.Payload. Used by materialiseCounter at the read boundary.
 func renderCounterPayload(cell *counterCell) json.RawMessage {
 	return json.RawMessage(strconv.AppendInt(nil, cell.value.Load(), 10))
 }

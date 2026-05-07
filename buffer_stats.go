@@ -1,35 +1,30 @@
 package scopecache
 
-// approxSizeBytes is a richer estimate than the raw approxItemSize sum: it
-// also folds in Go map/slice overhead for b.byID and b.bySeq. It surfaces
-// as the per-scope approx_scope_mb value in observability snapshots. It
-// is NOT used for cap enforcement — admission control uses
-// Store.totalBytes (approxItemSize sum + scopeBufferOverhead per scope)
-// so the 507 budget matches what reserveBytes accounts for. Per-item Go
-// heap overhead (slice/map entries) is intentionally outside the cap:
-// charging it would tie admission control to Go's internal data-structure
-// layout, while the current accounting (approxItemSize + per-scope
-// overhead) is layout-independent and matches reserveBytes exactly.
-// Trade-off: approx_store_mb under-reports real memory pressure at very
-// high scope counts, where Go heap overhead per scope becomes non-trivial
-// relative to item bytes.
+// approxSizeBytesLocked is a richer per-scope memory estimate than
+// the raw approxItemSize sum: it also folds in Go map/slice overhead
+// for b.byID and b.bySeq. Surfaces as approx_scope_mb in observability
+// snapshots.
 //
-// O(1) by construction: every term is either a constant, a length on
-// an existing field, or a counter (b.bytes, b.idKeyBytes) the write
-// paths maintain incrementally. The earlier walk-based version was
-// O(items) per /stats call and dominated /stats latency on scopes
-// with thousands of items.
+// NOT used for cap enforcement — admission control uses
+// Store.totalBytes (approxItemSize sum + scopeBufferOverhead per
+// scope) so the 507 budget matches what reserveBytes accounts for.
+// Per-item Go heap overhead is intentionally outside the cap:
+// charging it would tie admission control to Go's internal data-
+// structure layout. Trade-off: approx_store_mb under-reports real
+// memory pressure at very high scope counts.
+//
+// O(1) by construction: every term is a constant, a slice/map length,
+// or an incrementally-maintained counter (b.bytes, b.idKeyBytes).
 //
 // Term breakdown:
-//   - 64                          : *scopeBuffer struct overhead (constant)
-//   - len(b.items) * 32           : Go slice slot overhead per item
-//   - b.bytes                     : Σ approxItemSize(item) — admission-control byte sum
-//   - len(b.byID) * 32            : map bucket overhead per byID entry
-//   - b.idKeyBytes                : Σ len(item.ID) over the byID keys
-//   - len(b.bySeq) * 16           : map bucket overhead per bySeq entry
+//   - 64                : *scopeBuffer struct overhead (constant)
+//   - len(b.items) * 32 : Go slice slot overhead per item
+//   - b.bytes           : Σ approxItemSize(item)
+//   - len(b.byID) * 32  : map bucket overhead per byID entry
+//   - b.idKeyBytes      : Σ len(item.ID) over the byID keys
+//   - len(b.bySeq) * 16 : map bucket overhead per bySeq entry
 //
-// PRECONDITION: caller holds b.mu (or b.mu.RLock — the formula reads
-// only mu-protected state).
+// PRECONDITION: caller holds b.mu (read or write).
 func (b *scopeBuffer) approxSizeBytesLocked() int64 {
 	const structOverhead = int64(64)
 	const itemSlotOverhead = int64(32)
@@ -66,8 +61,7 @@ type scopeStats struct {
 
 // stats returns a snapshot of this scope's metrics. All fields are
 // primitives the cache maintains directly (timestamps + monotonic
-// counters); time-windowed aggregations are addon territory — see
-// recordRead in buffer_heat.go.
+// counters); time-windowed aggregations are addon territory.
 func (b *scopeBuffer) stats() scopeStats {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

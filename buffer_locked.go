@@ -7,17 +7,15 @@ import (
 )
 
 // Cross-cutting helpers shared by scopeBuffer's mutation paths. The
-// `*Locked` suffix on three of them signals: caller MUST hold b.mu.
-// Calling them without the lock is a race; calling them WITH the lock
-// then re-acquiring is a deadlock — they do not lock themselves. The
-// non-Locked helper (precomputeRenderBytes) is pure and lock-agnostic.
+// `*Locked` suffix signals: caller MUST hold b.mu. Calling without
+// the lock is a race; calling with the lock then re-acquiring is a
+// deadlock — these do not lock themselves. precomputeRenderBytes is
+// pure and lock-agnostic.
 //
-// These helpers were extracted from the parallel call-sites in
-// updateByID, updateBySeq, counterAdd, deleteByID, deleteBySeq and
-// upsertByID to centralise three concerns that previously drifted:
-// bytes-accounting, secondary-index sync, and GC-zeroing of removed
-// payloads. Forgetting any of those leaks state silently, hence the
-// dedicated low-level layer.
+// The helpers centralise three concerns that previously drifted
+// across parallel call-sites: bytes-accounting, secondary-index
+// sync, and GC-zeroing of removed payloads. Forgetting any of them
+// leaks state silently.
 
 // precomputeRenderBytes returns the JSON-string-decoded form of payload
 // when payload's first non-whitespace byte is `"`, or nil otherwise.
@@ -36,20 +34,15 @@ func precomputeRenderBytes(payload json.RawMessage) []byte {
 	return []byte(s)
 }
 
-// reservePayloadDeltaLocked computes the byte delta between an old and a
-// new payload (newSize − oldSize) and, if the delta is non-zero AND the
-// buffer is store-attached, reserves the delta against the store-wide
-// byte budget via reserveBytes. Returns the delta so the caller can
-// update b.bytes consistently after a successful mutation.
+// reservePayloadDeltaLocked reserves (newSize − oldSize) against the
+// store-wide byte budget when delta != 0 and the buffer is store-
+// attached, and returns the delta so the caller can update b.bytes
+// consistently after a successful mutation.
 //
 // PRECONDITION: caller holds b.mu.
 //
-// Returns *StoreFullError when the cap reservation fails. No store
-// state is mutated in that case — the caller can return the error
-// without rolling anything back. Centralises the (b.store != nil &&
-// delta != 0) guard: forgetting either condition produces a nil-
-// pointer crash on orphan buffers (used in tests) or a CAS for a
-// zero delta (cheap but pointless).
+// Returns *StoreFullError when the reservation fails — no store
+// state mutated, caller returns the error without rollback.
 func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int64) (int64, error) {
 	delta := newSize - oldSize
 	if b.store != nil && delta != 0 {
@@ -61,35 +54,27 @@ func (b *scopeBuffer) reservePayloadDeltaLocked(oldSize, newSize int64) (int64, 
 	return delta, nil
 }
 
-// itemCapExceeded reports whether holding `proposed` items in this
-// scope would violate the per-scope item-count cap. The unbounded
-// sentinel (b.maxItems == 0, set by maxItemsFor for `_events`)
-// disables the check entirely so callers cannot accidentally trip
-// it on scopes whose contract is "no count limit, byte budget only".
+// itemCapExceeded reports whether `proposed` items would violate the
+// per-scope item-count cap. The unbounded sentinel (b.maxItems == 0,
+// set by maxItemsFor for `_events`) disables the check — that
+// scope's contract is "byte budget only".
 //
-// Centralises the sentinel handling so single-item write paths
-// (appendItem, upsert-create, counter-create) and bulk paths
-// (replaceAll) cannot drift from each other. Single-item callers
-// pass len(b.items) + 1; bulk callers pass the proposed batch size.
+// Single-item callers pass len(b.items) + 1; bulk callers pass the
+// proposed batch size.
 //
-// Lock-agnostic: read of b.maxItems is safe without b.mu because
-// maxItems is set once at buffer construction (newscopeBuffer or
-// initReservedScopes(Locked)) and never reassigned. Callers that
-// also read len(b.items) are still expected to hold b.mu so the
-// (proposed, len) pair is consistent.
+// Lock-agnostic: b.maxItems is set once at buffer construction and
+// never reassigned. Callers that also read len(b.items) still hold
+// b.mu so the (proposed, len) pair is consistent.
 func (b *scopeBuffer) itemCapExceeded(proposed int) bool {
 	return b.maxItems > 0 && proposed > b.maxItems
 }
 
-// payloadAndRenderBytes returns the byte cost approxItemSize attributes
-// to an item's payload-related fields. For a counter item that's the
-// fixed counterCellOverhead (cell heap + worst-case int64 string); for
-// a regular item it's len(Payload) + len(renderBytes). Used by the
-// replace paths (upsert/update) to compute the size delta between the
-// old shape and the new shape correctly when either side is a counter
-// item — a naive `len(payload)` comparison would under-count counter
-// items because their stored Payload is stale-by-construction (see
-// Item.counter's comment in types.go).
+// payloadAndRenderBytes returns the byte cost approxItemSize charges
+// for an item's payload-related fields: counterCellOverhead for
+// counter items (where stored Payload is stale-by-construction),
+// len(Payload) + len(renderBytes) otherwise. Used by replace paths
+// (upsert/update) to compute size deltas correctly when either side
+// is a counter item.
 func payloadAndRenderBytes(item Item) int64 {
 	if item.counter != nil {
 		return counterCellOverhead
@@ -97,42 +82,28 @@ func payloadAndRenderBytes(item Item) int64 {
 	return int64(len(item.Payload)) + int64(len(item.renderBytes))
 }
 
-// replaceItemAtIndexLocked overwrites payload and ts at items[i],
-// installs the caller-precomputed renderBytes, syncs the secondary
-// indexes, and applies the caller's delta to b.bytes.
+// replaceItemAtIndexLocked overwrites payload + ts + renderBytes at
+// items[i], syncs the secondary indexes, applies delta to b.bytes,
+// and stamps lastWriteTS.
 //
-// PRECONDITION: caller holds b.mu and i is a valid index into
-// b.items. Bounds-check is the caller's responsibility — the helper
-// does not validate i because callers reach it via O(log n)
-// binary-search or guaranteed-hit lookups, and re-checking would
-// defeat that.
+// PRECONDITION: caller holds b.mu and i is valid. Bounds-check is
+// the caller's job — callers reach i via O(log n) binary-search or
+// guaranteed-hit lookups, and re-checking would defeat that.
 //
-// The byID sync is conditional because /append accepts items without
-// an id (id="" is legal), so not every item has a byID entry to keep
-// in sync. bySeq is unconditional because every item has a seq.
-//
-// Ts is always overwritten by the caller-supplied value: every
-// caller (updateByID, updateBySeq, counterAdd) computes a fresh
-// time.Now().UnixMicro() under b.mu and passes it in. The "always
-// refresh" rule is enforced at the call site, not here — this helper
-// is a mechanical write of the values the caller has already decided
-// on.
-//
-// The caller passes renderBytes (rather than computing it inside the
-// helper) because approxItemSize counts renderBytes too — so the
-// caller must precompute it to derive `delta`, then pass both. This
-// keeps the cap accounting honest on string-payload updates whose
-// decoded form changes length.
+// byID sync is conditional (id="" is legal on /append, so not every
+// item has a byID entry); bySeq is unconditional. Ts is always the
+// caller-supplied value (every caller stamps fresh under b.mu); the
+// "always refresh" rule lives at the call site, not here.
+// renderBytes is caller-supplied because the size delta the caller
+// passed in already accounts for it.
 func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, ts int64, renderBytes []byte, delta int64) {
 	b.items[i].Payload = payload
 	b.items[i].Ts = ts
 	b.items[i].renderBytes = renderBytes
-	// /update and /upsert replace the whole item shape, so any
-	// previously-installed counter cell is no longer canonical: future
-	// reads must see the new Payload bytes, not a stale cell value.
-	// Clear the pointer so subsequent /counter_add slow-path reaches
-	// the promote branch (parsing the freshly-installed payload) rather
-	// than the orphaned cell.
+	// /update + /upsert replace the whole item shape: a previously-
+	// installed counter cell is no longer canonical. Clear it so
+	// subsequent /counter_add slow-path reaches the promote branch
+	// (parsing the new payload) instead of an orphaned cell.
 	b.items[i].counter = nil
 	updated := b.items[i]
 	// replaceItemAtIndexLocked is only reachable when the item already
@@ -149,14 +120,13 @@ func (b *scopeBuffer) replaceItemAtIndexLocked(i int, payload json.RawMessage, t
 	}
 }
 
-// indexBySeqLocked returns the position of the item with the given seq
-// inside b.items. Returns (0, false) when no such item exists. items is
-// always ordered ascending by seq (appendItem assigns monotonic seqs and
-// nothing inserts in the middle), so this is O(log n) — the canonical
-// way to translate a byID/bySeq map hit into a slice index for in-place
-// mutation. Caller must hold b.mu (read or write — both are fine,
-// callers have a write lock in practice because every user is about to
-// mutate b.items[i]).
+// indexBySeqLocked returns the slice position of the item with seq in
+// b.items via O(log n) binary search. Returns (0, false) on miss.
+// items is always ordered ascending by seq (appendItem assigns
+// monotonic seqs, nothing inserts in the middle), which is what makes
+// the search valid.
+//
+// PRECONDITION: caller holds b.mu (read or write).
 func (b *scopeBuffer) indexBySeqLocked(seq uint64) (int, bool) {
 	i := sort.Search(len(b.items), func(i int) bool {
 		return b.items[i].Seq >= seq

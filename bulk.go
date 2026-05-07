@@ -1,29 +1,48 @@
+// bulk.go owns the multi-shard mutations: wipe, replaceScopes (/warm),
+// rebuildAll (/rebuild). All three serialise against single-scope
+// writers via shard write locks, and against each other via the
+// ascending-shard-index lock order declared in store.go.
+//
+// Cross-cutting invariants:
+//
+//   - **Lock order.** wipe and rebuildAll lock every shard via
+//     lockAllShards. replaceScopes locks only the shards its input
+//     touches via lockShards(shardsForScopes(...)) — both helpers
+//     enforce the ascending-index order that prevents deadlock with
+//     each other and with /delete_scope.
+//   - **Buffer detach.** Every buffer the op replaces is set
+//     detached=true under its own buf.mu before the shard map is
+//     swapped/cleared. A concurrent in-flight write that wakes up on
+//     a stale buf pointer returns *ScopeDetachedError instead of
+//     committing into an unreachable orphan; without this, its
+//     reserveBytes call would permanently inflate totalBytes against
+//     the freshly-reset counter.
+//   - **`_events` is silent on bulk destructive ops.** wipe and
+//     rebuildAll wipe `_events` itself as part of their work; any
+//     event written here would land in the about-to-be-wiped buffer
+//     or paradoxically as seq=1 in the freshly-recreated one.
+//     Drainers detect via `_events.lastSeq < lastSeenSeq` (cursor-
+//     rewind) and reset their state. /warm DOES emit (`{op:"warm"}`)
+//     because it does not touch `_events`.
+//   - **Reserved scopes are re-created.** wipe and rebuildAll call
+//     initReservedScopesLocked under the same all-shard write lock
+//     that performed the destructive step, so subscribers never
+//     observe a gap. `_events` and `_inbox` are pre-validated out of
+//     /warm and /rebuild input so the input never targets them.
+
 package scopecache
 
 import (
 	"fmt"
 )
 
-// wipe removes every scope from the store and resets the byte counter to
-// zero in one atomic step. Each scope buffer is detached under its own
-// write-lock before the store map is replaced, mirroring the /delete_scope
-// pattern: any in-flight write waiting on buf.mu wakes up on a detached
-// buffer and returns *ScopeDetachedError, so orphaned work cannot silently
-// "succeed" into a buffer that nobody can ever read from again.
+// wipe removes every scope and resets the byte counter to zero in
+// one atomic step. Returns (scopeCount, totalItems, freedBytes) so
+// the /wipe handler can echo what was released.
 //
-// freedBytes is captured via totalBytes.Swap(0) AFTER every buf has been
-// detached, so it covers any bytes a concurrent /append committed through
-// reserveBytes while wipe was walking the map.
-//
-// The caller — the /wipe handler — surfaces (scopeCount, totalItems, freedBytes)
-// in the response so a client can verify how much state the call released.
-//
-// /wipe deliberately emits NO entry into `_events`: the wipe obliterates
-// `_events` itself as part of its work (initReservedScopesLocked recreates
-// it as a fresh empty scope at the end), so an event written here would
-// either land in the about-to-be-wiped old buffer or paradoxically as
-// seq=1 in the freshly-recreated buffer. Drainers detect wipe via
-// `_events.lastSeq < lastSeenSeq` (cursor-rewind) and reset their state.
+// freedBytes is captured via totalBytes.Swap(0) AFTER every buf has
+// been detached, so it covers any bytes a concurrent /append
+// committed through reserveBytes while wipe was walking the map.
 func (s *store) wipe() (int, int, int64) {
 	s.lockAllShards()
 	defer s.unlockAllShards()
@@ -81,39 +100,25 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 	var offenders []ScopeCapacityOffender
 
 	for scope, items := range grouped {
-		// Validate the map KEY itself — empty, length, character-set —
-		// before the reserved-scope check. Empty-slice batches
-		// (`grouped["bad ": nil}`) would otherwise bypass the per-item
-		// loop's validateWriteItem entirely and let a Go caller create
-		// a scope whose name violates the normal shape rules. The HTTP
-		// path can't trip this because groupItemsByScope only groups
-		// keys that came from a non-empty item.Scope (already
-		// shape-validated upstream), but the Gateway is the supported
-		// alternate entry point and addon authors compose maps by hand.
+		// Validate the map KEY itself before the reserved-scope check.
+		// Empty-slice batches (`grouped["bad ": nil}`) would otherwise
+		// bypass the per-item loop's validateWriteItem entirely and
+		// let a Go caller create a scope whose name violates the
+		// normal shape rules. The HTTP path is safe (groupItemsByScope
+		// keys come from already-validated item.Scope), but Gateway
+		// callers compose maps by hand.
 		if err := validateScope(scope, "/warm"); err != nil {
 			return 0, wrapValidation(err)
 		}
 		if isReservedScope(scope) {
 			return 0, fmt.Errorf("%w: scope '%s' is reserved and cannot be the target of /warm", ErrInvalidInput, scope)
 		}
-		// Per-item shape validation. Same rules every other write path
-		// applies (validateWriteItem). Pre-step-6.7 this loop lived in
-		// the HTTP handler; centralising here means Gateway.Warm and
-		// any addon caller get the same per-item gate without
-		// duplicating it. Index is per-scope-slice (not flat across
-		// the original ItemsRequest) — slight cosmetic shift in the
-		// error string vs. pre-step-6.7, but the substring "scope X,
-		// item N" is searchable for the same operator-side debugging.
-		//
-		// item.Scope must match the map key. The HTTP path can't break
-		// this because groupItemsByScope groups on item.Scope, but a Go
-		// caller building the map by hand could pass `grouped["actual"]`
-		// containing Item{Scope:"wrong"} — the buffer would store under
-		// "actual" while item.Scope reads "wrong", silently breaking the
-		// scope-identity invariant for downstream reads, replays, and
-		// /events emit. Reject explicitly rather than normalising — a
-		// silent rewrite would mask a misconstructed map and let the
-		// real client bug ship.
+		// item.Scope must match the map key. A Go caller could
+		// otherwise pass `grouped["actual"]` containing
+		// Item{Scope:"wrong"}; the buffer would store under "actual"
+		// while item.Scope reads "wrong", silently breaking the
+		// scope-identity invariant. Reject rather than normalise — a
+		// silent rewrite would mask a misconstructed map.
 		for i := range items {
 			if err := validateWriteItem(&items[i], "/warm", s.maxItemBytes); err != nil {
 				return 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
@@ -255,17 +260,10 @@ func (s *store) replaceScopes(grouped map[string][]Item) (int, error) {
 	return n, nil
 }
 
-// rebuildAll replaces every scope in the store with the supplied input.
-// Same lock discipline as wipe (every shard write-locked in ascending
-// order); same reservation invariants for `_events` and `_inbox` (re-
-// created at the end via initReservedScopesLocked).
-//
-// /rebuild deliberately emits NO entry into `_events`: like /wipe, the
-// rebuild path drops the existing `_events` and recreates it fresh, so
-// any event written here would either land in the about-to-be-wiped old
-// buffer or paradoxically as seq=1 in the freshly-recreated buffer.
-// Drainers detect rebuild via `_events.lastSeq < lastSeenSeq` (cursor-
-// rewind) and reset their state — same shape as /wipe.
+// rebuildAll replaces every scope in the store with the supplied
+// input. Same lock + detach + reserved-scope-recreate discipline as
+// wipe; emits no `_events` entry for the same reason (cursor-rewind
+// is the drainer's signal).
 func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	// Phase 1 — build every scope buffer off-map and distribute directly
 	// into the per-shard maps that Phase 2 will swap in. If any scope
@@ -282,18 +280,12 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	var offenders []ScopeCapacityOffender
 
 	for scope, items := range grouped {
-		// Validate the map KEY itself before the reserved-scope check;
-		// see replaceScopes for the rationale (empty-slice batches
-		// would otherwise bypass per-item validation).
 		if err := validateScope(scope, "/rebuild"); err != nil {
 			return 0, 0, wrapValidation(err)
 		}
 		if isReservedScope(scope) {
 			return 0, 0, fmt.Errorf("%w: scope '%s' is reserved and cannot appear in /rebuild input", ErrInvalidInput, scope)
 		}
-		// Per-item shape validation, same shape as /warm — see
-		// replaceScopes for the rationale on per-scope-slice indexing
-		// AND on the map-key/item.Scope equality check.
 		for i := range items {
 			if err := validateWriteItem(&items[i], "/rebuild", s.maxItemBytes); err != nil {
 				return 0, 0, fmt.Errorf("scope '%s', item at index %d: %w", scope, i, err)
@@ -349,13 +341,10 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 		}
 	}
 
-	// Phase 2 — lock every shard in ascending order, detach every existing
-	// buffer, swap the shard maps, reset the byte counter, release. Detach
-	// is essential: without it, a concurrent /append holding a stale buf
-	// pointer obtained via getOrCreateScope would run AFTER the swap and
-	// call reserveBytes against the freshly reset counter, permanently
-	// inflating totalBytes (its item lands in an unreachable orphan
-	// buffer). Mirrors wipe and /delete_scope; see scopeBuffer.detached.
+	// Phase 2 — lock every shard, detach every existing buffer, swap
+	// the maps, reset counters, release. The detach is what blocks a
+	// stale-pointer concurrent /append from inflating totalBytes
+	// against the freshly-reset counter (file-header invariant).
 	s.lockAllShards()
 	defer s.unlockAllShards()
 	for i := range s.shards {
@@ -372,15 +361,10 @@ func (s *store) rebuildAll(grouped map[string][]Item) (int, int, error) {
 	s.totalBytes.Store(totalNewBytes)
 	s.totalItems.Store(int64(totalItems))
 	s.scopeCount.Store(int64(totalScopes))
-	// rebuildAll constructs new buffers off-side via newscopeBuffer
-	// (which only seeds b.lastWriteTS to the buffer's creation time)
-	// and never goes through commitReplacement, so the per-scope bumps
-	// don't fire here. Stamp store-wide explicitly.
+	// New buffers were built off-side without commitReplacement, so
+	// the per-scope bump chain never fires — stamp store-wide
+	// explicitly.
 	s.bumpLastWriteTS(nowUnixMicro())
-	// Re-create reserved scopes under the same all-shard write lock so
-	// subscribers don't observe a gap, mirroring wipe(). The input was
-	// already validated to not contain reserved scopes, so init's
-	// idempotent guard is purely defensive.
 	s.initReservedScopesLocked()
 
 	return totalScopes, totalItems, nil

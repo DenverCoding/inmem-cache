@@ -10,18 +10,15 @@ import "sort"
 //   - getBySeq    — single-item lookup by seq (drives /get?seq=)
 //
 // All four take b.mu.RLock so multiple readers run concurrently. None
-// of them check b.detached: reading from a detached buffer returns the
-// state the buffer had at detach time, which is fine for reads — there
-// is no orphan-write hazard, only an eventually-stale snapshot. The
-// hot-path read bookkeeping (recordRead in buffer_heat.go) runs
-// separately and is intentionally lock-free on b.mu.
+// check b.detached: reading from a detached buffer returns the state
+// the buffer had at detach time, which is fine for reads — no
+// orphan-write hazard, only an eventually-stale snapshot. The
+// read-bookkeeping (recordRead) runs separately and is lock-free.
 //
-// Counter materialisation: every read path runs returned items through
-// materialiseCounter so consumers see the cell's current value/ts
-// rather than the stored Payload bytes (which are stale-by-design on
-// counter items — see Item.counter's comment in types.go).
-// Materialisation is a single atomic load + a fresh strconv when the
-// item is a counter, and a no-op otherwise.
+// Every read path runs returned items through materialiseCounter so
+// consumers see the cell's current value/ts rather than the stored
+// (stale-by-design) Payload bytes. A single atomic load + fresh
+// strconv on counters, no-op otherwise.
 
 func materialiseCounter(item Item) Item {
 	if item.counter == nil {
@@ -77,17 +74,15 @@ func (b *scopeBuffer) tailOffset(limit int, offset int) ([]Item, bool) {
 	return materialiseCountersInPlace(append([]Item(nil), b.items[start:end]...)), hasMore
 }
 
-// sinceSeq returns items with seq > afterSeq, oldest-first, up to limit.
-// limit must be a positive integer; limit ≤ 0 returns an empty slice
-// (matching tailOffset and scopeList — every multi-item read on the
-// public surface treats a non-positive limit as "give me 0 items"
-// rather than "no cap" or panic). The HTTP path's normalizeLimit
-// rejects 0/negative with 400 before reaching here; the guard exists
-// for direct Gateway callers.
+// sinceSeq returns items with seq > afterSeq, oldest-first, up to
+// limit. limit ≤ 0 returns an empty slice — matches every other
+// multi-item read on the public surface. HTTP rejects 0/negative
+// with 400 via normalizeLimit; the guard here exists for direct
+// Gateway callers.
 //
-// The bool is true when more matching items exist beyond the returned
-// slice, which lets the handler surface truncated=true without the
-// client having to guess from count == limit.
+// The bool is true when more matching items exist beyond the
+// returned slice, so the handler surfaces truncated=true without
+// the client guessing from count == limit.
 func (b *scopeBuffer) sinceSeq(afterSeq uint64, limit int) ([]Item, bool) {
 	if limit <= 0 {
 		return []Item{}, false

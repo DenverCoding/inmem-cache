@@ -56,50 +56,31 @@ var ErrInvalidSubscribeScope = errors.New("scopecache: subscribe is restricted t
 // + webhook) is the subscriber's job, not the cache's.
 var ErrAlreadySubscribed = errors.New("scopecache: scope already has an active subscriber")
 
-// subscriber is the per-scope subscription state held at Store level
-// in s.subscribers. ch is the size-1 coalescing wake-up channel; the
-// same channel is returned to the subscriber goroutine. close-on-
-// unsub means the channel itself doubles as the loop-exit signal —
-// no separate closed-flag, no context.Done() machinery needed in
-// caller code.
-//
-// Lifetime:
-//   - Created in Subscribe under subsMu.Lock, inserted into
-//     s.subscribers[scope].
-//   - Read by notifySubscriber under subsMu.RLock for fanout.
-//   - Removed and channel closed by Subscribe's returned unsub func
-//     under subsMu.Lock.
-//
-// No additional fields needed: scope identity is implicit in the map
-// key; close(ch) is the only "shutdown signal" surface.
+// subscriber is the per-scope subscription state held in
+// s.subscribers. ch is the size-1 coalescing wake-up channel —
+// returned to the caller goroutine and closed by unsub, which
+// doubles as the loop-exit signal (no separate closed-flag, no
+// context.Done() needed in caller code).
 type subscriber struct {
 	ch chan struct{}
 }
 
-// Subscribe attaches a coalescing wake-up channel to the named
-// reserved scope. Returns the channel, an unsub function, and an
-// error. The subscriber goroutine loops `for range ch { … }`; calling
-// unsub() closes the channel and the loop exits naturally.
+// Subscribe attaches a coalescing wake-up channel to a reserved
+// scope. The subscriber goroutine loops `for range ch { … }`; unsub()
+// closes the channel and the loop exits naturally.
 //
 // Errors:
 //
-//   - ErrInvalidSubscribeScope when scope is not a reserved scope
-//     (the cache only supports subscribing to `_events` and `_inbox`).
-//   - ErrAlreadySubscribed when the scope already has an active
-//     subscriber.
+//   - ErrInvalidSubscribeScope — scope is not reserved
+//     (`_events`, `_inbox` are the only valid targets).
+//   - ErrAlreadySubscribed    — scope already has a subscriber.
 //
-// The returned channel survives /wipe and /rebuild transparently: the
-// subscriber slot lives at Store level (keyed by scope name, NOT on
-// the underlying *scopeBuffer), so when those destructive ops
-// drop+recreate the reserved scope buffers the subscriber stays
-// attached and re-points at the freshly-recreated buffer. The
-// subscriber detects wipe/rebuild via cursor-rewind on the next Tail
-// (lastSeq going backwards relative to the cursor it persisted) and
-// resets its own state accordingly.
-//
-// Subscribe is the only capitalised method on *Store besides
-// NewStore / NewAPI / RegisterRoutes — see CLAUDE.md "Public API
-// surface" for the rationale.
+// The returned channel survives /wipe and /rebuild: the subscriber
+// slot lives at Store level (keyed by scope name, NOT on the
+// underlying *scopeBuffer), so destructive ops drop+recreate the
+// reserved scope buffer underneath without disturbing the
+// subscription. Wipe/rebuild detection is the subscriber's job via
+// cursor-rewind on the next Tail (lastSeq < persisted cursor).
 func (s *store) Subscribe(scope string) (<-chan struct{}, func(), error) {
 	if !isReservedScope(scope) {
 		return nil, nil, ErrInvalidSubscribeScope

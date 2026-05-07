@@ -1,3 +1,36 @@
+// store.go owns the Store coordinator: a 32-shard scope map with
+// admission control on a single store-wide byte budget. Every public
+// HTTP/Gateway path lands here before reaching a *scopeBuffer.
+//
+// Cross-cutting invariants other files inherit:
+//
+//   - **Sharding.** scopes is split across numShards (32, power of 2)
+//     independently-locked buckets. Single-scope ops take one shard
+//     RLock; multi-scope ops (/wipe, /rebuild, /warm) MUST acquire
+//     shard locks in ascending shard-index order to avoid deadlock.
+//     Use lockAllShards / lockShards rather than ad-hoc loops.
+//   - **Lockstep counters.** totalBytes / totalItems / scopeCount are
+//     atomic counters maintained incrementally by every write path so
+//     /stats stays O(1). Adding a new write/delete path means adding
+//     the matching Adds in lockstep with the per-scope mutation —
+//     drift corrupts /stats silently.
+//   - **Reserved scopes.** `_events` and `_inbox` are pre-created at
+//     newStore time and re-created after /wipe / /rebuild via
+//     initReservedScopesLocked. isReservedScope is the single source
+//     of truth validators consult. Per-scope caps for the reserved
+//     pair are derived in newStore (eventsMaxItemBytes,
+//     inboxMaxItem{s,Bytes}) and dispatched via maxItemBytesFor /
+//     maxItemsFor.
+//   - **lastWriteTS.** Store-wide freshness signal, advanced via
+//     bumpLastWriteTS (CAS-max). User-write success bumps it; counter
+//     activity is silent (see buffer_counter.go), and pre-create /
+//     rollback paths must NOT bump or polling clients see ghost ticks.
+//   - **Byte budget.** reserveBytes is the only path that may push
+//     totalBytes upward. Positive deltas use a CAS loop with overflow-
+//     safe arithmetic; negative deltas (releases) always succeed. A
+//     write that fails the cap leaves no state behind — caller returns
+//     *StoreFullError without rollback.
+
 package scopecache
 
 import (
@@ -29,12 +62,9 @@ type scopeShard struct {
 type store struct {
 	// shards splits the scope map into numShards independently-locked
 	// buckets. Per-scope hot paths (getOrCreate, lookup, delete) take
-	// only one shard's lock; multi-shard ops (/wipe, /rebuild, /warm)
-	// take a sorted subset in ascending index order. Pre-sharding the
-	// store had a single store-wide RWMutex that
-	// serialised every scope creation through one queue — see phase-4
-	// finding "/append to a unique scope per request serializes on the
-	// store-wide write lock".
+	// only one shard's lock; multi-shard ops take a sorted subset in
+	// ascending index order. Replaced the original store-wide RWMutex
+	// that serialised every scope creation through one queue.
 	shards   [numShards]scopeShard
 	hashSeed maphash.Seed
 
@@ -42,173 +72,120 @@ type store struct {
 	maxStoreBytes   int64
 	maxItemBytes    int64
 
-	// Reserved-scope derived caps. Computed once at NewStore time from
-	// Config so write-path checks can read these directly without
-	// re-deriving on every call. See types.go EventsConfig / InboxConfig
-	// for the shape rationale (why `_events` has no item-count knob
-	// and `_inbox` has both item-count and item-byte knobs).
+	// Reserved-scope derived caps. Computed once in newStore from
+	// Config so write-path checks read directly.
 	//
-	//   - eventsMaxItemBytes: max(MaxItemBytes, Inbox.MaxItemBytes) +
-	//                         eventsItemEnvelopeOverhead. Derived, not a
-	//                         knob — an event entry must always fit the
-	//                         user-write that produced it, and `_inbox`
-	//                         can legitimately accept items larger than
-	//                         the global MaxItemBytes (Inbox.MaxItemBytes
-	//                         is independent). Without taking the max,
-	//                         a valid `_inbox` write in EventsModeFull
-	//                         would commit successfully but its event
-	//                         would silently drop on the size check —
-	//                         breaking the "every successful write becomes
-	//                         an event" contract drainers rely on.
-	//   - inboxMaxItems:      Inbox.MaxItems (default = ScopeMaxItems).
-	//                         Operator-tunable independently of the global.
-	//   - inboxMaxItemBytes:  Inbox.MaxItemBytes (default = InboxMaxItemBytes,
-	//                         i.e. 64 KiB). Operator-tunable; typically
-	//                         smaller than the global MaxItemBytes because
-	//                         `_inbox` is for small fan-in events, not
-	//                         arbitrary user payloads.
+	// eventsMaxItemBytes = max(MaxItemBytes, Inbox.MaxItemBytes) +
+	// eventsItemEnvelopeOverhead. The max() is load-bearing: when an
+	// operator tunes Inbox.MaxItemBytes above MaxItemBytes, an _inbox
+	// write in EventsModeFull would otherwise commit successfully but
+	// have its event silently dropped on the per-event size check,
+	// breaking the "every successful write becomes an event" contract.
 	//
-	// `_events` does NOT have an item-count cap: ScopeMaxItems is
-	// bypassed for that scope (best-effort observability — the only
-	// real begrenzer is the global byte budget on MaxStoreBytes).
+	// `_events` is exempt from the item-count cap (best-effort
+	// observability — only the byte budget gates writes there).
 	eventsMaxItemBytes int64
 	inboxMaxItems      int
 	inboxMaxItemBytes  int64
 
-	// eventsMode controls auto-populate of the reserved `_events` scope.
-	// See types.go EventsMode for the three states. Resolved from
-	// Config.Events.Mode at NewStore time. The auto-populate hooks
-	// (Phase A "Subscribe + event drain architecture") consult this
-	// field; with eventsMode == EventsModeOff (the default) the
-	// hooks short-circuit immediately and the cache behaves
-	// identically to a pre-Phase-A build.
+	// eventsMode controls auto-populate of the reserved `_events`
+	// scope (off | notify | full — see EventsMode in types.go).
+	// Resolved from Config.Events.Mode at newStore time; off is the
+	// zero-overhead default.
 	eventsMode EventsMode
 
-	// eventsDropsTotal counts events that the cache attempted to
-	// auto-populate into `_events` but had to drop because the byte
-	// budget was already saturated (or, defensively, because
-	// json.Marshal of the writeEvent failed). Incremented atomically
-	// inside emitAppendEvent (and future per-op emit helpers) when
-	// the inner s.appendOne to `_events` returns any error.
-	// Surfaced on /stats by the future enrichment step (Phase A
-	// roadmap §5e); read by tests directly today.
+	// eventsDropsTotal counts events the cache attempted to auto-
+	// populate into `_events` but had to drop (byte budget saturated,
+	// or defensively, json.Marshal of the writeEvent failed).
+	// Incremented atomically inside the emit* helpers when the inner
+	// appendOne to `_events` returns any error. Surfaced on /stats.
 	//
-	// A drop here NEVER affects the user-visible result of the
-	// underlying mutation: the user-write already committed before
-	// the emit ran. The drop is a degraded observability signal,
-	// not a degraded primary operation.
+	// A drop NEVER affects the user-visible result of the underlying
+	// mutation — the user-write already committed before the emit
+	// ran. Degraded observability, not a degraded primary operation.
 	eventsDropsTotal atomic.Int64
 
-	// totalBytes tracks the running sum of every store-byte reservation:
-	// approxItemSize per item plus scopeBufferOverhead per allocated
-	// scope. Kept in an atomic so write paths can reserve against the
-	// global budget without touching the store-level mutex; writes that
-	// would push it past maxStoreBytes are rejected with StoreFullError.
+	// totalBytes is the authoritative byte counter for admission
+	// control: Σ approxItemSize over items + scopeBufferOverhead per
+	// allocated scope. Atomic so write paths reserve against the
+	// global budget without touching the store-level mutex; writes
+	// that would push it past maxStoreBytes are rejected with
+	// StoreFullError. Surfaced as approx_store_mb on /stats — the
+	// number a client sees in a 507, the value reported by /stats,
+	// and the comparand on the next write all describe the same
+	// accounting model.
 	//
-	// This is the authoritative counter for admission control and is
-	// surfaced (converted to MiB) as approx_store_mb in /stats. It is
-	// intentionally aligned with what reserveBytes enforces: the budget
-	// a client sees in a 507 response, the value reported by /stats,
-	// and the value compared against maxStoreBytes on the next write
-	// all describe the same accounting model.
-	//
-	// totalBytes is leaner than scopeBuffer.approxSizeBytes — the
-	// per-scope estimate folds in Go map/slice overhead for byID, bySeq
-	// and the heat-bucket ring, which admission control deliberately
-	// does NOT charge against the cap. Counting per-scope overhead is
-	// what closes the empty-scope-spam DoS (see scopeBufferOverhead's
-	// own comment); counting per-item Go heap overhead would be
-	// honest-er to real memory pressure but at the cost of making the
-	// cap arithmetic depend on internal data-structure layout. See
-	// phase-4 finding "approx_store_mb under-reports real memory cost
-	// at high scope counts" for the open pre-v1.0 question.
+	// Leaner than scopeBuffer.approxSizeBytes: the per-scope estimate
+	// folds in Go map/slice overhead, which admission control
+	// deliberately does NOT charge against the cap (cap arithmetic
+	// stays layout-independent). scopeBufferOverhead is the one
+	// per-scope item that IS charged — closes the empty-scope-spam
+	// DoS. Trade-off: approx_store_mb under-reports real memory
+	// pressure at very high scope counts.
 	totalBytes atomic.Int64
 
-	// totalItems and scopeCount mirror the totalBytes pattern: every
-	// write path that creates or removes an item / scope adjusts the
-	// matching atomic in lockstep with its per-scope mutation. This
-	// makes /stats O(1) — three atomic loads and zero shard walks,
-	// independent of how many scopes the store holds.
+	// totalItems and scopeCount mirror the totalBytes lockstep
+	// pattern: every write path that creates or removes an item /
+	// scope adjusts the matching atomic alongside its per-scope
+	// mutation. /stats reads them with three atomic loads, no shard
+	// walks.
 	//
-	// Lockstep discipline (same as totalBytes):
-	//   - item insert paths: insertNewItemLocked + counterAdd create
-	//     branch do totalItems.Add(+1) under b.mu, alongside b.bytes
-	//     accounting.
-	//   - item delete paths: deleteIndexLocked does totalItems.Add(-1);
-	//     deleteUpToSeq does Add(-N) for the batch.
-	//   - bulk replace paths: commitReplacement(PreReserved) compute
-	//     itemDelta = len(r.items) - len(b.items) at commit time and
-	//     Add the delta. No pre-reservation needed (no store-wide item
-	//     cap), so concurrent stale-pointer drift is handled implicitly
-	//     by reading len(b.items) at commit time rather than a snapshot.
-	//   - scope create paths: getOrCreateScopeTrackingCreated and
-	//     ensureScope do scopeCount.Add(+1) inside the shard-write-lock
-	//     critical section, alongside the map insert.
-	//   - scope delete paths: cleanupIfEmptyAndUnused and deleteScope do
-	//     scopeCount.Add(-N) and totalItems.Add(-itemCount) inside their
-	//     shard-write-lock section.
-	//   - bulk reset paths: wipe does Store(0) on both; rebuildAll does
-	//     Store(totalItems) / Store(totalScopes) under all-shard write
-	//     lock, same shape as totalBytes.Store(totalNewBytes).
+	// Lockstep paths to maintain:
+	//   - item insert: insertNewItemLocked + counterAdd create
+	//     branch — totalItems.Add(+1) under b.mu.
+	//   - item delete: deleteIndexLocked Add(-1); deleteUpToSeq
+	//     Add(-N) for the batch.
+	//   - bulk replace: commitReplacement(PreReserved) computes
+	//     itemDelta = len(r.items) - len(b.items) at commit; the
+	//     fresh len() reads handle stale-pointer drift implicitly.
+	//   - scope create: getOrCreateScopeTrackingCreated and
+	//     ensureScope Add(+1) inside the shard-write-lock section.
+	//   - scope delete: cleanupIfEmptyAndUnused and deleteScope
+	//     Add(-1) / Add(-itemCount) inside their shard-lock section.
+	//   - bulk reset: wipe Store(0); rebuildAll Store(N) under
+	//     all-shard write lock.
 	//
-	// Forgetting one of these is exactly the same class of bug as
-	// forgetting a totalBytes update — corrupts /stats silently. The
-	// invariant test (TestStore_StatsCounters_Invariant) walks every
-	// shard and asserts totalItems == Σ len(buf.items) and scopeCount
-	// == Σ len(sh.scopes); run it after touching any of the paths
-	// above.
+	// Forgetting any of these corrupts /stats silently — same class
+	// of bug as forgetting a totalBytes update. The invariant test
+	// TestStore_StatsCounters_Invariant walks every shard and
+	// asserts totalItems == Σ len(buf.items) and scopeCount ==
+	// Σ len(sh.scopes); run it after touching any of these paths.
 	totalItems atomic.Int64
 	scopeCount atomic.Int64
 
-	// lastWriteTS is a microsecond timestamp surfaced on /stats as the
-	// "freshness" signal: a single number a polling client can compare
-	// against its previous value to skip a refetch when nothing has
-	// changed. Updated via bumpLastWriteTS (CAS-max) from every place
-	// that bumps per-scope b.lastWriteTS, plus the store-level
-	// destructive paths (deleteScope, wipe, rebuildAll) that don't go
-	// through a per-scope bump.
+	// lastWriteTS is the freshness signal surfaced on /stats: one
+	// number a polling client compares against its previous value to
+	// skip a refetch. Updated via bumpLastWriteTS (CAS-max) from
+	// every per-scope write that bumps b.lastWriteTS, plus
+	// store-level destructive paths (deleteScope, wipe, rebuildAll).
 	//
-	// CAS-max (rather than naive Store) is required: two writes in
-	// different scopes can compute time.Now().UnixMicro() out of order
-	// across CPUs, then a naive store could leave the counter at the
-	// older value, lying about freshness. The CAS loop guarantees the
-	// counter only ever advances.
+	// CAS-max (rather than naive Store) is required because writes
+	// from different scopes can compute time.Now().UnixMicro() out
+	// of order across CPUs; a naive store could leave the counter at
+	// the older value and lie about freshness.
 	//
-	// Default value is 0 (epoch start) — distinguishable from any real
-	// timestamp the cache would produce. Cleared back to 0 by /wipe
-	// only conceptually; in practice /wipe immediately bumps it to its
-	// own commit time so a client polling right after a wipe still
-	// sees a non-zero "something happened" tick.
+	// Default value is 0 (epoch start), distinguishable from any
+	// real timestamp the cache would produce. /wipe immediately
+	// bumps to its own commit time so a client polling right after
+	// a wipe still sees a non-zero "something happened" tick.
 	lastWriteTS atomic.Int64
 
 	// subsMu + subscribers form the Subscribe primitive's per-scope
-	// subscription registry. See subscribe.go for the full lifecycle
-	// + lock-discipline contract. Subscribers are restricted to
-	// reserved scopes and at most one per scope (RFC §7.4.1). Lives
-	// at Store level — NOT on *scopeBuffer — so the subscription
-	// survives /wipe and /rebuild buffer churn transparently.
-	//
-	// Lock-discipline (also see subscribe.go file-level comment):
-	//   - notifySubscriber:       subsMu.RLock + non-blocking send + RUnlock
-	//   - Subscribe / unsubscribe: subsMu.Lock + mutate map + Unlock
-	//   - notify is called AFTER buf.mu is released, so subsMu and
-	//     b.mu never nest in either order.
+	// registry. Subscribers are restricted to reserved scopes and at
+	// most one per scope (RFC §7.4.1). Lives at Store level (NOT on
+	// *scopeBuffer) so the subscription survives /wipe and /rebuild
+	// buffer churn. Full lifecycle + lock-discipline lives in
+	// subscribe.go.
 	subsMu      sync.RWMutex
 	subscribers map[string]*subscriber
 }
 
-// bumpLastWriteTS advances s.lastWriteTS to nowUs if and only if
-// nowUs > current. Concurrent writers from different scopes can
-// compute time.Now().UnixMicro() out of order across CPUs; a naive
-// Store(nowUs) would let the older timestamp overwrite the newer
-// one and lie about freshness. The CAS loop guarantees monotonicity.
+// bumpLastWriteTS advances s.lastWriteTS to nowUs if nowUs > current.
+// CAS-max (not Store) so out-of-order timestamps from different CPUs
+// cannot regress the freshness signal.
 //
-// Loop terminates in 1 iteration when uncontested, and in O(few)
-// iterations under contention because each retry re-loads a strictly
-// greater current value. No lock taken — safe to call from inside
-// b.mu critical sections (which is the common case: write paths
-// stamp b.lastWriteTS = ts under b.mu, then call this with the same
-// ts).
+// Loop terminates in 1 iteration when uncontested. No lock taken —
+// safe to call from inside b.mu critical sections.
 func (s *store) bumpLastWriteTS(nowUs int64) {
 	for {
 		cur := s.lastWriteTS.Load()
@@ -319,37 +296,26 @@ func (s *store) maxItemsFor(scope string) int {
 // budget, not by an arbitrary item-count cap.
 const unboundedScopeMaxItems = 0
 
-// initReservedScopes pre-creates every entry in reservedScopeNames at
-// NewStore time. Idempotent and safe to call from NewStore (single-
-// threaded, no contention). For paths that already hold all-shard
-// write locks (wipe, rebuildAll), use initReservedScopesLocked
-// instead — calling this version under those locks would deadlock on
-// the per-shard write lock acquisition.
+// initReservedScopes pre-creates every entry in reservedScopeNames
+// at newStore time. Idempotent. For paths that already hold all-
+// shard write locks (wipe, rebuildAll), use initReservedScopesLocked
+// — calling this version under those locks would deadlock.
 //
-// The byte-budget reservation is unconditional (matching
-// initReservedScopesLocked): Config.WithDefaults clamps MaxStoreBytes
-// to at least reservedScopesOverhead so the reserved scopes always
-// fit. Pre-clamp the conditional reserveBytes gate here silently
-// skipped scope creation when the cap was too small while the post-
-// wipe path bypassed the cap, leaving the two init paths with
-// asymmetric invariants.
+// Byte-budget reservation is unconditional (Config.WithDefaults
+// clamps MaxStoreBytes to at least reservedScopesOverhead so the
+// reserved scopes always fit), matching the post-wipe re-init path
+// so the two paths share invariants.
 //
-// Boot-time pre-creation is NOT counted as cache activity:
-// s.lastWriteTS is NOT bumped, and the per-scope buf.lastWriteTS is
-// reset to 0. A polling client that uses lastWriteTS as a "have I
-// seen this cache before" sentinel should see 0 on a fresh boot;
-// the invariant `s.lastWriteTS >= max(buf.lastWriteTS)` requires
-// every scope's tick to also be 0 in that pristine state. The first
-// real write is what advances both counters.
+// Boot-time pre-creation is NOT cache activity: s.lastWriteTS is
+// NOT bumped and per-scope buf.lastWriteTS is reset to 0. A polling
+// client using lastWriteTS as "have I seen this cache before"
+// expects 0 on a fresh boot; the first real write advances both.
 func (s *store) initReservedScopes() {
 	for _, name := range reservedScopeNames {
 		sh := s.shardFor(name)
 		sh.mu.Lock()
 		if _, exists := sh.scopes[name]; !exists {
 			buf := s.newscopeBuffer()
-			// Per-scope cap dispatch: _events gets the unbounded
-			// sentinel, _inbox gets the operator-tunable cap.
-			// See maxItemsFor for the rationale.
 			buf.maxItems = s.maxItemsFor(name)
 			buf.lastWriteTS = 0 // bootstrap: no writes yet
 			sh.scopes[name] = buf
@@ -360,21 +326,16 @@ func (s *store) initReservedScopes() {
 	}
 }
 
-// initReservedScopesLocked re-creates the reserved scopes assuming the
-// caller holds every shard's write lock (wipe, rebuildAll). Mirrors
-// the create path of ensureScope but skips the lock dance since the
-// caller already owns every shard. Idempotent: a scope that somehow
-// survived the caller's reset (defensive against rebuildAll input
-// slipping through validation) is left alone, no double-reserve.
+// initReservedScopesLocked re-creates the reserved scopes assuming
+// the caller holds every shard's write lock (wipe, rebuildAll).
+// Idempotent: a scope that survived the caller's reset (defensive
+// against rebuildAll input slipping through validation) is left
+// alone, no double-reserve.
 //
-// Like initReservedScopes, this path does NOT bump s.lastWriteTS:
-// the surrounding wipe()/rebuildAll() already bumped store-wide for
-// the destructive event itself. The per-scope buf.lastWriteTS is
-// likewise NOT advanced beyond the surrounding-event tick — re-
-// creating the scopes in lockstep is part of the same logical
-// operation, not a separate one. We therefore keep buf.lastWriteTS
-// at the surrounding-event value (which the wipe/rebuild call
-// already established as s.lastWriteTS).
+// Does NOT bump s.lastWriteTS — the surrounding wipe / rebuildAll
+// already bumped for the destructive event. Per-scope buf.lastWriteTS
+// is aligned with that same tick: re-creation is part of the same
+// logical operation, not a separate one.
 func (s *store) initReservedScopesLocked() {
 	for _, name := range reservedScopeNames {
 		sh := s.shardFor(name)
@@ -382,8 +343,6 @@ func (s *store) initReservedScopesLocked() {
 			continue
 		}
 		buf := s.newscopeBuffer()
-		// Per-scope cap dispatch matches initReservedScopes; see
-		// maxItemsFor for the rationale.
 		buf.maxItems = s.maxItemsFor(name)
 		buf.lastWriteTS = s.lastWriteTS.Load() // align with surrounding event
 		sh.scopes[name] = buf
@@ -418,10 +377,9 @@ func newStore(c Config) *store {
 	for i := range s.shards {
 		s.shards[i].scopes = make(map[string]*scopeBuffer)
 	}
-	// Pre-create reserved scopes so subscribers can attach immediately
-	// at boot (before any writes happen) and so the future log-scope
-	// auto-populate hooks (Phase A "Subscribe + log-scope drain
-	// architecture") have a destination ready.
+	// Pre-create reserved scopes so subscribers can attach
+	// immediately at boot (before any writes happen) and so the
+	// auto-populate hooks have a destination ready.
 	s.initReservedScopes()
 	return s
 }
@@ -634,22 +592,16 @@ func (s *store) getOrCreateScopeTrackingCreated(scope string) (*scopeBuffer, boo
 	}
 	sh.scopes[scope] = preBuf
 	s.scopeCount.Add(1)
-	// NO bumpLastWriteTS here. The scope is a precursor to the caller's
-	// actual write (appendOne / upsertOne / counterAddOne) and those
-	// success paths emit their own bump — insertNewItemLocked for
-	// append/upsert, an explicit bump in counterAddOne when scopeCreated
-	// is true. Bumping here would leave a ghost tick when the caller's
-	// item reservation fails and cleanupIfEmptyAndUnused rolls the scope
-	// back: s.lastWriteTS is monotonic via CAS-max, so a precursor bump
-	// cannot be undone. Polling clients would then see a tick that
-	// corresponds to no committed cache-state change, contradicting
-	// the freshness-signal contract.
+	// NO bumpLastWriteTS here. This scope is a precursor to the
+	// caller's item write — its success path emits its own bump.
+	// s.lastWriteTS is CAS-max-monotonic, so a precursor bump cannot
+	// be undone if the item reservation fails and
+	// cleanupIfEmptyAndUnused rolls the scope back. Polling clients
+	// would then see a tick that corresponds to no committed change.
 	//
-	// Infrastructure scope creates where the empty scope IS the goal
-	// (not a precursor to an item write) go through ensureScope, which
-	// bumps unconditionally — its callers commit no items beyond the
-	// scope itself, so the scope's existence is the committed state
-	// change.
+	// Empty-scope-as-goal creates (infrastructure scopes) go through
+	// ensureScope, which bumps unconditionally — there the scope's
+	// existence IS the committed state change.
 	sh.mu.Unlock()
 	return preBuf, true, nil
 }
@@ -696,20 +648,16 @@ func (s *store) cleanupIfEmptyAndUnused(scope string, buf *scopeBuffer) {
 	buf.store = nil
 }
 
-// appendOne is the atomic /append write-path. It creates the target
+// appendOne is the atomic /append write-path. Creates the target
 // scope on demand, reserves item bytes, commits the item, and rolls
 // back the empty scope on item-reservation failure so a 507 cannot
-// leak per-scope overhead onto the store-byte cap. See
-// cleanupIfEmptyAndUnused for the rollback semantics.
+// leak per-scope overhead onto the store-byte cap.
 //
-// On a successful commit the method invokes emitAppendEvent to
-// auto-populate `_events` (Phase A step 5b). The emit happens
-// AFTER buf.appendItem has returned (b.mu released): this is the
-// "capture-under-lock, emit-outside-lock" pattern. With
-// Config.Events.Mode == Off (the default) the emit is a one-branch
-// no-op; with Notify or Full it does a second appendOne into the
-// `_events` scope, which is recursion-guarded inside the helper.
-// See events.go for the full discipline.
+// On commit it invokes emitAppendEvent to auto-populate `_events`,
+// AFTER buf.appendItem returned (b.mu released) — capture-under-
+// lock, emit-outside-lock. With Events.Mode == Off the emit is a
+// one-branch no-op; Notify / Full do a second appendOne into
+// `_events`, recursion-guarded inside the helper.
 func (s *store) appendOne(item Item) (Item, error) {
 	if err := validateWriteItem(&item, "/append", s.maxItemBytesFor(item.Scope)); err != nil {
 		return Item{}, err
@@ -750,9 +698,8 @@ func (s *store) appendOne(item Item) (Item, error) {
 
 // upsertOne is the atomic /upsert write-path; same rollback contract
 // as appendOne. Returns (item, created, err) where created reflects
-// the upsert outcome, not the scope-creation outcome. On success it
-// emits an upsert event into `_events` (Phase A auto-populate; gated
-// on Config.Events.Mode — see events.go).
+// the upsert outcome, not the scope-creation outcome. Emits an
+// upsert event on success (gated on Events.Mode).
 func (s *store) upsertOne(item Item) (Item, bool, error) {
 	if err := validateUpsertItem(&item, s.maxItemBytes); err != nil {
 		return Item{}, false, err
@@ -799,15 +746,11 @@ func (s *store) counterAddOne(scope, id string, by int64) (int64, bool, error) {
 		}
 		return value, counterCreated, addErr
 	}
-	// Counter mutations are silent on s.lastWriteTS by design (see
-	// buffer_counter.go). The one legitimate exception: a counter_add
-	// that just allocated a brand-new scope as a side effect — that
-	// scope's existence IS observable on /stats (scope_count grew), so
-	// polling clients need a tick to refetch. Pre-step-3 of the
-	// rollback-tick fix this bump fired inside getOrCreateScopeTrackingCreated
-	// before the cell commit, leaving a ghost tick on cell-allocation
-	// failure; moving it here means it fires only after the counter
-	// committed, so success ticks and rollback stays silent.
+	// Counter mutations are silent on s.lastWriteTS by design — but
+	// when counter_add allocated a brand-new scope as a side effect,
+	// scope_count just grew on /stats and polling clients need a
+	// tick. Bump after the commit (not in getOrCreate) so a cell-
+	// allocation failure doesn't leave a ghost tick.
 	if scopeCreated {
 		s.bumpLastWriteTS(nowUnixMicro())
 	}
@@ -1033,8 +976,7 @@ func (s *store) ensureScope(scope string) *scopeBuffer {
 	buf = s.newscopeBuffer()
 	sh.scopes[scope] = buf
 	s.scopeCount.Add(1)
-	// Same reasoning as getOrCreateScopeTrackingCreated: scope_count
-	// just changed, so the freshness tick advances.
+	// scope_count just changed, so the freshness tick advances.
 	s.bumpLastWriteTS(buf.lastWriteTS)
 	return buf
 }

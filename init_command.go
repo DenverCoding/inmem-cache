@@ -95,31 +95,12 @@ import (
 	"os/exec"
 )
 
-// RunInitCommand executes command synchronously and blocks until it
-// exits or until ctx is cancelled. Returns nil if command is empty
-// (sentinel for "not configured") or if cmd.Run reports success;
-// otherwise returns the exec error wrapped with the command path.
-//
-// ctx is the cancellation handle the caller supplies — typically a
-// SIGINT/SIGTERM-aware context for the standalone (signalCtx) or the
-// caddy.Context passed into Provision for the module. Cancellation
-// causes the kernel to SIGKILL the entire process group (see
-// configureProcessGroup), so a script that backgrounds children
-// (`curl ... &; wait`) does not leak orphan processes when boot
-// gets interrupted. Callers that want a hard timeout wrap ctx with
-// context.WithTimeout themselves; the helper itself does not enforce
-// a default, since "rebuild from source of truth at boot" can
-// legitimately take many minutes on a large dataset.
-//
-// extraEnv is appended to os.Environ(); both adapters use this to
-// pass SCOPECACHE_SOCKET_PATH pointing to a per-instance temp Unix
-// socket that exposes the cache's HTTP routes for the duration of
-// the script. See the file-level comment for the full adapter
-// contract.
-//
-// stdout/stderr are inherited so the operator sees the script's
-// output in their normal log stream. logf may be nil — the helper
-// then runs without lifecycle logging.
+// RunInitCommand executes command synchronously, blocking until it
+// exits or ctx is cancelled. Returns nil when command is empty
+// (sentinel for "not configured") or cmd.Run succeeds; otherwise
+// returns the exec error wrapped with the command path. Always
+// wipes `_events` after the script exits (success or failure) — see
+// file-header for the adapter, cancellation, and logging contracts.
 func (g *Gateway) RunInitCommand(ctx context.Context, command string, extraEnv []string, logf func(string, ...any)) error {
 	if command == "" {
 		return nil
@@ -135,15 +116,10 @@ func (g *Gateway) RunInitCommand(ctx context.Context, command string, extraEnv [
 	configureProcessGroup(cmd)
 	runErr := cmd.Run()
 
-	// Always wipe `_events` after init, regardless of the script's
-	// exit code. Init is cache-state restoration from a source of
-	// truth, NOT a domain action — the events its writes auto-
-	// populated are duplicates of state that already exists at the
-	// source. Forwarding them through a drain script would loop the
-	// data back to where init pulled it from. A failure on the wipe
-	// is logged but not surfaced; an empty cache plus a stale event
-	// stream is still a working cache, and the next operator action
-	// will overwrite it.
+	// Wipe `_events` regardless of the script's exit code (rationale
+	// in file-header). A failure on the wipe is logged but not
+	// surfaced — an empty cache plus a stale event stream is still
+	// a working cache, and the next operator action will overwrite it.
 	if _, delErr := g.DeleteUpTo(EventsScopeName, math.MaxUint64); delErr != nil && logf != nil {
 		logf("init: clear %s: %v", EventsScopeName, delErr)
 	}

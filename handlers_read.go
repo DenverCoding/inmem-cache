@@ -22,20 +22,13 @@ import (
 // Store.tail.
 
 // writeItemsHit assembles and writes the success response for a
-// list-returning read endpoint (/head, /tail). The Store-layer read
-// methods (Store.head, Store.tail) own the read-heat stamping; this
-// helper is purely about HTTP response shape and the per-response
-// byte cap.
-//
-// estimateMultiItemResponseBytes MUST run before writeJSONWithMeta:
-// once the response body has been written there is no way to switch
-// to a 507 without leaving a half-flushed body on the wire — the cap
-// check is a one-shot opportunity per request.
+// list-returning read endpoint (/head, /tail). HTTP shape + per-
+// response byte cap only — read-heat stamping lives in Store.head /
+// Store.tail.
 //
 // `extra` slots between `count` and `truncated` so /tail can carry
 // its `offset` field at the right wire position; /head passes nil.
-// Field order is load-bearing: matches the existing wire shape
-// exactly. Do not reorder.
+// Field order is load-bearing — do not reorder.
 func (api *API) writeItemsHit(
 	w http.ResponseWriter,
 	started time.Time,
@@ -61,12 +54,10 @@ func (api *API) writeItemsHit(
 		kv{"truncated", truncated},
 		kv{"items", items},
 	)
-	// Single-marshal cap check via writeJSONWithMetaCap. Replaces an
-	// outer capResponse middleware that buffered the whole handler
-	// output a second time — for multi-MiB responses the saving is the
-	// full body size in heap. The pre-flight estimateMultiItemResponseBytes
-	// above still runs first to short-circuit pathological queries
-	// (limit=10000 against 1 MiB items) before the marshal.
+	// Pre-flight estimateMultiItemResponseBytes above short-circuits
+	// pathological queries (limit=10000 against 1 MiB items) before
+	// marshal. writeJSONWithMetaCap is the post-flight authoritative
+	// cap on the marshalled body itself.
 	writeJSONWithMetaCap(w, http.StatusOK, fields, started, api.maxResponseBytes)
 }
 

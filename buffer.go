@@ -75,23 +75,20 @@ type scopeBuffer struct {
 	// Store.reserveBytes (single-item write paths) and
 	// scopeBuffer.commitReplacement (bulk /warm and /rebuild).
 	bytes int64
-	// idKeyBytes is the running sum of len(item.ID) over every item
-	// that has a non-empty ID. Lets approxSizeBytesLocked surface a
-	// per-scope memory estimate in O(1) without re-walking byID's
-	// keys on every /stats call. Mutated under b.mu by every path
-	// that mutates b.byID. Observability-only: NOT charged against
-	// the store-byte cap (admission control stays layout-independent —
-	// see the file-level header on buffer_stats.go).
+	// idKeyBytes is the running sum of len(item.ID) over items with a
+	// non-empty ID. Lets approxSizeBytesLocked surface a per-scope
+	// memory estimate in O(1) without re-walking byID. Mutated under
+	// b.mu by every path that mutates b.byID. Observability-only —
+	// NOT charged against the store-byte cap (admission control stays
+	// layout-independent).
 	idKeyBytes int64
 	createdTS  int64
-	// lastWriteTS is the microsecond timestamp of the most recent write
-	// that touched this scope — append, upsert, update, counter_add,
-	// delete, or a /warm/rebuild commit. Set under b.mu by every write
-	// path; read in stats() under b.mu.RLock. Initialised equal to
-	// createdTS so a freshly-created scope without writes reports a
-	// non-zero value (the creation itself is treated as the most recent
-	// "touch"). Surfaced as last_write_ts on /stats. Distinct from
-	// lastAccessTS — that one tracks reads.
+	// lastWriteTS is the microsecond timestamp of the most recent
+	// write that touched this scope. Set under b.mu by every write
+	// path; read under b.mu.RLock by stats(). Initialised equal to
+	// createdTS so a freshly-created scope reports a non-zero value
+	// (creation is the first "touch"). Surfaced as last_write_ts on
+	// /stats; distinct from lastAccessTS, which tracks reads.
 	lastWriteTS int64
 	// lastAccessTS and readCountTotal are atomic so the read-hot path
 	// (recordRead) does not need to take b.mu. recordRead used to take
@@ -105,24 +102,16 @@ type scopeBuffer struct {
 }
 
 func newscopeBuffer(maxItems int) *scopeBuffer {
-	// items, byID and bySeq all grow on-demand. Pre-allocating any of
-	// them on every scope-create is the wrong default: a unique-scope-
-	// per-write workload creates millions of buffers, most of which
-	// hold one item and never need byID at all (items without an `id`
-	// have no byID entry). See:
+	// items, byID and bySeq grow on-demand. Pre-allocating any of
+	// them on every scope-create is the wrong default: under unique-
+	// scope-per-write workloads (millions of one-item buffers) the
+	// pre-alloc was a GC bottleneck, and items without an `id` never
+	// need byID at all.
 	//
-	//   - phase-4 finding "Sharded scopes map: pre-existing-scope
-	//     writes 2× faster, unique-scope writes barely" — traces the
-	//     items-slice pre-alloc that GC could not keep up with.
-	//   - the follow-up "Lazy maps in newscopeBuffer" — extends the
-	//     same reasoning to byID and bySeq. Lazy bySeq saves the
-	//     create-time alloc on every scope; lazy byID skips the
-	//     allocation entirely on scopes whose items never carry an id.
-	//
-	// The write paths (in buffer_write.go, buffer_counter.go) and the
-	// replaceItemAtIndexLocked helper lazily initialise these maps
-	// before assigning into them. Reads, deletes, len and range are
-	// nil-safe in Go and need no guard.
+	// Write paths (buffer_write.go, buffer_counter.go) and
+	// replaceItemAtIndexLocked lazily initialise these maps before
+	// assigning into them. Reads, deletes, len and range are nil-safe
+	// in Go and need no guard.
 	now := nowUnixMicro()
 	return &scopeBuffer{
 		maxItems:    maxItems,

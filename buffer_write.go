@@ -10,28 +10,21 @@ import (
 // Single-item write paths on *scopeBuffer:
 //
 //   - appendItem    — insert a fresh item; rejects on dup id, capacity, or byte cap
-//   - upsertByID    — insert-or-replace by id; replace-whole-item semantics on hit
+//   - upsertByID    — insert-or-replace by id; replace-whole-item on hit
 //   - updateByID    — modify payload at an existing id
 //   - updateBySeq   — same, addressed by seq
 //
 // All four take b.mu exclusively, check b.detached first, and route
 // their byte-budget reservation through Store.reserveBytes. Shared
-// helpers — precomputeRenderBytes, indexBySeqLocked,
-// reservePayloadDeltaLocked, replaceItemAtIndexLocked — live in
-// buffer_locked.go (cross-file reuse). insertNewItemLocked at the
-// bottom of this file is the local helper that collapses the
-// fresh-insert pipeline shared by appendItem and upsertByID's
-// miss-branch.
+// helpers (precomputeRenderBytes, indexBySeqLocked,
+// reservePayloadDeltaLocked, replaceItemAtIndexLocked) live in
+// buffer_locked.go. insertNewItemLocked at the bottom is the local
+// helper that collapses the fresh-insert pipeline shared by
+// appendItem and upsertByID's miss-branch.
 //
-// Ts is cache-owned: every path that mutates an item stamps
-// time.Now().UnixMicro() onto Item.Ts under b.mu before storing or
-// replacing. Clients cannot supply ts (rejected at the validator);
-// the field is observability only — "when did the cache last write
-// this item" — so refresh-on-every-write is the simplest honest model.
-// Microsecond granularity (not milliseconds): two writes inside the
-// same millisecond are still distinguishable, which matters for ordered
-// /inbox draining and for "last activity" stamping on counters under
-// burst load.
+// Every path stamps time.Now().UnixMicro() onto Item.Ts under b.mu
+// before storing or replacing — Ts contract lives on the Item type
+// in types.go.
 
 func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 	b.mu.Lock()
@@ -41,10 +34,6 @@ func (b *scopeBuffer) appendItem(item Item) (Item, error) {
 		return Item{}, &ScopeDetachedError{}
 	}
 
-	// maxItems == 0 is the unboundedScopeMaxItems sentinel — only the
-	// reserved `_events` scope is created with it; every user scope
-	// gets a positive cap installed at create time. itemCapExceeded
-	// honours the sentinel; see buffer_locked.go for the rationale.
 	if b.itemCapExceeded(len(b.items) + 1) {
 		return Item{}, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
@@ -75,15 +64,9 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 	nowUs := time.Now().UnixMicro()
 
 	if existing, exists := b.byID[item.ID]; exists {
-		// Delta covers both Payload and renderBytes: approxItemSize
-		// counts both, and the cap check must too. renderBytes is
-		// non-nil only for JSON-string payloads. payloadAndRenderBytes
-		// handles the counter-item case where `existing.Payload` is
-		// stale-by-construction and the real cost lives in the cell —
-		// a naive `len(existing.Payload)` would under-count.
-		// validateUpsertItem already filled item.renderBytes for
-		// string payloads; recompute only when the call came in via
-		// a Gateway path that bypassed the validator.
+		// validateUpsertItem fills item.renderBytes for string
+		// payloads; recompute only when the call came in via a
+		// Gateway path that bypassed the validator.
 		newRender := item.renderBytes
 		if newRender == nil {
 			newRender = precomputeRenderBytes(item.Payload)
@@ -106,10 +89,8 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		// stored ts always reflects when the current content arrived.
 		b.items[i].Ts = nowUs
 		b.items[i].renderBytes = newRender
-		// Clear any inherited counter cell — /upsert is "replace whole
-		// item with the supplied shape", so the cell from a prior
-		// /counter_add is no longer canonical. See replaceItemAtIndexLocked
-		// in buffer_locked.go for the same reasoning on the /update path.
+		// /upsert replaces the whole item shape — clear any prior
+		// counter cell so it's no longer canonical.
 		b.items[i].counter = nil
 
 		updated := b.items[i]
@@ -125,14 +106,12 @@ func (b *scopeBuffer) upsertByID(item Item) (Item, bool, error) {
 		return updated, false, nil
 	}
 
-	// Sentinel-aware (maxItems == 0 disables the check); see
-	// itemCapExceeded.
 	if b.itemCapExceeded(len(b.items) + 1) {
 		return Item{}, false, &ScopeFullError{Count: len(b.items), Cap: b.maxItems}
 	}
 
-	// nowUs is shared with the replace branch above so create-vs-replace
-	// is indistinguishable in Ts to observers.
+	// Reuse the replace branch's nowUs so create-vs-replace is
+	// indistinguishable in Ts to observers.
 	inserted, err := b.insertNewItemLocked(item, nowUs)
 	if err != nil {
 		return Item{}, false, err
@@ -160,11 +139,9 @@ func (b *scopeBuffer) updateByID(id string, payload json.RawMessage, preRender [
 		return 0, nil
 	}
 
-	// Only the payload changes on /update; scope/id are unchanged in
-	// size, so the byte delta reduces to new payload-bytes minus old
-	// payload-bytes. payloadAndRenderBytes handles the counter-item
-	// case (cell overhead vs len(Payload)+len(renderBytes)); see
-	// buffer_locked.go for the rationale.
+	// Scope/id are unchanged on /update, so the byte delta reduces to
+	// new vs old payload-bytes (payloadAndRenderBytes handles the
+	// counter-item case).
 	newRender := preRender
 	if newRender == nil {
 		newRender = precomputeRenderBytes(payload)
@@ -201,26 +178,19 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 		return 0, nil
 	}
 
-	// See updateByID for the renderBytes-aware delta rationale.
 	newRender := preRender
 	if newRender == nil {
 		newRender = precomputeRenderBytes(payload)
 	}
 
-	// Per-item cap re-check on the fully-materialized post-update item.
-	// The validator's checkItemSize ran on the request body, where ID
-	// is empty for seq-based updates — so its size measurement
+	// Per-item cap re-check on the fully-materialised post-update
+	// item. The validator's checkItemSize ran on the request body,
+	// where ID is empty for seq-based updates — so its measurement
 	// undercounts by len(existing.ID). Without this re-check a
 	// long-id scope can bypass MaxItemBytes by addressing the item
-	// via seq instead of id (validator-rejected). The counter field
-	// is intentionally omitted from the candidate: replaceItemAtIndexLocked
-	// clears any prior counter cell, so the post-update item is always
-	// a regular Payload-bytes item regardless of the predecessor.
-	//
-	// updateByID does not need this re-check: its validator path sees
-	// the same id that the buffer holds (the request *is* the address),
-	// so request-side and stored-side approxItemSize agree by
-	// construction.
+	// via seq. updateByID needs no re-check: its validator path sees
+	// the stored id (the request *is* the address), so request-side
+	// and stored-side approxItemSize agree by construction.
 	if b.store != nil {
 		maxItemBytes := b.store.maxItemBytesFor(existing.Scope)
 		candidate := Item{
@@ -252,55 +222,38 @@ func (b *scopeBuffer) updateBySeq(seq uint64, payload json.RawMessage, preRender
 	return 1, nil
 }
 
-// insertNewItemLocked is the shared "append a fresh item to this scope"
-// pipeline used by appendItem and upsertByID's miss-branch. It owns the
-// nine-step sequence that must stay coherent across both paths:
-// ts-stamp → renderBytes precompute → size → store-byte reservation →
-// seq assignment → b.items append → b.bySeq sync → b.byID sync (when ID
-// non-empty) → b.bytes update.
+// insertNewItemLocked is the shared fresh-insert pipeline used by
+// appendItem and upsertByID's miss-branch. The nine steps must stay
+// coherent across both paths:
+// ts-stamp → renderBytes precompute → size → store-byte reservation
+// → seq assignment → b.items append → b.bySeq sync → b.byID sync
+// (when ID != "") → b.bytes update.
 //
-// PRECONDITIONS — caller responsibilities, not re-checked here:
+// PRECONDITIONS — caller responsibilities, not re-checked:
 //   - holds b.mu (write lock)
-//   - has confirmed b.detached == false
-//   - has confirmed len(b.items) < b.maxItems
-//   - has ruled out duplicate-ID (when item.ID != "")
-//   - has rejected any client-supplied Seq/Ts at the validator layer
+//   - b.detached == false
+//   - len(b.items) < b.maxItems (or maxItems == sentinel)
+//   - duplicate-ID ruled out (when item.ID != "")
+//   - client-supplied Seq/Ts already rejected at the validator
 //
-// nowUs is caller-supplied so /upsert can keep create- and replace-
-// paths on identical Ts, which prevents observers from inferring
-// create-vs-replace from a timestamp drift. /append computes its own
-// time.Now().UnixMicro() at call site since it has no replace branch
-// to align with.
+// nowUs is caller-supplied so /upsert keeps create- and replace-
+// paths on identical Ts (observers cannot infer create-vs-replace
+// from timestamp drift). /append computes its own at the call site.
 //
-// Why renderBytes precompute happens here, not at the validator: the
-// validator runs on a fresh decoded request body and renderBytes is a
-// cache-internal field; computing it here means the size we reserve
-// matches the size we store. checkItemSize does its own
-// precomputeRenderBytes to enforce the per-item cap honestly — see the
-// header comment on that function.
-//
-// Returns *StoreFullError on cap reservation failure; in that case the
-// scope state is untouched (no Seq increment, no b.items mutation, no
-// b.bytes increment), so the caller can return the error without
-// rolling anything back.
+// Returns *StoreFullError on cap reservation failure; scope state is
+// untouched in that case (no Seq increment, no b.items mutation, no
+// b.bytes increment), so the caller returns without rollback.
 func (b *scopeBuffer) insertNewItemLocked(item Item, nowUs int64) (Item, error) {
-	// Defensive clear of the cache-owned counter pointer. The Gateway
-	// boundary already strips it via cloneItemPayload, and the HTTP
-	// path never sets it (json decode targets exported fields only).
-	// Clearing here is belt-and-braces against future internal callers
-	// (helpers, tests that construct Items directly) bypassing the
-	// Gateway clone — a non-nil counter pointer riding through this
-	// path would make approxItemSize charge counterCellOverhead
-	// instead of len(Payload), and reads would materialise from the
-	// orphaned cell instead of the freshly-installed payload bytes.
-	// renderBytes does not need a separate clear — precomputeRenderBytes
-	// reassigns it unconditionally on the next line.
+	// Defensive clear of counter — Gateway boundary already strips it,
+	// HTTP json-decode never sets it, but internal callers (helpers,
+	// direct-construction tests) might. A leaked non-nil counter
+	// would make approxItemSize charge counterCellOverhead instead of
+	// len(Payload), and reads would materialise from the orphaned
+	// cell instead of the new payload bytes.
 	item.counter = nil
 	item.Ts = nowUs
-	// renderBytes is normally pre-computed by the validator's checkItemSize
-	// (so the byte cap measures what we actually store) and carried through
-	// on the same Item value. Recompute only on direct Gateway callers
-	// that bypass the validator path.
+	// validator's checkItemSize normally fills renderBytes already.
+	// Recompute only when a direct Gateway caller bypassed it.
 	if item.renderBytes == nil {
 		item.renderBytes = precomputeRenderBytes(item.Payload)
 	}

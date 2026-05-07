@@ -89,13 +89,11 @@ func buildReplacementState(items []Item) (scopeReplacement, error) {
 
 		lastSeq++
 		item := src
-		// Defensive clear of the cache-owned counter pointer. Same
-		// rationale as insertNewItemLocked: the Gateway clone already
-		// strips it on /warm and /rebuild input via
-		// cloneGroupedItemPayloads, but a counter pointer that smuggled
-		// through any other path would make approxItemSize charge
-		// counterCellOverhead instead of len(Payload), and post-warm
-		// reads would materialise from the orphaned cell.
+		// Defensive clear of counter — Gateway clone strips it on
+		// /warm + /rebuild input, but a smuggled non-nil cell would
+		// make approxItemSize charge counterCellOverhead instead of
+		// len(Payload), and post-warm reads would materialise from
+		// the orphaned cell.
 		item.counter = nil
 		item.Seq = lastSeq
 		item.Ts = nowUs
@@ -203,10 +201,9 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 		if drift != 0 {
 			b.store.totalBytes.Add(-drift)
 		}
-		// totalItems has no pre-reservation, so we don't need an item
-		// snapshot to subtract: len(b.items) at commit time captures
-		// any stale-pointer concurrent /append's contribution. Same
-		// reasoning as commitReplacement above; see that comment.
+		// totalItems has no pre-reservation: len(b.items) under the
+		// lock captures any concurrent /append's contribution
+		// naturally — its item is being discarded by the swap.
 		b.store.totalItems.Add(int64(len(r.items)) - int64(len(b.items)))
 		b.store.bumpLastWriteTS(now)
 	}
@@ -220,8 +217,6 @@ func (b *scopeBuffer) commitReplacementPreReserved(r scopeReplacement, newBytes 
 }
 
 func (b *scopeBuffer) replaceAll(items []Item) ([]Item, error) {
-	// Sentinel-aware (maxItems == 0 disables the check); see
-	// itemCapExceeded in buffer_locked.go.
 	if b.itemCapExceeded(len(items)) {
 		return nil, &ScopeFullError{Count: len(items), Cap: b.maxItems}
 	}
