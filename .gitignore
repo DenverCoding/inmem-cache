@@ -2,6 +2,7 @@
 *.exe
 *.test
 /sock/
+/.claude/scheduled_tasks.lock
 /CLAUDE.md
 /CLAUDE_TODO.md
 /CLAUDE_COMMENTS.md
