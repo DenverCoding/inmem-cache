@@ -292,14 +292,15 @@ strict `>` comparison is enough; concurrent writes from different
 scopes can't reorder the counter backwards even when their wall
 clocks advance out of order across CPUs.
 
-### 2.6 Reserved scopes and boot-time initialisation
+### 2.6 Reserved scopes
 
 The cache reserves exactly two scope names: `_events` and `_inbox`.
-Both are pre-created at `NewGateway` time so subscribers (§7.4–7.5) and
-apps can attach to a known-stable target without a "scope-doesn't-
-exist-yet" race, and both are re-created automatically after
-`/wipe` and `/rebuild` so the cache always lands on a consistent
-post-event baseline.
+Both are pre-created at boot and re-created automatically after
+`/wipe` and `/rebuild`, so subscribers (§7.4–7.5) and apps can attach
+to a known-stable target without a "scope-doesn't-exist-yet" race
+and never observe a moment where the scope doesn't exist. The full
+boot flow — including the operator-supplied init script — lives in
+§2.7.
 
 | Reserved scope | Role | Writer | Reader |
 |---|---|---|---|
@@ -326,34 +327,7 @@ The reservation is **scope-level only** — item-level cleanup
 (`/delete`, `/delete_up_to`) and item-level reads work normally,
 because the drainer pattern fundamentally requires them.
 
-**Boot-time initialisation.** `NewGateway` calls
-`s.initReservedScopes()` after the per-shard maps are allocated.
-This pre-creates `_events` and `_inbox` via `ensureScope`-equivalent
-logic, charges `len(reservedScopeNames) × scopeBufferOverhead`
-(2 × 1024 = 2048 bytes by default) against the store byte budget,
-and bumps `scope_count` by 2. Boot-time pre-creation does NOT bump
-`s.lastWriteTS` — a fresh store still reports `last_write_ts = 0`
-so the "have I seen this cache before" sentinel works for polling
-clients.
-
 **Lifecycle interactions.**
-
-- `/wipe` drops every scope (including the reserved ones), then —
-  under the same all-shard write lock, before releasing —
-  re-creates the reserved scopes via `s.initReservedScopesLocked()`.
-  The re-creation is atomic with the wipe: subscribers attached to
-  `_events` or `_inbox` never observe a moment where their scope
-  doesn't exist. Post-wipe baseline is `scope_count = 2`,
-  `total_items = 0`, `approx_store_mb = reservedScopesOverhead`.
-
-- `/rebuild` validates input first (rejects the call with 400 if
-  any input scope is reserved), then under all-shard write lock
-  detaches every existing buffer, swaps in the new shard maps,
-  resets the store-wide counters to the new totals, and finally
-  calls `s.initReservedScopesLocked()` to re-create the reserved
-  scopes. The cap check includes `reservedScopesOverhead` in the
-  expected post-rebuild byte total so an input that fills the cap
-  exactly doesn't blow past it once init runs.
 
 - `/delete_scope` on a reserved name is rejected at the validator
   layer (400). To release the items in a reserved scope without
@@ -364,6 +338,12 @@ clients.
 - `/append`, `/delete`, `/delete_up_to`, and reads operate on
   reserved scopes with no additional bookkeeping — same paths as
   user-managed scopes.
+
+- `/wipe` and `/rebuild` re-create `_events` and `_inbox` under the
+  same all-shard write lock that does the destruction, so the
+  reservation invariant is preserved end-to-end. Subscribers
+  attached to a reserved scope never observe a moment where it
+  doesn't exist. Mechanics in §2.7.
 
 **Per-reserved-scope capacity knobs.** The reserved scopes use
 caps that are deliberately decoupled from the global ones, but
@@ -450,9 +430,160 @@ check when the sentinel is present. The validators in
 
 Future addon-convention scopes that need pre-creation (e.g.
 `_tokens` for the `guarded` addon) are not part of the core's
-reservation list — they are operator-side concerns and will land
-via the planned config-driven init-script (see CLAUDE.md
-"Pre-1.0 TODO operational" for the deferred design).
+reservation list — they are operator-side concerns. The
+`init_command` hook in §2.7 is the standard way an operator pre-
+creates them at boot from the source of truth.
+
+---
+
+### 2.7 Boot-time initialisation
+
+Before the cache accepts external traffic it goes through a fixed
+sequence: construct the store, pre-create reserved scopes, run the
+operator-supplied init script behind a private socket, bind the
+public listener, then start subscribers. Each step has a single
+purpose, and each subsequent step assumes the previous one
+finished cleanly.
+
+```
+NewGateway / newStore
+       │
+       ▼
+initReservedScopes        — _events, _inbox pre-created
+       │
+       ▼
+RunInitCommand            — operator script populates the cache
+       │ (private temp socket; public listener still unbound)
+       ▼
+public listener binds     — external clients can now reach the cache
+       │
+       ▼
+StartSubscriber(s)        — drain bridges activate against _events / _inbox
+```
+
+**Step 1 — Reserved-scope pre-creation.** `NewGateway` calls
+`s.initReservedScopes()` after the per-shard maps are allocated.
+This pre-creates `_events` and `_inbox` via `ensureScope`-equivalent
+logic, charges `len(reservedScopeNames) × scopeBufferOverhead`
+(2 × 1024 = 2048 bytes by default) against the store byte budget,
+and bumps `scope_count` by 2. Pre-creation does NOT bump
+`s.lastWriteTS` — a fresh store still reports `last_write_ts = 0`
+so the "have I seen this cache before" sentinel works for polling
+clients.
+
+The same `s.initReservedScopesLocked()` runs at the tail of
+`/wipe` and `/rebuild`, under the all-shard write lock that the
+destructive op already holds:
+
+- `/wipe` drops every scope (including reserved), then re-creates
+  the reserved ones before releasing the lock. Post-wipe baseline:
+  `scope_count = 2`, `total_items = 0`,
+  `approx_store_mb = reservedScopesOverhead`.
+- `/rebuild` validates input first (400 if any input scope is
+  reserved), then under all-shard write lock detaches every
+  existing buffer, swaps in the new shard maps, resets the store-
+  wide counters to the new totals, and finally re-creates the
+  reserved scopes. The cap check includes `reservedScopesOverhead`
+  in the expected post-rebuild byte total so an input that fills
+  the cap exactly does not blow past it once init runs.
+
+**Step 2 — `init_command` adapter hook.** A thin Go-side bridge
+(`*Gateway.RunInitCommand`) that invokes an operator-supplied
+executable once, synchronously, after the cache is fully
+constructed and before the public listener binds. Use case:
+rebuild the cache from a source of truth at boot. The script
+queries a database, reads files, or hits a remote API, and writes
+the resulting state into the cache via the same HTTP endpoints
+any other client uses (`/append`, `/warm`, `/rebuild`). The cache
+itself never reads the source of truth — it just provides the
+"now is the right moment to populate me" hook.
+
+Both adapters wrap `RunInitCommand` in a `runInitWithPrivateSocket`
+helper that:
+
+1. Creates a temp directory (`0o700` perms).
+2. Binds a temp `AF_UNIX` socket inside it serving the cache's
+   HTTP routes.
+3. Sets `SCOPECACHE_SOCKET_PATH=<that path>` in the script's
+   environment.
+4. Runs the init script.
+5. Tears the socket and temp dir down before returning.
+
+Effect: the script ALWAYS reaches the cache via
+`curl --unix-socket "$SCOPECACHE_SOCKET_PATH" http://localhost/...`,
+regardless of whether the operator configured a Unix-socket
+standalone or a TCP-listening Caddy module. The same script body
+works in both deployments.
+
+**Step 3 — Public listener binds AFTER init returns.** The
+operator-configured listener (the Unix socket on the standalone,
+Caddy's HTTP listener on the module) is NOT bound while the init
+script is running. External clients hitting it during boot get
+connection-refused, not a partially-populated cache. This is a
+deliberate operator-visible signal: "the cache is not ready yet."
+
+**Step 4 — Subscribers start AFTER init.** The
+`SCOPECACHE_SUBSCRIBER_COMMAND` / `subscriber_command` bridge
+(§7.5) activates only once init has returned. Two reasons:
+
+1. Init is cache-state RESTORATION, not a domain action. The
+   writes it performs auto-populate `_events` with duplicates of
+   state that already exists at the source of truth. Forwarding
+   those through a drain script would loop the data back to where
+   init pulled it from. `RunInitCommand` therefore wipes
+   `_events` itself when it returns (success or failure), so
+   subscribers see an empty stream when they activate.
+2. `_inbox` is untouched during init — no external writers can
+   reach the public listener yet, and init's purpose is
+   restoration, not fan-in.
+
+Net result: when subscribers register there is no backlog. The
+first wake-up fires on the first user-write once the public
+listener is up. No initial-drain dance, no race against the
+listener-bind window.
+
+**Cancellation and timeouts.** `RunInitCommand` takes a
+`context.Context` — typically a SIGINT/SIGTERM-aware signal
+context for the standalone, or the `caddy.Context` passed into
+`Provision` for the module. Cancellation causes the kernel to
+SIGKILL the entire process group, so a script that backgrounds
+children (`curl ... &; wait`) does not leak orphan processes when
+boot gets interrupted. `RunInitCommand` itself does not enforce a
+default timeout, since "rebuild from source of truth at boot" can
+legitimately take many minutes on a large dataset. Adapters
+expose an `init_timeout_sec` knob (Caddyfile / env-var) — when
+non-zero, the adapter wraps the context in `context.WithTimeout`
+before calling `RunInitCommand`. Default is `0` (no timeout).
+
+**Failure handling.** Errors are logged AND returned: the
+adapter decides whether a failed init is fatal (abort startup) or
+recoverable (continue with an empty cache). Both adapters
+currently log + continue — an empty cache is still a working
+cache, and the next operator-triggered rebuild (manual
+`/rebuild`, scheduled cron, next `caddy reload`) will fix it.
+
+**Knob.**
+
+| Adapter           | Knob                              | Default       |
+|-------------------|-----------------------------------|---------------|
+| Standalone binary | `SCOPECACHE_INIT_COMMAND` (env)   | empty (no init) |
+| Standalone binary | `SCOPECACHE_INIT_TIMEOUT_SEC` (env) | `0` (no timeout) |
+| Caddy module      | `init_command <path>` (Caddyfile) | empty (no init) |
+| Caddy module      | `init_timeout_sec <seconds>` (Caddyfile) | `0` (no timeout) |
+
+Both knobs are **adapter-level**, not `Config` fields — the core
+exposes `*Gateway.RunInitCommand` and the adapters decide how to
+wire it.
+
+**Implementation locus.** `RunInitCommand` lives in
+`init_command.go` (core, stdlib-only). The
+`runInitWithPrivateSocket` helper is duplicated across both
+adapters: `cmd/scopecache/main.go` for the standalone binary and
+`caddymodule/module.go` for the Caddy module. The duplication is
+deliberate — the helper is small, the two adapters bind their
+public listeners differently, and the temp-socket lifetime is
+short enough that hoisting the helper into core would buy nothing
+beyond an extra abstraction layer.
 
 ---
 
@@ -478,11 +609,15 @@ in the rightmost column reflect what `Config{}.WithDefaults()` plus
 | `Config.Inbox.MaxItems`       | `SCOPECACHE_INBOX_MAX_ITEMS`         | `inbox_max_items`      | = `ScopeMaxItems` |
 | `Config.Inbox.MaxItemBytes`   | `SCOPECACHE_INBOX_MAX_ITEM_KB` *(KiB)* | `inbox_max_item_kb`  | 64 KiB        |
 | `Config.Events.Mode`          | `SCOPECACHE_EVENTS_MODE`             | `events_mode`          | `off`         |
+| *(adapter-level)*             | `SCOPECACHE_INIT_COMMAND`            | `init_command`         | *(empty — no init script)* |
+| *(adapter-level)*             | `SCOPECACHE_INIT_TIMEOUT_SEC`        | `init_timeout_sec`     | `0` (no timeout) |
 | *(adapter-level)*             | `SCOPECACHE_SUBSCRIBER_COMMAND`      | `subscriber_command`   | *(empty — no subscriber spawned)* |
 
-The last row is an **adapter-level knob**, not a `Config` field. It
-activates the in-core subscriber bridge at boot — see §7.5 for the
-contract.
+The last three rows are **adapter-level knobs**, not `Config`
+fields. `init_command` runs an operator script once at boot,
+behind a private temp socket, before the public listener binds —
+see §2.7 for the contract. `subscriber_command` activates the in-
+core subscriber bridge once init has finished — see §7.5.
 
 The remaining caps in the cache are **derived** from the rows above
 and not exposed as knobs:
